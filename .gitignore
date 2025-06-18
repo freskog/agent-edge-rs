@@ -26,9 +26,6 @@ Thumbs.db
 recordings/
 test_audio/
 
-# TensorFlow Lite models (embedded in binary - keep in repo)
-# *.tflite
-# models/
 weights/
 
 # Logs
