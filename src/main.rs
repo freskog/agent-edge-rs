@@ -1,279 +1,195 @@
-use agent_edge_rs::audio::{AudioCapture, AudioCaptureConfig};
-#[cfg(all(target_os = "linux", feature = "pulseaudio"))]
-use agent_edge_rs::audio::{PulseAudioCapture, PulseAudioCaptureConfig};
-use anyhow::Result;
-use clap::Parser;
+use clap::{Arg, Command};
+use env_logger::Env;
 use log::{error, info};
+use std::time::Duration;
+use tokio::signal;
+use tokio::time::sleep;
 
-#[derive(Parser)]
-#[command(name = "agent-edge")]
-#[command(about = "Wakeword-only edge client for low-powered devices")]
-struct Args {
-    /// Enable verbose logging
-    #[arg(short, long)]
-    verbose: bool,
+use agent_edge_rs::audio::{AudioBuffer, PulseAudioCapture, PulseAudioCaptureConfig};
+use agent_edge_rs::detection::{DetectionPipeline, PipelineConfig};
 
-    /// Audio device name (optional, will use default if not specified)
-    #[arg(short, long)]
-    device: Option<String>,
-
-    /// List available audio input devices and exit
-    #[arg(long)]
-    list_devices: bool,
-
-    /// Duration to capture audio in seconds (for testing)
-    #[arg(long, default_value = "5")]
-    duration: u64,
-
-    /// Development mode: auto-detect best available audio config
-    #[arg(long)]
-    dev_mode: bool,
-
-    /// Use PulseAudio directly (Linux only) for better latency control
-    #[arg(long)]
-    use_pulseaudio: bool,
-
-    /// Target latency in milliseconds - communicated to PulseAudio server (only with --use-pulseaudio)
-    #[arg(long, default_value = "50")]
-    latency_ms: u32,
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     // Initialize logging
-    let log_level = if args.verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    info!("Starting agent-edge wakeword client");
+    // CLI argument parsing
+    let matches = Command::new("agent-edge")
+        .version("0.1.0")
+        .about("Wakeword detection for Raspberry Pi edge devices")
+        .arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .short('v')
+                .action(clap::ArgAction::SetTrue)
+                .help("Enable verbose debug logging"),
+        )
+        .arg(
+            Arg::new("device")
+                .long("device")
+                .value_name("NAME")
+                .help("Use specific PulseAudio device name"),
+        )
+        .arg(
+            Arg::new("threshold")
+                .long("threshold")
+                .value_name("FLOAT")
+                .help("Wakeword confidence threshold (0.0-1.0)")
+                .value_parser(clap::value_parser!(f32))
+                .default_value("0.8"),
+        )
+        .arg(
+            Arg::new("latency")
+                .long("latency")
+                .value_name("MS")
+                .help("Target audio latency in milliseconds")
+                .value_parser(clap::value_parser!(u32))
+                .default_value("50"),
+        )
+        .get_matches();
+
+    // Set log level based on verbose flag
+    if matches.get_flag("verbose") {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+
+    info!("🚀 Starting agent-edge wakeword detection");
     info!(
-        "Target platform: {} on {}",
+        "   Platform: {} on {}",
         std::env::consts::ARCH,
         std::env::consts::OS
     );
 
-    // Check audio system availability and PulseAudio option
-    if args.use_pulseaudio {
-        #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
-        {
-            info!(
-                "Audio system: Direct PulseAudio ({}ms target latency communicated to server)",
-                args.latency_ms
-            );
-            return run_with_pulseaudio(args);
-        }
-        #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
-        {
-            error!("PulseAudio support is only available on Linux with pulseaudio feature enabled");
-            error!(
-                "On your platform ({}), please use regular audio capture without --use-pulseaudio",
-                std::env::consts::OS
-            );
-            return Err(anyhow::anyhow!("PulseAudio feature not available"));
-        }
-    } else {
-        // Show audio system info
-        #[cfg(target_os = "linux")]
-        info!("Audio system: cpal -> ALSA -> PulseAudio");
-        #[cfg(target_os = "macos")]
-        info!("Audio system: Core Audio (via cpal)");
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        info!("Audio system: Unknown platform - using cpal defaults");
-
-        run_with_cpal(args)
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "pulseaudio"))]
-fn run_with_pulseaudio(args: Args) -> Result<()> {
-    info!("Using direct PulseAudio capture");
-
-    // Create PulseAudio configuration
-    let pulse_config = if args.dev_mode {
-        PulseAudioCaptureConfig {
-            sample_rate: 16000,
-            channels: 1, // Start with mono for dev compatibility
-            device_name: args.device.clone(),
-            target_latency_ms: args.latency_ms,
-            app_name: "agent-edge".to_string(),
-            stream_name: "dev-wakeword-capture".to_string(),
-        }
-    } else {
-        PulseAudioCaptureConfig {
-            sample_rate: 16000,
-            channels: 6, // ReSpeaker 4-mic array
-            device_name: args.device.clone(),
-            target_latency_ms: args.latency_ms,
-            app_name: "agent-edge".to_string(),
-            stream_name: "wakeword-capture".to_string(),
-        }
+    // Configure PulseAudio capture
+    let latency_ms = matches.get_one::<u32>("latency").copied().unwrap_or(50);
+    let audio_config = PulseAudioCaptureConfig {
+        sample_rate: 16000,
+        channels: 6, // ReSpeaker 4-mic array (6 channels)
+        device_name: matches.get_one::<String>("device").cloned(),
+        target_latency_ms: latency_ms,
+        app_name: "agent-edge".to_string(),
+        stream_name: "wakeword-capture".to_string(),
     };
 
-    info!("PulseAudio configuration: {:?}", pulse_config);
+    // Configure detection pipeline
+    let mut pipeline_config = PipelineConfig::default();
+    let threshold = matches.get_one::<f32>("threshold").copied().unwrap_or(0.8);
+    pipeline_config.wakeword_config.confidence_threshold = threshold;
+    pipeline_config.debug_mode = matches.get_flag("verbose");
 
-    // Create and start PulseAudio capture
-    let mut pulse_capture = PulseAudioCapture::new(pulse_config)?;
-    pulse_capture.start()?;
+    // Create pipeline
+    info!("Initializing wakeword detection pipeline...");
+    let mut pipeline = DetectionPipeline::new(pipeline_config)?;
 
-    info!("Starting PulseAudio capture for {} seconds", args.duration);
-
-    let start_time = std::time::Instant::now();
-    let mut sample_count = 0usize;
-    let mut max_amplitude = 0.0f32;
-    let mut min_amplitude = 0.0f32;
-
-    while start_time.elapsed().as_secs() < args.duration {
-        match pulse_capture.try_get_audio_buffer() {
-            Ok(Some(buffer)) => {
-                sample_count += buffer.len();
-
-                // Calculate some basic statistics
-                for &sample in &buffer {
-                    max_amplitude = max_amplitude.max(sample);
-                    min_amplitude = min_amplitude.min(sample);
-                }
-
-                // Log periodic statistics
-                if sample_count % 16000 == 0 {
-                    // Every ~1 second at 16kHz
-                    info!(
-                        "Captured {} samples, amplitude range: [{:.6}, {:.6}]",
-                        sample_count, min_amplitude, max_amplitude
-                    );
-                }
-            }
-            Ok(None) => {
-                // No data available, sleep a bit
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(e) => {
-                error!("Failed to get audio buffer: {}", e);
-                break;
-            }
-        }
-    }
-
-    pulse_capture.stop()?;
-
-    info!("PulseAudio capture completed");
-    info!("Total samples captured: {}", sample_count);
-    info!(
-        "Final amplitude range: [{:.6}, {:.6}]",
-        min_amplitude, max_amplitude
-    );
-
-    let duration_secs = start_time.elapsed().as_secs_f64();
-    if duration_secs > 0.0 {
-        let sample_rate = sample_count as f64 / duration_secs;
-        info!("Average sample rate: {:.1} Hz", sample_rate);
-    }
-
-    Ok(())
-}
-
-fn run_with_cpal(args: Args) -> Result<()> {
-    info!("Using cpal audio interface");
-
-    // Create audio capture configuration
-    let config = if args.dev_mode {
-        info!("Development mode: detecting best available audio config");
-        AudioCaptureConfig {
-            sample_rate: 16000,
-            channels: 1, // Start with mono for dev compatibility
-            device_name: args.device.clone(),
-            buffer_size: 1024,
-            target_latency_ms: args.latency_ms, // 50ms target latency for PulseAudio
-        }
-    } else {
-        // Production mode: ReSpeaker 4-mic array
-        let mut config = AudioCaptureConfig::default();
-        config.device_name = args.device.clone();
-        config.target_latency_ms = args.latency_ms;
-        config
-    };
-
-    if let Some(device) = &args.device {
-        info!("Using audio device: {}", device);
-    } else {
-        info!("Using default audio device");
-    }
-
-    // Initialize audio capture
-    let mut audio_capture = AudioCapture::new(config)?;
-
-    // Handle list-devices option
-    if args.list_devices {
-        info!("Available audio input devices:");
-        match audio_capture.list_input_devices() {
-            Ok(devices) => {
-                for (i, device) in devices.iter().enumerate() {
-                    println!("  {}: {}", i, device);
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                error!("Failed to list audio devices: {}", e);
-                return Err(e.into());
-            }
-        }
-    }
-
-    // Start audio capture
-    info!("Starting audio capture for {} seconds", args.duration);
+    // Create PulseAudio capture
+    info!("Setting up PulseAudio capture...");
+    let mut audio_capture = PulseAudioCapture::new(audio_config)?;
     audio_capture.start()?;
 
-    // Capture audio for the specified duration
+    info!("🎤 Starting audio capture...");
+    info!(
+        "   Chunk size: {} samples ({}ms)",
+        pipeline.chunk_size_samples(),
+        pipeline.chunk_duration_ms()
+    );
+    info!("   Detection threshold: {:.1}", pipeline.get_threshold());
+    info!("   Target latency: {}ms", latency_ms);
+    info!("   Listening for wakeword 'hey mycroft'... (Press Ctrl+C to stop)");
+
     let start_time = std::time::Instant::now();
-    let mut sample_count = 0;
-    let mut total_samples = 0;
+    let mut chunk_count = 0;
+    let chunk_size = pipeline.chunk_size_samples();
 
-    while start_time.elapsed().as_secs() < args.duration {
-        match audio_capture.try_get_audio_buffer() {
-            Ok(Some(buffer)) => {
-                sample_count += 1;
-                total_samples += buffer.len();
+    // Main processing loop - run until Ctrl+C
+    loop {
+        // Check for Ctrl+C signal
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                info!("Received Ctrl+C, shutting down...");
+                break;
+            }
 
-                if sample_count % 100 == 0 {
-                    info!(
-                        "Captured {} buffers, {} total samples",
-                        sample_count, total_samples
-                    );
+            // Try to get audio data
+            result = async {
+                match audio_capture.try_get_audio_buffer() {
+                    Ok(Some(mut audio_buffer)) => {
+                        // Process buffer in chunks of the required size
+                        while audio_buffer.len() >= chunk_size {
+                            let audio_chunk: AudioBuffer = audio_buffer.drain(..chunk_size).collect();
+                            chunk_count += 1;
 
-                    // Show some audio statistics
-                    if !buffer.is_empty() {
-                        let avg = buffer.iter().sum::<f32>() / buffer.len() as f32;
-                        let max = buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                        info!(
-                            "  Latest buffer: {} samples, avg: {:.4}, max: {:.4}",
-                            buffer.len(),
-                            avg,
-                            max
-                        );
+                            // Process through wakeword pipeline
+                            match pipeline.process_chunk(&audio_chunk) {
+                                Ok(Some(detection)) => {
+                                    if detection.detected {
+                                        info!("🎯 WAKEWORD DETECTED!");
+                                        info!("   Confidence: {:.3}", detection.confidence);
+                                        info!("   Frame: {}", detection.frame_number);
+
+                                        // Reset pipeline after detection
+                                        pipeline.reset();
+
+                                        // In production, this is where you'd trigger the next stage
+                                        // (ASR, command processing, etc.)
+                                    } else if detection.confidence >= threshold {
+                                        // Show detection scores above threshold even if not triggered
+                                        info!("   Detection: {:.3} (frame {})",
+                                              detection.confidence, detection.frame_number);
+                                    } else if matches.get_flag("verbose") {
+                                        info!("   Frame {}: confidence {:.3}",
+                                              detection.frame_number, detection.confidence);
+                                    }
+                                }
+                                Ok(None) => {
+                                    // Still accumulating frames for detection
+                                    if matches.get_flag("verbose") && chunk_count % 50 == 0 {
+                                        let stats = pipeline.stats();
+                                        info!("Processed {} chunks, buffer: {}/{}",
+                                              stats.chunks_processed,
+                                              stats.frames_buffered,
+                                              76);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Detection error: {}", e);
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No audio data available, sleep briefly
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(e) => {
+                        error!("Audio capture error: {}", e);
+                        return Err(e.into());
                     }
                 }
-            }
-            Ok(None) => {
-                // No audio data available yet
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(e) => {
-                error!("Audio capture error: {}", e);
-                break;
+                Ok::<(), anyhow::Error>(())
+            } => {
+                if let Err(e) = result {
+                    return Err(e);
+                }
             }
         }
     }
-
-    info!(
-        "Captured {} audio buffers with {} total samples",
-        sample_count, total_samples
-    );
 
     // Stop audio capture
     audio_capture.stop()?;
-    info!("Audio capture test completed successfully");
 
-    // TODO: Load TensorFlow Lite models
-    // TODO: Start wakeword detection loop
+    // Show final statistics
+    let stats = pipeline.stats();
+    info!("📊 Session complete:");
+    info!("   Total chunks processed: {}", stats.chunks_processed);
+    info!(
+        "   Average processing time: {:.2}ms",
+        stats.avg_processing_time_ms
+    );
+    info!(
+        "   Total runtime: {:.1}s",
+        start_time.elapsed().as_secs_f32()
+    );
 
     Ok(())
 }

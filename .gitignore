@@ -26,9 +26,9 @@ Thumbs.db
 recordings/
 test_audio/
 
-# TensorFlow Lite models (will be downloaded/generated)
-*.tflite
-models/
+# TensorFlow Lite models (embedded in binary - keep in repo)
+# *.tflite
+# models/
 weights/
 
 # Logs
