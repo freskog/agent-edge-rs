@@ -1,0 +1,64 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# IDE files
+.idea/
+# Keep .vscode/ settings for rust-analyzer configuration
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Audio test files and recordings
+*.wav
+*.mp3
+*.flac
+*.ogg
+recordings/
+test_audio/
+
+# TensorFlow Lite models (will be downloaded/generated)
+*.tflite
+models/
+weights/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Environment variables
+.env
+.env.local
+
+# Build directories for cross-compilation
+cross-target/
+
+# Backup files
+*.bak
+*.backup
+
+# Development artifacts
+*.orig
+*.rej
+
+# Documentation build
+/book/
+/doc/
+
+# Runtime generated files
+*.pid
+*.sock 

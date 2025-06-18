@@ -1,0 +1,18 @@
+# Cross.toml - Configuration for cross-compilation to Raspberry Pi AArch64
+
+[target.aarch64-unknown-linux-gnu]
+# Use pre-build commands to install PulseAudio and ALSA development libraries for AArch64  
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install --assume-yes libasound2-dev:arm64 libpulse-dev:arm64 pkg-config",
+]
+
+# Set environment variables for cross-compilation
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = [
+    "PKG_CONFIG_ALLOW_CROSS=1",
+]
+
+# Optional: Use a specific Docker image version if needed
+# image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge" 
