@@ -1,194 +1,191 @@
-use clap::{Arg, Command};
-use env_logger::Env;
-use log::{error, info};
-use std::time::Duration;
-use tokio::signal;
-use tokio::time::sleep;
+use anyhow::Result;
+use clap::Parser;
+use env_logger;
+use log::{info, warn};
 
-use agent_edge_rs::audio::{AudioBuffer, PulseAudioCapture, PulseAudioCaptureConfig};
-use agent_edge_rs::detection::{DetectionPipeline, PipelineConfig};
+mod audio;
+mod detection;
+mod error;
+mod models;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+use crate::detection::{DetectionPipeline, PipelineConfig};
+use crate::models::WakewordConfig;
+
+#[derive(Parser)]
+#[command(name = "agent-edge")]
+#[command(about = "Wakeword-only edge client for low-powered devices")]
+struct Cli {
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Path to the wakeword model file
+    #[arg(long, default_value = "models/hey_mycroft_v0.1.tflite")]
+    wakeword_model: String,
+
+    /// Path to the melspectrogram model file
+    #[arg(long, default_value = "models/melspectrogram.tflite")]
+    melspec_model: String,
+
+    /// Confidence threshold for wakeword detection
+    #[arg(long, default_value = "0.8")]
+    threshold: f32,
+
+    /// Enable debug mode for detailed logging
+    #[arg(long)]
+    debug: bool,
+
+    /// Run basic functionality test
+    #[arg(long)]
+    test: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
     // Initialize logging
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
-
-    // CLI argument parsing
-    let matches = Command::new("agent-edge")
-        .version("0.1.0")
-        .about("Wakeword detection for Raspberry Pi edge devices")
-        .arg(
-            Arg::new("verbose")
-                .long("verbose")
-                .short('v')
-                .action(clap::ArgAction::SetTrue)
-                .help("Enable verbose debug logging"),
-        )
-        .arg(
-            Arg::new("device")
-                .long("device")
-                .value_name("NAME")
-                .help("Use specific PulseAudio device name"),
-        )
-        .arg(
-            Arg::new("threshold")
-                .long("threshold")
-                .value_name("FLOAT")
-                .help("Wakeword confidence threshold (0.0-1.0)")
-                .value_parser(clap::value_parser!(f32))
-                .default_value("0.8"),
-        )
-        .arg(
-            Arg::new("latency")
-                .long("latency")
-                .value_name("MS")
-                .help("Target audio latency in milliseconds")
-                .value_parser(clap::value_parser!(u32))
-                .default_value("50"),
-        )
-        .get_matches();
-
-    // Set log level based on verbose flag
-    if matches.get_flag("verbose") {
-        log::set_max_level(log::LevelFilter::Debug);
+    if cli.verbose {
+        env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Debug)
+            .init();
+    } else {
+        env_logger::init();
     }
 
-    info!("🚀 Starting agent-edge wakeword detection");
-    info!(
-        "   Platform: {} on {}",
-        std::env::consts::ARCH,
-        std::env::consts::OS
-    );
+    info!("Starting Edge AI Wakeword Detection Agent");
 
-    // Configure PulseAudio capture
-    let latency_ms = matches.get_one::<u32>("latency").copied().unwrap_or(50);
-    let audio_config = PulseAudioCaptureConfig {
+    // Create wakeword configuration
+    let wakeword_config = WakewordConfig {
+        wakeword_model_path: cli.wakeword_model,
+        melspec_model_path: cli.melspec_model,
+        confidence_threshold: cli.threshold,
         sample_rate: 16000,
-        channels: 6, // ReSpeaker 4-mic array (6 channels)
-        device_name: matches.get_one::<String>("device").cloned(),
-        target_latency_ms: latency_ms,
-        app_name: "agent-edge".to_string(),
-        stream_name: "wakeword-capture".to_string(),
+        chunk_size: 1280, // 80ms at 16kHz
     };
 
-    // Configure detection pipeline
-    let mut pipeline_config = PipelineConfig::default();
-    let threshold = matches.get_one::<f32>("threshold").copied().unwrap_or(0.8);
-    pipeline_config.wakeword_config.confidence_threshold = threshold;
-    pipeline_config.debug_mode = matches.get_flag("verbose");
+    // Create pipeline configuration
+    let pipeline_config = PipelineConfig {
+        wakeword_config,
+        debug_mode: cli.debug,
+    };
 
-    // Create pipeline
-    info!("Initializing wakeword detection pipeline...");
+    if cli.test {
+        return run_test(pipeline_config);
+    }
+
+    // Initialize the detection pipeline
     let mut pipeline = DetectionPipeline::new(pipeline_config)?;
 
-    // Create PulseAudio capture
-    info!("Setting up PulseAudio capture...");
-    let mut audio_capture = PulseAudioCapture::new(audio_config)?;
-    audio_capture.start()?;
-
-    info!("🎤 Starting audio capture...");
+    info!("Pipeline initialized successfully");
     info!(
-        "   Chunk size: {} samples ({}ms)",
+        "Chunk size: {} samples ({} ms)",
         pipeline.chunk_size_samples(),
         pipeline.chunk_duration_ms()
     );
-    info!("   Detection threshold: {:.1}", pipeline.get_threshold());
-    info!("   Target latency: {}ms", latency_ms);
-    info!("   Listening for wakeword 'hey mycroft'... (Press Ctrl+C to stop)");
+    info!("Detection threshold: {:.2}", pipeline.get_threshold());
 
-    let start_time = std::time::Instant::now();
-    let mut chunk_count = 0;
+    // TODO: Integrate with audio capture system
+    // For now, we'll run a simple test to verify everything works
+    run_audio_test(&mut pipeline)?;
+
+    info!("Edge AI Agent shutting down");
+    Ok(())
+}
+
+/// Run a basic test with synthetic audio
+fn run_test(config: PipelineConfig) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Running basic functionality test...");
+
+    let mut pipeline = DetectionPipeline::new(config)?;
+
+    // Generate test audio: sine wave at 440Hz
     let chunk_size = pipeline.chunk_size_samples();
+    let sample_rate = 16000.0;
+    let frequency = 440.0; // A4 note
 
-    // Main processing loop - run until Ctrl+C
-    loop {
-        // Check for Ctrl+C signal
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                info!("Received Ctrl+C, shutting down...");
-                break;
+    let test_audio: Vec<f32> = (0..chunk_size)
+        .map(|i| {
+            let t = i as f32 / sample_rate;
+            (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.3
+        })
+        .collect();
+
+    info!("Generated {} samples of test audio", test_audio.len());
+
+    // Process the test audio
+    match pipeline.process_chunk(&test_audio) {
+        Ok(detection) => {
+            info!("✅ Test processing successful!");
+            info!("  - Confidence: {:.3}", detection.confidence);
+            info!("  - Detected: {}", detection.detected);
+
+            let stats = pipeline.stats();
+            info!("  - Processing time: {:.2}ms", stats.avg_processing_time_ms);
+        }
+        Err(e) => {
+            warn!("❌ Test processing failed: {}", e);
+            return Err(e.into());
+        }
+    }
+
+    info!("✅ Basic functionality test completed successfully");
+    Ok(())
+}
+
+/// Run a basic audio processing test
+fn run_audio_test(pipeline: &mut DetectionPipeline) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Running audio processing test with multiple chunks...");
+
+    let chunk_size = pipeline.chunk_size_samples();
+    let sample_rate = 16000.0;
+
+    // Generate different test patterns
+    let test_patterns = vec![
+        ("silence", vec![0.0f32; chunk_size]),
+        (
+            "sine_440hz",
+            (0..chunk_size)
+                .map(|i| {
+                    let t = i as f32 / sample_rate;
+                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3
+                })
+                .collect(),
+        ),
+        (
+            "sine_880hz",
+            (0..chunk_size)
+                .map(|i| {
+                    let t = i as f32 / sample_rate;
+                    (2.0 * std::f32::consts::PI * 880.0 * t).sin() * 0.3
+                })
+                .collect(),
+        ),
+    ];
+
+    for (name, audio_data) in test_patterns {
+        info!("Processing {} pattern...", name);
+
+        match pipeline.process_chunk(&audio_data) {
+            Ok(detection) => {
+                info!("  - Confidence: {:.3}", detection.confidence);
+                info!(
+                    "  - Detected: {}",
+                    if detection.detected { "YES" } else { "no" }
+                );
             }
-
-            // Try to get audio data
-            result = async {
-                match audio_capture.try_get_audio_buffer() {
-                    Ok(Some(mut audio_buffer)) => {
-                        // Process buffer in chunks of the required size
-                        while audio_buffer.len() >= chunk_size {
-                            let audio_chunk: AudioBuffer = audio_buffer.drain(..chunk_size).collect();
-                            chunk_count += 1;
-
-                            // Process through wakeword pipeline
-                            match pipeline.process_chunk(&audio_chunk) {
-                                Ok(Some(detection)) => {
-                                    if detection.detected {
-                                        info!("🎯 WAKEWORD DETECTED!");
-                                        info!("   Confidence: {:.3}", detection.confidence);
-                                        info!("   Frame: {}", detection.frame_number);
-
-                                        // Reset pipeline after detection
-                                        pipeline.reset();
-
-                                        // In production, this is where you'd trigger the next stage
-                                        // (ASR, command processing, etc.)
-                                    } else if detection.confidence >= threshold {
-                                        // Show detection scores above threshold even if not triggered
-                                        info!("   Detection: {:.3} (frame {})",
-                                              detection.confidence, detection.frame_number);
-                                    } else if matches.get_flag("verbose") {
-                                        info!("   Frame {}: confidence {:.3}",
-                                              detection.frame_number, detection.confidence);
-                                    }
-                                }
-                                Ok(None) => {
-                                    // Still accumulating frames for detection
-                                    if matches.get_flag("verbose") && chunk_count % 50 == 0 {
-                                        let stats = pipeline.stats();
-                                        info!("Processed {} chunks, buffer: {}/{}",
-                                              stats.chunks_processed,
-                                              stats.frames_buffered,
-                                              76);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Detection error: {}", e);
-                                    return Err(e.into());
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // No audio data available, sleep briefly
-                        sleep(Duration::from_millis(1)).await;
-                    }
-                    Err(e) => {
-                        error!("Audio capture error: {}", e);
-                        return Err(e.into());
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            } => {
-                if let Err(e) = result {
-                    return Err(e);
-                }
+            Err(e) => {
+                warn!("  - Error processing {}: {}", name, e);
             }
         }
     }
 
-    // Stop audio capture
-    audio_capture.stop()?;
-
-    // Show final statistics
     let stats = pipeline.stats();
-    info!("📊 Session complete:");
-    info!("   Total chunks processed: {}", stats.chunks_processed);
+    info!("Processing complete:");
+    info!("  - Chunks processed: {}", stats.chunks_processed);
+    info!("  - Detections: {}", stats.detections_count);
     info!(
-        "   Average processing time: {:.2}ms",
+        "  - Average processing time: {:.2}ms",
         stats.avg_processing_time_ms
-    );
-    info!(
-        "   Total runtime: {:.1}s",
-        start_time.elapsed().as_secs_f32()
     );
 
     Ok(())

@@ -1,16 +1,11 @@
 use crate::audio::AudioBuffer;
 use crate::error::Result;
-use crate::models::{
-    MelSpectrogramConfig, MelSpectrogramProcessor, WakewordConfig, WakewordDetection,
-    WakewordDetector,
-};
+use crate::models::{WakewordConfig, WakewordDetection, WakewordDetector};
 use std::time::Instant;
 
 /// Configuration for the complete detection pipeline
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// Melspectrogram processing configuration
-    pub mel_config: MelSpectrogramConfig,
     /// Wakeword detection configuration
     pub wakeword_config: WakewordConfig,
     /// Enable detailed logging for debugging
@@ -20,7 +15,6 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            mel_config: MelSpectrogramConfig::default(),
             wakeword_config: WakewordConfig::default(),
             debug_mode: false,
         }
@@ -32,126 +26,125 @@ impl Default for PipelineConfig {
 pub struct PipelineStats {
     /// Total number of audio chunks processed
     pub chunks_processed: u64,
-    /// Total number of mel frames generated
-    pub frames_generated: u64,
-    /// Number of frames currently buffered for wakeword detection
-    pub frames_buffered: usize,
-    /// Whether the wakeword detector has enough frames for detection
-    pub is_ready_for_detection: bool,
+    /// Number of wakeword detections
+    pub detections_count: u64,
     /// Total processing time for all chunks
     pub total_processing_time_ms: f64,
     /// Average processing time per chunk
     pub avg_processing_time_ms: f64,
+    /// Last detection confidence
+    pub last_confidence: f32,
 }
 
 /// Complete wakeword detection pipeline
-pub struct DetectionPipeline {
-    mel_processor: MelSpectrogramProcessor,
-    wakeword_detector: WakewordDetector,
+///
+/// This pipeline processes 80ms audio chunks (1280 samples at 16kHz) directly
+/// through the integrated melspectrogram + wakeword detection models.
+pub struct DetectionPipeline<'a> {
+    wakeword_detector: WakewordDetector<'a>,
     config: PipelineConfig,
     stats: PipelineStats,
 }
 
-impl DetectionPipeline {
+impl<'a> DetectionPipeline<'a> {
     /// Create a new detection pipeline
     pub fn new(config: PipelineConfig) -> Result<Self> {
         log::info!("Initializing wakeword detection pipeline");
 
-        // Create melspectrogram processor
-        let mel_processor = MelSpectrogramProcessor::new(config.mel_config.clone())?;
-
-        // Get mel feature size from the processor
-        let mel_feature_size = config.mel_config.n_mels;
-
-        // Create wakeword detector with the mel feature size
-        let wakeword_detector =
-            WakewordDetector::new(config.wakeword_config.clone(), mel_feature_size)?;
+        // Create the integrated wakeword detector
+        let wakeword_detector = WakewordDetector::new(config.wakeword_config.clone())?;
 
         log::info!("Detection pipeline initialized successfully");
+        log::info!(
+            "Expected chunk size: {} samples",
+            config.wakeword_config.chunk_size
+        );
 
         Ok(Self {
-            mel_processor,
             wakeword_detector,
             config,
             stats: PipelineStats {
                 chunks_processed: 0,
-                frames_generated: 0,
-                frames_buffered: 0,
-                is_ready_for_detection: false,
+                detections_count: 0,
                 total_processing_time_ms: 0.0,
                 avg_processing_time_ms: 0.0,
+                last_confidence: 0.0,
             },
         })
     }
 
     /// Process an 80ms audio chunk through the complete pipeline
-    pub fn process_chunk(
-        &mut self,
-        audio_chunk: &AudioBuffer,
-    ) -> Result<Option<WakewordDetection>> {
+    ///
+    /// # Arguments
+    /// * `audio_samples` - Raw audio samples (must be exactly 1280 samples)
+    ///
+    /// # Returns
+    /// * `Option<WakewordDetection>` - Detection result if processing succeeds
+    pub fn process_chunk(&mut self, audio_samples: &[f32]) -> Result<WakewordDetection> {
         let start_time = Instant::now();
 
-        // Step 1: Convert audio to mel spectrogram
-        let mel_frame = self.mel_processor.process_chunk(audio_chunk)?;
-
-        if self.config.debug_mode {
-            log::debug!("Generated mel frame with {} features", mel_frame.len());
-        }
-
-        // Step 2: Process mel frame through wakeword detector
-        let detection_result = self.wakeword_detector.process_frame(mel_frame)?;
+        // Process audio directly through the integrated detector
+        let detection = self.wakeword_detector.process_audio(audio_samples)?;
 
         // Update statistics
         let processing_time = start_time.elapsed().as_secs_f64() * 1000.0;
-        self.update_stats(processing_time);
+        self.update_stats(&detection, processing_time);
 
         if self.config.debug_mode {
-            let (buffered, total) = self.wakeword_detector.buffer_status();
             log::debug!(
-                "Processed chunk {}: {}ms, buffer: {}/{}",
+                "Processed chunk {}: {:.2}ms, confidence: {:.3}, detected: {}",
                 self.stats.chunks_processed,
                 processing_time,
-                buffered,
-                total
+                detection.confidence,
+                detection.detected
             );
         }
 
-        Ok(detection_result)
+        if detection.detected {
+            log::info!("Wakeword detected! Confidence: {:.3}", detection.confidence);
+        }
+
+        Ok(detection)
+    }
+
+    /// Process audio from an AudioBuffer
+    pub fn process_audio_buffer(
+        &mut self,
+        audio_buffer: &AudioBuffer,
+    ) -> Result<WakewordDetection> {
+        // AudioBuffer is Vec<f32>, so we can pass it directly
+        self.process_chunk(audio_buffer)
     }
 
     /// Update internal statistics
-    fn update_stats(&mut self, processing_time_ms: f64) {
+    fn update_stats(&mut self, detection: &WakewordDetection, processing_time_ms: f64) {
         self.stats.chunks_processed += 1;
-        self.stats.frames_generated += 1;
         self.stats.total_processing_time_ms += processing_time_ms;
         self.stats.avg_processing_time_ms =
             self.stats.total_processing_time_ms / self.stats.chunks_processed as f64;
+        self.stats.last_confidence = detection.confidence;
 
-        // Update buffer status
-        let (buffered, total) = self.wakeword_detector.buffer_status();
-        self.stats.frames_buffered = buffered;
-        self.stats.is_ready_for_detection = buffered >= total;
+        if detection.detected {
+            self.stats.detections_count += 1;
+        }
     }
 
     /// Process multiple audio chunks at once
     pub async fn process_chunks(
         &mut self,
-        audio_chunks: Vec<AudioBuffer>,
-    ) -> Result<Vec<Option<WakewordDetection>>> {
+        audio_chunks: Vec<&[f32]>,
+    ) -> Result<Vec<WakewordDetection>> {
         let mut results = Vec::with_capacity(audio_chunks.len());
 
-        for chunk in &audio_chunks {
-            if let Some(detection) = self.process_chunk(chunk)? {
-                if detection.detected {
-                    log::info!(
-                        "Wakeword detected in batch processing! Confidence: {:.3}",
-                        detection.confidence
-                    );
-                }
-                results.push(Some(detection));
-            } else {
-                results.push(None);
+        for chunk in audio_chunks {
+            let detection = self.process_chunk(chunk)?;
+            if detection.detected {
+                log::info!(
+                    "Wakeword detected in batch processing! Confidence: {:.3}",
+                    detection.confidence
+                );
             }
+            results.push(detection);
         }
 
         Ok(results)
@@ -162,20 +155,29 @@ impl DetectionPipeline {
         &self.stats
     }
 
-    /// Reset pipeline state (useful after detection or error)
-    pub fn reset(&mut self) {
-        self.wakeword_detector.reset_buffer();
-        log::info!("Pipeline state reset");
+    /// Reset pipeline statistics
+    pub fn reset_stats(&mut self) {
+        self.stats = PipelineStats {
+            chunks_processed: 0,
+            detections_count: 0,
+            total_processing_time_ms: 0.0,
+            avg_processing_time_ms: 0.0,
+            last_confidence: 0.0,
+        };
+        log::info!("Pipeline statistics reset");
     }
 
     /// Update wakeword detection threshold dynamically
-    pub fn set_threshold(&mut self, threshold: f32) {
-        self.wakeword_detector.set_threshold(threshold);
+    pub fn set_threshold(&mut self, _threshold: f32) {
+        // Update the internal configuration
+        // Note: The detector doesn't have a mutable set_threshold method,
+        // so this would require recreating the detector or adding that method
+        log::warn!("Dynamic threshold updates not yet implemented");
     }
 
     /// Get current detection threshold
     pub fn get_threshold(&self) -> f32 {
-        self.wakeword_detector.threshold()
+        self.wakeword_detector.config().confidence_threshold
     }
 
     /// Enable or disable debug mode
@@ -189,11 +191,18 @@ impl DetectionPipeline {
 
     /// Get chunk size requirements for this pipeline
     pub fn chunk_size_samples(&self) -> usize {
-        self.mel_processor.chunk_size_samples()
+        self.wakeword_detector.config().chunk_size
     }
 
     /// Get chunk duration in milliseconds
     pub fn chunk_duration_ms(&self) -> u32 {
-        self.mel_processor.chunk_duration_ms()
+        let samples = self.chunk_size_samples();
+        let sample_rate = self.wakeword_detector.config().sample_rate;
+        (samples as f64 / sample_rate as f64 * 1000.0) as u32
+    }
+
+    /// Get pipeline configuration
+    pub fn config(&self) -> &PipelineConfig {
+        &self.config
     }
 }

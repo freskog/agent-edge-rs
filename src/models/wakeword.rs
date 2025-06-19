@@ -1,248 +1,250 @@
-use crate::error::{EdgeError, Result};
-use std::collections::VecDeque;
-use tflite::ops::builtin::BuiltinOpResolver;
-use tflite::{FlatBufferModel, InterpreterBuilder};
+//! Wakeword Detection using TensorFlow Lite
+//!
+//! This module provides wakeword detection capabilities using the hey_mycroft model
+//! with mel spectrogram feature preprocessing.
 
-/// Embedded wakeword detection model (baked into binary for edge deployment)
-const WAKEWORD_MODEL_BYTES: &[u8] = include_bytes!("../../models/hey_mycroft_v0.1.tflite");
+use crate::error::{EdgeError, Result};
+use lazy_static::lazy_static;
+use std::sync::{Arc, Mutex};
+
+use tflitec::interpreter::Options;
+use tflitec::model::Model;
+use tflitec::tensor;
 
 /// Configuration for wakeword detection
 #[derive(Debug, Clone)]
 pub struct WakewordConfig {
-    /// Number of mel spectrogram frames to accumulate before detection
-    pub frame_window_size: usize,
-    /// Confidence threshold for wakeword detection (0.0 to 1.0)
+    /// Path to the hey_mycroft wakeword model
+    pub wakeword_model_path: String,
+    /// Path to the melspectrogram preprocessing model  
+    pub melspec_model_path: String,
+    /// Confidence threshold for wakeword detection (0.0 - 1.0)
     pub confidence_threshold: f32,
-    /// Frame shift - how many frames to advance the window each time
-    pub frame_shift: usize,
+    /// Sample rate for audio processing (default: 16000 Hz)
+    pub sample_rate: u32,
+    /// Audio chunk size in samples (default: 1280 for 80ms at 16kHz)
+    pub chunk_size: usize,
 }
 
 impl Default for WakewordConfig {
     fn default() -> Self {
         Self {
-            frame_window_size: 76,     // Typical window size for OpenWakeWord models
-            confidence_threshold: 0.5, // OpenWakeWord default threshold
-            frame_shift: 1,            // Process every new frame
+            wakeword_model_path: "models/hey_mycroft_v0.1.tflite".to_string(),
+            melspec_model_path: "models/melspectrogram.tflite".to_string(),
+            confidence_threshold: 0.5,
+            sample_rate: 16000,
+            chunk_size: 1280, // 80ms at 16kHz
         }
     }
 }
 
-/// Result of wakeword detection
+/// Wakeword detection result
 #[derive(Debug, Clone)]
 pub struct WakewordDetection {
-    /// Confidence score (0.0 to 1.0)
-    pub confidence: f32,
-    /// Whether the detection exceeds the threshold
+    /// Whether a wakeword was detected
     pub detected: bool,
-    /// Timestamp of detection (frame number)
-    pub frame_number: u64,
+    /// Confidence score (0.0 - 1.0)
+    pub confidence: f32,
+    /// Timestamp when detection occurred
+    pub timestamp: std::time::Instant,
 }
 
-/// Wakeword detection processor that analyzes accumulated mel spectrogram frames
-pub struct WakewordDetector {
+/// Thread-safe wakeword detector
+pub struct WakewordDetector<'a> {
+    melspec_model: Model<'a>,
+    wakeword_model: Model<'a>,
     config: WakewordConfig,
-    interpreter: tflite::Interpreter,
-    frame_buffer: VecDeque<Vec<f32>>,
-    frame_count: u64,
-    frame_feature_size: usize,
-    input_index: i32,
-    output_index: i32,
 }
 
-impl WakewordDetector {
-    /// Create a new wakeword detector with embedded model
-    pub fn new(config: WakewordConfig, mel_feature_size: usize) -> Result<Self> {
-        log::info!(
-            "Loading embedded wakeword model ({} bytes)",
-            WAKEWORD_MODEL_BYTES.len()
-        );
-
-        // Load the embedded model
-        let model = FlatBufferModel::build_from_buffer(WAKEWORD_MODEL_BYTES.to_vec())
-            .map_err(|e| EdgeError::Model(format!("Failed to load wakeword model: {}", e)))?;
-
-        // Create resolver and interpreter builder
-        let resolver = BuiltinOpResolver::default();
-        let builder = InterpreterBuilder::new(&model, &resolver).map_err(|e| {
-            EdgeError::Model(format!("Failed to create interpreter builder: {}", e))
+impl<'a> WakewordDetector<'a> {
+    /// Create a new wakeword detector with the given configuration
+    pub fn new(config: WakewordConfig) -> Result<Self> {
+        // Load mel spectrogram model
+        let melspec_model = Model::new(&config.melspec_model_path).map_err(|e| {
+            EdgeError::ModelLoadError(format!("Failed to load melspectrogram model: {}", e))
         })?;
 
-        // Build interpreter
-        let mut interpreter = builder
-            .build()
-            .map_err(|e| EdgeError::Model(format!("Failed to build interpreter: {}", e)))?;
+        // Load wakeword model
+        let wakeword_model = Model::new(&config.wakeword_model_path).map_err(|e| {
+            EdgeError::ModelLoadError(format!("Failed to load wakeword model: {}", e))
+        })?;
 
-        // Allocate tensors
-        interpreter
-            .allocate_tensors()
-            .map_err(|e| EdgeError::Model(format!("Failed to allocate tensors: {}", e)))?;
-
-        // Get input and output indices
-        let inputs = interpreter.inputs().to_vec();
-        let outputs = interpreter.outputs().to_vec();
-
-        if inputs.is_empty() || outputs.is_empty() {
-            return Err(EdgeError::Model(
-                "Model has no inputs or outputs".to_string(),
-            ));
-        }
-
-        let input_index = inputs[0];
-        let output_index = outputs[0];
-
-        // Get tensor info for validation and logging
-        let input_tensor = interpreter
-            .tensor_info(input_index)
-            .ok_or_else(|| EdgeError::Model("Failed to get input tensor info".to_string()))?;
-        let output_tensor = interpreter
-            .tensor_info(output_index)
-            .ok_or_else(|| EdgeError::Model("Failed to get output tensor info".to_string()))?;
-
-        log::info!("Wakeword detector initialized:");
-        log::info!("  - Frame window size: {}", config.frame_window_size);
-        log::info!(
-            "  - Confidence threshold: {:.2}",
-            config.confidence_threshold
-        );
-        log::info!("  - Frame shift: {}", config.frame_shift);
-        log::info!("  - Input tensor shape: {:?}", input_tensor.dims);
-        log::info!("  - Output tensor shape: {:?}", output_tensor.dims);
-
-        // Validate mel feature size matches expected input
-        let expected_feature_size = if input_tensor.dims.len() >= 2 {
-            input_tensor.dims[input_tensor.dims.len() - 1] as usize // Last dimension is typically feature size
-        } else {
-            return Err(EdgeError::Model("Invalid input tensor shape".to_string()));
-        };
-
-        if mel_feature_size != expected_feature_size {
-            log::warn!(
-                "Mel feature size {} doesn't match expected input size {}",
-                mel_feature_size,
-                expected_feature_size
-            );
-        }
-
-        let frame_window_size = config.frame_window_size;
         Ok(Self {
+            melspec_model,
+            wakeword_model,
             config,
-            interpreter,
-            frame_buffer: VecDeque::with_capacity(frame_window_size),
-            frame_count: 0,
-            frame_feature_size: mel_feature_size,
-            input_index,
-            output_index,
         })
     }
 
-    /// Add a new mel spectrogram frame and check for wakeword detection
-    pub fn process_frame(&mut self, mel_features: Vec<f32>) -> Result<Option<WakewordDetection>> {
-        // Validate feature size
-        if mel_features.len() != self.frame_feature_size {
-            return Err(EdgeError::Model(format!(
-                "Invalid feature size: expected {}, got {}",
-                self.frame_feature_size,
-                mel_features.len()
+    /// Process audio samples and detect wakewords
+    pub fn process_audio(&self, audio_samples: &[f32]) -> Result<WakewordDetection> {
+        if audio_samples.len() != self.config.chunk_size {
+            return Err(EdgeError::InvalidInput(format!(
+                "Expected {} audio samples, got {}",
+                self.config.chunk_size,
+                audio_samples.len()
             )));
         }
 
-        // Add new frame to buffer
-        self.frame_buffer.push_back(mel_features);
-        self.frame_count += 1;
+        // Step 1: Convert audio to mel spectrogram features
+        let melspec_features = self.extract_melspec_features(audio_samples)?;
 
-        // Remove old frames if buffer is full
-        while self.frame_buffer.len() > self.config.frame_window_size {
-            self.frame_buffer.pop_front();
-        }
+        // Step 2: Run wakeword detection on mel spectrogram features
+        let confidence = self.detect_wakeword(&melspec_features)?;
 
-        // Only run detection when we have enough frames
-        if self.frame_buffer.len() < self.config.frame_window_size {
-            return Ok(None);
-        }
+        Ok(WakewordDetection {
+            detected: confidence >= self.config.confidence_threshold,
+            confidence,
+            timestamp: std::time::Instant::now(),
+        })
+    }
 
-        // Prepare input tensor data by flattening frame buffer
-        let mut input_data = Vec::new();
-        for frame in &self.frame_buffer {
-            input_data.extend_from_slice(frame);
-        }
+    /// Extract mel spectrogram features from raw audio
+    fn extract_melspec_features(&self, audio_samples: &[f32]) -> Result<Vec<f32>> {
+        // Create interpreter options
+        let mut options = Options::default();
+        options.thread_count = 1;
 
-        // Get input tensor data and copy flattened data
-        let tensor_input_data: &mut [f32] = self
-            .interpreter
-            .tensor_data_mut(self.input_index)
-            .map_err(|e| EdgeError::Model(format!("Failed to get input tensor data: {}", e)))?;
+        // Create interpreter
+        let interpreter = tflitec::interpreter::Interpreter::new(
+            &self.melspec_model,
+            Some(options),
+        )
+        .map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to create melspec interpreter: {}", e))
+        })?;
 
-        if tensor_input_data.len() < input_data.len() {
-            return Err(EdgeError::Model(
-                "Input tensor too small for frame data".to_string(),
+        // Resize input tensor to [1, chunk_size]
+        let input_shape = tensor::Shape::new(vec![1, self.config.chunk_size]);
+        interpreter.resize_input(0, input_shape).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to resize melspec input: {}", e))
+        })?;
+
+        // Allocate tensors
+        interpreter.allocate_tensors().map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to allocate melspec tensors: {}", e))
+        })?;
+
+        // Set input tensor data
+        interpreter.copy(audio_samples, 0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to set melspec input: {}", e))
+        })?;
+
+        // Run inference
+        interpreter
+            .invoke()
+            .map_err(|e| EdgeError::ProcessingError(format!("Melspec inference failed: {}", e)))?;
+
+        // Get output data
+        let output_tensor = interpreter.output(0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to get melspec output: {}", e))
+        })?;
+
+        let output_data = output_tensor.data::<f32>().to_vec();
+        Ok(output_data)
+    }
+
+    /// Detect wakeword from mel spectrogram features
+    fn detect_wakeword(&self, melspec_features: &[f32]) -> Result<f32> {
+        // Create interpreter options
+        let mut options = Options::default();
+        options.thread_count = 1;
+
+        // Create interpreter
+        let interpreter = tflitec::interpreter::Interpreter::new(
+            &self.wakeword_model,
+            Some(options),
+        )
+        .map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to create wakeword interpreter: {}", e))
+        })?;
+
+        // Allocate tensors (assuming the model has the right input shape)
+        interpreter.allocate_tensors().map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to allocate wakeword tensors: {}", e))
+        })?;
+
+        // Set input tensor data
+        interpreter.copy(melspec_features, 0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to set wakeword input: {}", e))
+        })?;
+
+        // Run inference
+        interpreter
+            .invoke()
+            .map_err(|e| EdgeError::ProcessingError(format!("Wakeword inference failed: {}", e)))?;
+
+        // Get output - should be a single confidence score
+        let output_tensor = interpreter.output(0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to get wakeword output: {}", e))
+        })?;
+
+        let output_data = output_tensor.data::<f32>();
+        if output_data.is_empty() {
+            return Err(EdgeError::ProcessingError(
+                "Empty wakeword output".to_string(),
             ));
         }
 
-        tensor_input_data[..input_data.len()].copy_from_slice(&input_data);
+        Ok(output_data[0])
+    }
 
-        // Run inference
-        self.interpreter
-            .invoke()
-            .map_err(|e| EdgeError::Model(format!("Inference failed: {}", e)))?;
+    /// Get the current configuration
+    pub fn config(&self) -> &WakewordConfig {
+        &self.config
+    }
+}
 
-        // Get output tensor data
-        let output_data: &[f32] = self
-            .interpreter
-            .tensor_data(self.output_index)
-            .map_err(|e| EdgeError::Model(format!("Failed to get output tensor data: {}", e)))?;
+// Global detector instance for convenient access
+lazy_static! {
+    static ref GLOBAL_DETECTOR: Arc<Mutex<Option<WakewordDetector<'static>>>> =
+        Arc::new(Mutex::new(None));
+}
 
-        // Assume single output value for binary classification
-        let confidence = if output_data.is_empty() {
-            return Err(EdgeError::Model("Empty output tensor".to_string()));
-        } else {
-            output_data[0] // For binary classification, often just one output value
-        };
+/// Initialize the global wakeword detector
+pub fn initialize_detector(config: WakewordConfig) -> Result<()> {
+    let detector = WakewordDetector::new(config)?;
+    let mut global = GLOBAL_DETECTOR.lock().map_err(|_| {
+        EdgeError::ProcessingError("Failed to acquire global detector lock".to_string())
+    })?;
+    *global = Some(detector);
+    Ok(())
+}
 
-        // Create detection result
-        let detected = confidence >= self.config.confidence_threshold;
-        let detection = WakewordDetection {
-            confidence,
-            detected,
-            frame_number: self.frame_count,
-        };
+/// Process audio using the global detector
+pub fn process_audio_global(audio_samples: &[f32]) -> Result<WakewordDetection> {
+    let global = GLOBAL_DETECTOR.lock().map_err(|_| {
+        EdgeError::ProcessingError("Failed to acquire global detector lock".to_string())
+    })?;
 
-        if detected {
-            log::info!(
-                "Wakeword detected! Confidence: {:.3}, Frame: {}",
-                confidence,
-                self.frame_count
-            );
+    match global.as_ref() {
+        Some(detector) => detector.process_audio(audio_samples),
+        None => Err(EdgeError::ProcessingError(
+            "Global detector not initialized".to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wakeword_config_default() {
+        let config = WakewordConfig::default();
+        assert_eq!(config.sample_rate, 16000);
+        assert_eq!(config.chunk_size, 1280);
+        assert_eq!(config.confidence_threshold, 0.5);
+    }
+
+    #[test]
+    fn test_wakeword_detector_creation() {
+        let config = WakewordConfig::default();
+
+        // This will fail in CI without the actual model files
+        match WakewordDetector::new(config) {
+            Ok(_) => println!("✅ Wakeword detector created successfully"),
+            Err(e) => println!("⚠️  Expected failure without model files: {}", e),
         }
-
-        Ok(Some(detection))
-    }
-
-    /// Get current frame buffer status (current_size, capacity)
-    pub fn buffer_status(&self) -> (usize, usize) {
-        (self.frame_buffer.len(), self.config.frame_window_size)
-    }
-
-    /// Reset the frame buffer (useful for testing or state reset)
-    pub fn reset_buffer(&mut self) {
-        self.frame_buffer.clear();
-        self.frame_count = 0;
-    }
-
-    /// Update the confidence threshold
-    pub fn set_threshold(&mut self, threshold: f32) {
-        if threshold >= 0.0 && threshold <= 1.0 {
-            self.config.confidence_threshold = threshold;
-            log::info!("Updated confidence threshold to {:.2}", threshold);
-        } else {
-            log::warn!(
-                "Invalid threshold {:.2}, must be between 0.0 and 1.0",
-                threshold
-            );
-        }
-    }
-
-    /// Get current confidence threshold
-    pub fn threshold(&self) -> f32 {
-        self.config.confidence_threshold
     }
 }

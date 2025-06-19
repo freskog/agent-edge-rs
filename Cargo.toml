@@ -1,36 +1,39 @@
 [package]
 name = "agent-edge-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Fredrik Skogberg <freskog@gmail.com>"]
 description = "Wakeword-only edge client for low-powered devices"
 
 [dependencies]
-# TensorFlow Lite inference for wakeword detection
-tflite = "0.9"
-
-# Audio processing and signal analysis
-hound = "3.5"  # For WAV file handling during testing
-byteorder = "1.5"
-dasp = "0.11"  # Digital Audio Signal Processing, includes sample conversion
-
-# PulseAudio support (Linux only)
-libpulse-binding = "2.30"
-libpulse-simple-binding = "2.29"
-
-# Utilities
+# Core utilities
+log = "0.4"
+env_logger = "0.10"
 anyhow = "1.0"
 thiserror = "1.0"
-log = "0.4"
-env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 
-# Async runtime
-tokio = { version = "1.0", features = ["full"] }
+# Machine learning
+tflitec = "0.6.0"
 
-[dev-dependencies]
-tempfile = "3.8"
+# Global state management
+lazy_static = "1.4"
+
+# PulseAudio support (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = { version = "2.28", optional = true }
+libpulse-simple-binding = { version = "2.28", optional = true }
 
 [[bin]]
 name = "agent-edge"
-path = "src/main.rs" 
+path = "src/main.rs"
+[features]
+default = []
+pulse = ["libpulse-binding", "libpulse-simple-binding"]
+
+# Profile optimized for static linking
+[profile.release-static]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"

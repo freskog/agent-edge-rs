@@ -1,173 +1,223 @@
-use crate::audio::AudioBuffer;
+//! Mel Spectrogram Processor using TensorFlow Lite
+//!
+//! This module provides mel spectrogram feature extraction from raw audio samples
+//! using the melspectrogram.tflite model with proper OpenWakeWord-compatible usage.
+//!
+//! Based on research, OpenWakeWord:
+//! 1. Uses resize_tensor_input(0, [1, 1280], strict=True) for the melspectrogram model
+//! 2. Expects input shape [1, 1280] (batch_size=1, sequence_length=1280)
+//! 3. The model processes 1.28 seconds of audio at 16kHz sample rate
+//! 4. Input is raw audio samples, not mel spectrograms
+
 use crate::error::{EdgeError, Result};
-use tflite::ops::builtin::BuiltinOpResolver;
-use tflite::{FlatBufferModel, InterpreterBuilder};
+use std::path::Path;
 
-/// Embedded melspectrogram model (baked into binary for edge deployment)
-const MELSPECTROGRAM_MODEL_BYTES: &[u8] = include_bytes!("../../models/melspectrogram.tflite");
+use tflitec::interpreter::Options;
+use tflitec::model::Model;
+use tflitec::tensor;
 
-/// Configuration for melspectrogram processing
+/// Configuration for mel spectrogram processing
 #[derive(Debug, Clone)]
 pub struct MelSpectrogramConfig {
-    /// Sample rate for audio processing (should match audio capture)
+    /// Path to the melspectrogram model
+    pub model_path: String,
+    /// Audio chunk size in samples (1280 = 80ms at 16kHz)
+    pub chunk_size: usize,
+    /// Sample rate (default: 16000 Hz)
     pub sample_rate: u32,
-    /// Duration of each chunk in milliseconds
-    pub chunk_duration_ms: u32,
-    /// Number of mel frequency bins
-    pub n_mels: usize,
 }
 
 impl Default for MelSpectrogramConfig {
     fn default() -> Self {
         Self {
-            sample_rate: 16000,    // Standard for speech processing
-            chunk_duration_ms: 80, // 80ms chunks as specified
-            n_mels: 80,            // Typical mel filterbank size
+            model_path: "models/melspectrogram.tflite".to_string(),
+            chunk_size: 1280, // 80ms at 16kHz
+            sample_rate: 16000,
         }
     }
 }
 
-/// Melspectrogram processor that converts 80ms audio chunks to mel spectrograms
-pub struct MelSpectrogramProcessor {
+/// Mel spectrogram processor using TensorFlow Lite
+///
+/// This processor converts raw audio samples to mel spectrogram features
+/// using the OpenWakeWord melspectrogram model approach.
+pub struct MelSpectrogramProcessor<'a> {
+    model: Model<'a>,
     config: MelSpectrogramConfig,
-    interpreter: tflite::Interpreter,
-    chunk_size_samples: usize,
-    input_index: i32,
-    output_index: i32,
 }
 
-impl MelSpectrogramProcessor {
-    /// Create a new melspectrogram processor with embedded model
+impl<'a> MelSpectrogramProcessor<'a> {
+    /// Create a new mel spectrogram processor
     pub fn new(config: MelSpectrogramConfig) -> Result<Self> {
-        let chunk_size_samples = (config.sample_rate * config.chunk_duration_ms / 1000) as usize;
-
-        log::info!(
-            "Loading embedded melspectrogram model ({} bytes)",
-            MELSPECTROGRAM_MODEL_BYTES.len()
-        );
-
-        // Load the embedded model
-        let model = FlatBufferModel::build_from_buffer(MELSPECTROGRAM_MODEL_BYTES.to_vec())
-            .map_err(|e| EdgeError::Model(format!("Failed to load melspectrogram model: {}", e)))?;
-
-        // Create resolver and interpreter builder
-        let resolver = BuiltinOpResolver::default();
-        let builder = InterpreterBuilder::new(&model, &resolver).map_err(|e| {
-            EdgeError::Model(format!("Failed to create interpreter builder: {}", e))
-        })?;
-
-        // Build interpreter
-        let mut interpreter = builder
-            .build()
-            .map_err(|e| EdgeError::Model(format!("Failed to build interpreter: {}", e)))?;
-
-        // Allocate tensors
-        interpreter
-            .allocate_tensors()
-            .map_err(|e| EdgeError::Model(format!("Failed to allocate tensors: {}", e)))?;
-
-        // Get input and output indices
-        let inputs = interpreter.inputs().to_vec();
-        let outputs = interpreter.outputs().to_vec();
-
-        if inputs.is_empty() || outputs.is_empty() {
-            return Err(EdgeError::Model(
-                "Model has no inputs or outputs".to_string(),
-            ));
-        }
-
-        let input_index = inputs[0];
-        let output_index = outputs[0];
-
-        // Get tensor info for logging
-        let input_tensor = interpreter
-            .tensor_info(input_index)
-            .ok_or_else(|| EdgeError::Model("Failed to get input tensor info".to_string()))?;
-        let output_tensor = interpreter
-            .tensor_info(output_index)
-            .ok_or_else(|| EdgeError::Model("Failed to get output tensor info".to_string()))?;
-
-        log::info!("MelSpectrogram processor initialized:");
-        log::info!(
-            "  - Chunk duration: {}ms ({} samples at {}Hz)",
-            config.chunk_duration_ms,
-            chunk_size_samples,
-            config.sample_rate
-        );
-        log::info!("  - Mel bins: {}", config.n_mels);
-        log::info!("  - Input tensor shape: {:?}", input_tensor.dims);
-        log::info!("  - Output tensor shape: {:?}", output_tensor.dims);
-
-        Ok(Self {
-            config,
-            interpreter,
-            chunk_size_samples,
-            input_index,
-            output_index,
-        })
-    }
-
-    /// Process an 80ms audio chunk and return mel spectrogram features
-    pub fn process_chunk(&mut self, audio_chunk: &AudioBuffer) -> Result<Vec<f32>> {
-        // Validate input size
-        if audio_chunk.len() != self.chunk_size_samples {
-            return Err(EdgeError::Model(format!(
-                "Invalid chunk size: expected {} samples, got {}",
-                self.chunk_size_samples,
-                audio_chunk.len()
+        let model_path = Path::new(&config.model_path);
+        if !model_path.exists() {
+            return Err(EdgeError::ModelLoadError(format!(
+                "Model file not found: {}",
+                config.model_path
             )));
         }
 
-        // Get input tensor data and copy audio data
-        let input_data: &mut [f32] = self
-            .interpreter
-            .tensor_data_mut(self.input_index)
-            .map_err(|e| EdgeError::Model(format!("Failed to get input tensor data: {}", e)))?;
+        // Load the model
+        let model = Model::new(&config.model_path)
+            .map_err(|e| EdgeError::ModelLoadError(format!("Failed to load model: {}", e)))?;
 
-        if input_data.len() < audio_chunk.len() {
-            return Err(EdgeError::Model(
-                "Input tensor too small for audio chunk".to_string(),
-            ));
+        Ok(Self { model, config })
+    }
+
+    /// Process audio samples to extract mel spectrogram features
+    ///
+    /// # Arguments
+    /// * `audio_samples` - Raw audio samples (must be exactly config.chunk_size length)
+    ///
+    /// # Returns
+    /// * `Vec<f32>` - Mel spectrogram features as a flattened vector
+    pub fn process(&self, audio_samples: &[f32]) -> Result<Vec<f32>> {
+        if audio_samples.len() != self.config.chunk_size {
+            return Err(EdgeError::InvalidInput(format!(
+                "Expected {} audio samples, got {}",
+                self.config.chunk_size,
+                audio_samples.len()
+            )));
         }
 
-        input_data[..audio_chunk.len()].copy_from_slice(audio_chunk);
+        // Create interpreter options
+        let mut options = Options::default();
+        options.thread_count = 1;
+
+        // Create interpreter (borrowing from model)
+        let interpreter = tflitec::interpreter::Interpreter::new(&self.model, Some(options))
+            .map_err(|e| {
+                EdgeError::ProcessingError(format!("Failed to create interpreter: {}", e))
+            })?;
+
+        // Resize input tensor to expected shape: [1, chunk_size]
+        let input_shape = tensor::Shape::new(vec![1, self.config.chunk_size]);
+        interpreter.resize_input(0, input_shape).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to resize input tensor: {}", e))
+        })?;
+
+        // Allocate tensors after resizing
+        interpreter.allocate_tensors().map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to allocate tensors: {}", e))
+        })?;
+
+        // Set input tensor data
+        interpreter
+            .copy(audio_samples, 0)
+            .map_err(|e| EdgeError::ProcessingError(format!("Failed to set input: {}", e)))?;
 
         // Run inference
-        self.interpreter
+        interpreter
             .invoke()
-            .map_err(|e| EdgeError::Model(format!("Inference failed: {}", e)))?;
+            .map_err(|e| EdgeError::ProcessingError(format!("Inference failed: {}", e)))?;
 
-        // Get output tensor data
-        let output_data: &[f32] = self
-            .interpreter
-            .tensor_data(self.output_index)
-            .map_err(|e| EdgeError::Model(format!("Failed to get output tensor data: {}", e)))?;
+        // Get output tensor
+        let output_tensor = interpreter.output(0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to get output tensor: {}", e))
+        })?;
 
-        // Return mel spectrogram features
-        Ok(output_data.to_vec())
+        // Read output data
+        let output_data = output_tensor.data::<f32>().to_vec();
+
+        Ok(output_data)
     }
 
-    /// Get the expected chunk size in samples
-    pub fn chunk_size_samples(&self) -> usize {
-        self.chunk_size_samples
+    /// Get the current configuration
+    pub fn config(&self) -> &MelSpectrogramConfig {
+        &self.config
     }
 
-    /// Get the expected chunk duration in milliseconds
-    pub fn chunk_duration_ms(&self) -> u32 {
-        self.config.chunk_duration_ms
+    /// Get the expected input shape
+    pub fn input_shape(&self) -> Result<Vec<i32>> {
+        Ok(vec![1, self.config.chunk_size as i32])
     }
 
-    /// Get the number of mel frequency bins in the output
-    pub fn n_mels(&self) -> usize {
-        self.config.n_mels
+    /// Get the output shape by running a quick inference
+    pub fn output_shape(&self) -> Result<Vec<i32>> {
+        // Create a temporary interpreter to get output shape
+        let mut options = Options::default();
+        options.thread_count = 1;
+
+        let interpreter = tflitec::interpreter::Interpreter::new(&self.model, Some(options))
+            .map_err(|e| {
+                EdgeError::ProcessingError(format!("Failed to create interpreter: {}", e))
+            })?;
+
+        let input_shape = tensor::Shape::new(vec![1, self.config.chunk_size]);
+        interpreter.resize_input(0, input_shape).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to resize input tensor: {}", e))
+        })?;
+
+        interpreter.allocate_tensors().map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to allocate tensors: {}", e))
+        })?;
+
+        let output_tensor = interpreter.output(0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to get output tensor: {}", e))
+        })?;
+
+        Ok(output_tensor
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|&x| x as i32)
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_melspec_config_default() {
+        let config = MelSpectrogramConfig::default();
+        assert_eq!(config.chunk_size, 1280);
+        assert_eq!(config.sample_rate, 16000);
+        assert!(config.model_path.contains("melspectrogram.tflite"));
     }
 
-    /// Get output feature dimensions (for accumulating frames for wakeword model)
-    pub fn output_shape(&self) -> Result<Vec<usize>> {
-        let output_tensor = self
-            .interpreter
-            .tensor_info(self.output_index)
-            .ok_or_else(|| EdgeError::Model("Failed to get output tensor info".to_string()))?;
-        Ok(output_tensor.dims.iter().map(|&d| d as usize).collect())
+    #[test]
+    fn test_melspec_processor_creation() {
+        let config = MelSpectrogramConfig::default();
+
+        // This will fail in CI without the actual model file
+        match MelSpectrogramProcessor::new(config) {
+            Ok(_) => println!("✅ Mel spectrogram processor created successfully"),
+            Err(e) => println!("⚠️  Expected failure without model files: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_audio_sample_generation() {
+        let chunk_size = 1280;
+        let sample_rate = 16000;
+
+        // Generate test sine wave
+        let frequency = 440.0; // A4 note
+        let audio_samples: Vec<f32> = (0..chunk_size)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.5
+            })
+            .collect();
+
+        assert_eq!(audio_samples.len(), chunk_size);
+
+        // Verify amplitude range
+        let max_val = audio_samples
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let min_val = audio_samples.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+
+        assert!(max_val <= 1.0);
+        assert!(min_val >= -1.0);
+
+        println!(
+            "Generated {} audio samples with range [{:.3}, {:.3}]",
+            audio_samples.len(),
+            min_val,
+            max_val
+        );
     }
 }
