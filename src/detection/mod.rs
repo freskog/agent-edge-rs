@@ -1,3 +1,3 @@
 pub mod pipeline;
 
-pub use pipeline::{DetectionPipeline, PipelineConfig, PipelineStats};
+pub use pipeline::{DetectionPipeline, DetectionResult, OpenWakeWordConfig};

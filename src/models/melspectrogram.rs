@@ -119,7 +119,30 @@ impl<'a> MelSpectrogramProcessor<'a> {
         // Read output data
         let output_data = output_tensor.data::<f32>().to_vec();
 
-        Ok(output_data)
+        // Apply OpenWakeWord's melspectrogram transform: x/10 + 2
+        let transformed_data: Vec<f32> = output_data.iter().map(|&x| x / 10.0 + 2.0).collect();
+
+        // Debug: Let's see what the melspectrogram is producing
+        if transformed_data.len() >= 10 {
+            log::info!("Melspec output (first 10): {:?}", &transformed_data[0..10]);
+            log::info!(
+                "Melspec output (last 10): {:?}",
+                &transformed_data[transformed_data.len() - 10..]
+            );
+            log::info!(
+                "Melspec stats: min={:.3}, max={:.3}, mean={:.3}",
+                transformed_data
+                    .iter()
+                    .fold(f32::INFINITY, |a, &b| a.min(b)),
+                transformed_data
+                    .iter()
+                    .fold(f32::NEG_INFINITY, |a, &b| a.max(b)),
+                transformed_data.iter().sum::<f32>() / transformed_data.len() as f32
+            );
+        }
+        log::info!("Melspec output total length: {}", transformed_data.len());
+
+        Ok(transformed_data)
     }
 
     /// Get the current configuration
@@ -162,6 +185,49 @@ impl<'a> MelSpectrogramProcessor<'a> {
             .iter()
             .map(|&x| x as i32)
             .collect())
+    }
+
+    pub fn get_expected_input_size(&self) -> usize {
+        self.config.chunk_size
+    }
+
+    pub fn get_expected_output_size(&self) -> usize {
+        // Based on OpenWakeWord, melspectrogram produces [1, 1, 5, 32] = 160 features per chunk
+        160
+    }
+}
+
+/// Simple wrapper for mel spectrogram model used by the detection pipeline
+pub struct MelspectrogramModel<'a> {
+    processor: MelSpectrogramProcessor<'a>,
+}
+
+impl<'a> MelspectrogramModel<'a> {
+    pub fn new(model_path: &str) -> Result<Self> {
+        let config = MelSpectrogramConfig {
+            model_path: model_path.to_string(),
+            ..Default::default()
+        };
+        let processor = MelSpectrogramProcessor::new(config)?;
+        Ok(Self { processor })
+    }
+
+    pub fn compute(&self, audio: &[i16]) -> Result<Vec<f32>> {
+        // Convert i16 to f32
+        let audio_f32: Vec<f32> = audio.iter().map(|&x| x as f32).collect();
+        self.processor.process(&audio_f32)
+    }
+
+    pub fn predict(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        self.processor.process(audio)
+    }
+
+    pub fn get_expected_input_size(&self) -> usize {
+        self.processor.get_expected_input_size()
+    }
+
+    pub fn get_expected_output_size(&self) -> usize {
+        self.processor.get_expected_output_size()
     }
 }
 

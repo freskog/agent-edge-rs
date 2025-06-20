@@ -49,6 +49,120 @@ pub struct WakewordDetection {
     pub timestamp: std::time::Instant,
 }
 
+/// Simple wrapper for wakeword model used by the detection pipeline  
+pub struct WakewordModel<'a> {
+    model: Model<'a>,
+    expected_input_size: usize,
+    pub confidence_threshold: f32,
+    pub sample_rate: u32,
+}
+
+impl<'a> WakewordModel<'a> {
+    pub fn new(model_path: &str) -> Result<Self> {
+        let model = Model::new(model_path).map_err(|e| {
+            EdgeError::ModelLoadError(format!("Failed to load wakeword model: {}", e))
+        })?;
+
+        // Corrected: Model expects [1, 16, 96] = 1536 features (16 embedding frames × 96 features each)
+        let expected_input_size = 1536;
+
+        Ok(Self {
+            model,
+            expected_input_size,
+            confidence_threshold: 0.5,
+            sample_rate: 16000,
+        })
+    }
+
+    pub fn predict(&self, features: &[f32]) -> Result<f32> {
+        if features.len() != self.expected_input_size {
+            return Err(EdgeError::InvalidInput(format!(
+                "Expected {} features, got {}",
+                self.expected_input_size,
+                features.len()
+            )));
+        }
+
+        // Temporary debug to see what's happening
+        log::info!(
+            "Wakeword model raw input (len={}): first 10: {:?}",
+            features.len(),
+            &features[0..10.min(features.len())]
+        );
+
+        // Create interpreter options
+        let mut options = Options::default();
+        options.thread_count = 1;
+
+        // Create interpreter
+        let interpreter = tflitec::interpreter::Interpreter::new(&self.model, Some(options))
+            .map_err(|e| {
+                EdgeError::ProcessingError(format!("Failed to create wakeword interpreter: {}", e))
+            })?;
+
+        // Resize input tensor to [1, expected_input_size]
+        let input_shape = tensor::Shape::new(vec![1, self.expected_input_size]);
+        interpreter.resize_input(0, input_shape).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to resize wakeword input: {}", e))
+        })?;
+
+        // Allocate tensors
+        interpreter.allocate_tensors().map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to allocate wakeword tensors: {}", e))
+        })?;
+
+        // Set input tensor data (use original features without normalization)
+        interpreter.copy(features, 0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to set wakeword input: {}", e))
+        })?;
+
+        // Run inference
+        interpreter
+            .invoke()
+            .map_err(|e| EdgeError::ProcessingError(format!("Wakeword inference failed: {}", e)))?;
+
+        // Get output - model outputs [4, 1] so we need to check the shape
+        let output_tensor = interpreter.output(0).map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to get wakeword output: {}", e))
+        })?;
+
+        let output_data = output_tensor.data::<f32>();
+        if output_data.is_empty() {
+            return Err(EdgeError::ProcessingError(
+                "Empty wakeword output".to_string(),
+            ));
+        }
+
+        // Temporary debug to see what's happening
+        log::info!(
+            "Wakeword model raw outputs (len={}): {:?}",
+            output_data.len(),
+            output_data
+        );
+
+        // Real OpenWakeWord model outputs a single confidence score (not 4 classes)
+        // This matches our model inspection: output shape [1, 1] = 1 value
+
+        if output_data.len() != 1 {
+            log::warn!("Expected 1 output value, got {}", output_data.len());
+            return Ok(0.0);
+        }
+
+        // The single output value is already a confidence score
+        let confidence = output_data[0];
+
+        // Clamp to valid range [0, 1]
+        let confidence = confidence.max(0.0).min(1.0);
+
+        // Return the confidence score directly
+        Ok(confidence)
+    }
+
+    pub fn get_expected_input_size(&self) -> usize {
+        self.expected_input_size
+    }
+}
+
 /// Thread-safe wakeword detector
 pub struct WakewordDetector<'a> {
     melspec_model: Model<'a>,

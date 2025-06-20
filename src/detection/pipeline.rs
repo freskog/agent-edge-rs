@@ -1,208 +1,287 @@
-use crate::audio::AudioBuffer;
 use crate::error::Result;
-use crate::models::{WakewordConfig, WakewordDetection, WakewordDetector};
-use std::time::Instant;
+use crate::models::{
+    embedding::EmbeddingModel, melspectrogram::MelspectrogramModel, wakeword::WakewordModel,
+};
+use std::collections::VecDeque;
 
-/// Configuration for the complete detection pipeline
 #[derive(Debug, Clone)]
-pub struct PipelineConfig {
-    /// Wakeword detection configuration
-    pub wakeword_config: WakewordConfig,
-    /// Enable detailed logging for debugging
-    pub debug_mode: bool,
+pub struct DetectionResult {
+    pub detected: bool,
+    pub confidence: f32,
+    pub timestamp: u128,
 }
 
-impl Default for PipelineConfig {
+#[derive(Debug, Clone)]
+pub struct OpenWakeWordConfig {
+    pub chunk_size: usize,        // 1280 samples (80ms at 16kHz)
+    pub detection_threshold: f32, // 0.5 default
+}
+
+impl Default for OpenWakeWordConfig {
     fn default() -> Self {
         Self {
-            wakeword_config: WakewordConfig::default(),
-            debug_mode: false,
+            chunk_size: 1280, // 80ms at 16kHz
+            detection_threshold: 0.5,
         }
     }
 }
 
-/// Statistics for monitoring pipeline performance
-#[derive(Debug, Clone)]
-pub struct PipelineStats {
-    /// Total number of audio chunks processed
-    pub chunks_processed: u64,
-    /// Number of wakeword detections
-    pub detections_count: u64,
-    /// Total processing time for all chunks
-    pub total_processing_time_ms: f64,
-    /// Average processing time per chunk
-    pub avg_processing_time_ms: f64,
-    /// Last detection confidence
-    pub last_confidence: f32,
-}
-
-/// Complete wakeword detection pipeline
-///
-/// This pipeline processes 80ms audio chunks (1280 samples at 16kHz) directly
-/// through the integrated melspectrogram + wakeword detection models.
+/// OpenWakeWord-style detection pipeline with CORRECTED approach:
+/// - Generate embedding every 80ms chunk using sliding window of mel frames
+/// - Accumulate embeddings in sliding window
+/// - Make wakeword prediction every 80ms using sliding window of embeddings
 pub struct DetectionPipeline<'a> {
-    wakeword_detector: WakewordDetector<'a>,
-    config: PipelineConfig,
-    stats: PipelineStats,
+    melspectrogram_model: MelspectrogramModel<'a>,
+    embedding_model: EmbeddingModel<'a>,
+    wakeword_model: WakewordModel<'a>,
+
+    // Audio buffering for 80ms chunks
+    audio_buffer: VecDeque<i16>,
+    chunk_size: usize,
+
+    // Mel frame buffering for embedding model (need ~76 frames for each embedding)
+    mel_buffer: VecDeque<Vec<f32>>,
+
+    // Embedding buffering for wakeword model (need 64 embeddings of 96 features each)
+    embedding_buffer: VecDeque<Vec<f32>>,
+
+    config: OpenWakeWordConfig,
+    debug_mode: bool,
+
+    // Debouncing to prevent repeated detections
+    last_detection_time: Option<std::time::Instant>,
+    debounce_duration: std::time::Duration,
 }
 
 impl<'a> DetectionPipeline<'a> {
-    /// Create a new detection pipeline
-    pub fn new(config: PipelineConfig) -> Result<Self> {
-        log::info!("Initializing wakeword detection pipeline");
+    pub fn new(
+        melspectrogram_model_path: &str,
+        embedding_model_path: &str,
+        wakeword_model_path: &str,
+        config: OpenWakeWordConfig,
+    ) -> Result<Self> {
+        log::info!("Initializing FINAL CORRECTED OpenWakeWord pipeline");
 
-        // Create the integrated wakeword detector
-        let wakeword_detector = WakewordDetector::new(config.wakeword_config.clone())?;
+        let melspectrogram_model = MelspectrogramModel::new(melspectrogram_model_path)?;
+        let embedding_model = EmbeddingModel::new(embedding_model_path)?;
+        let wakeword_model = WakewordModel::new(wakeword_model_path)?;
 
-        log::info!("Detection pipeline initialized successfully");
-        log::info!(
-            "Expected chunk size: {} samples",
-            config.wakeword_config.chunk_size
-        );
+        log::info!("🔍 CORRECTED OpenWakeWord Architecture (Matching Official):");
+        log::info!("   ✅ Process each 80ms chunk → generate 1 embedding");
+        log::info!("   ✅ Embedding uses sliding window of 76 mel frames");
+        log::info!("   ✅ Accumulate embeddings in sliding window of 16");
+        log::info!("   ✅ Wakeword prediction every 80ms using 16 embeddings");
+        log::info!("   ✅ Model expects [1, 16, 96] = 1536 features (not 6144)");
 
-        Ok(Self {
-            wakeword_detector,
+        Ok(DetectionPipeline {
+            melspectrogram_model,
+            embedding_model,
+            wakeword_model,
+            audio_buffer: VecDeque::new(),
+            chunk_size: config.chunk_size,
+            mel_buffer: VecDeque::new(),
+            embedding_buffer: VecDeque::new(),
             config,
-            stats: PipelineStats {
-                chunks_processed: 0,
-                detections_count: 0,
-                total_processing_time_ms: 0.0,
-                avg_processing_time_ms: 0.0,
-                last_confidence: 0.0,
-            },
+            debug_mode: true,
+            last_detection_time: None,
+            debounce_duration: std::time::Duration::from_millis(1500), // 1.5 seconds debounce
         })
     }
 
-    /// Process an 80ms audio chunk through the complete pipeline
-    ///
-    /// # Arguments
-    /// * `audio_samples` - Raw audio samples (must be exactly 1280 samples)
-    ///
-    /// # Returns
-    /// * `Option<WakewordDetection>` - Detection result if processing succeeds
-    pub fn process_chunk(&mut self, audio_samples: &[f32]) -> Result<WakewordDetection> {
-        let start_time = Instant::now();
+    pub fn process_audio_chunk(&mut self, audio_samples: &[i16]) -> Result<DetectionResult> {
+        // Add samples to buffer
+        self.audio_buffer.extend(audio_samples);
 
-        // Process audio directly through the integrated detector
-        let detection = self.wakeword_detector.process_audio(audio_samples)?;
+        let mut detection = DetectionResult {
+            detected: false,
+            confidence: 0.0,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        };
 
-        // Update statistics
-        let processing_time = start_time.elapsed().as_secs_f64() * 1000.0;
-        self.update_stats(&detection, processing_time);
+        // Process complete chunks - this triggers embedding generation and prediction every 80ms
+        while self.audio_buffer.len() >= self.chunk_size {
+            let chunk: Vec<i16> = self.audio_buffer.drain(..self.chunk_size).collect();
 
-        if self.config.debug_mode {
-            log::debug!(
-                "Processed chunk {}: {:.2}ms, confidence: {:.3}, detected: {}",
-                self.stats.chunks_processed,
-                processing_time,
-                detection.confidence,
-                detection.detected
-            );
-        }
+            // Convert to f32 for model input
+            let audio_chunk: Vec<f32> = chunk.iter().map(|&x| x as f32).collect();
 
-        if detection.detected {
-            log::info!("Wakeword detected! Confidence: {:.3}", detection.confidence);
+            // Stage 1: Melspectrogram (80ms audio → mel features)
+            let mel_features = self.melspectrogram_model.predict(&audio_chunk)?;
+
+            // Each chunk gives us 5 time frames of 32 mel bins each (160 features total)
+            if mel_features.len() != 160 {
+                log::warn!("Expected 160 mel features, got {}", mel_features.len());
+                continue;
+            }
+
+            // Convert to time frames: [160] → [5, 32]
+            let mut time_frames = Vec::new();
+            for frame_idx in 0..5 {
+                let start = frame_idx * 32;
+                let frame = mel_features[start..start + 32].to_vec();
+                time_frames.push(frame);
+            }
+
+            // Add new frames to sliding window
+            self.mel_buffer.extend(time_frames);
+
+            // Maintain sliding window for embedding model
+            while self.mel_buffer.len() > 80 {
+                self.mel_buffer.pop_front();
+            }
+
+            if self.debug_mode {
+                log::info!(
+                    "Added 5 frames, buffer now has {} frames",
+                    self.mel_buffer.len()
+                );
+            }
+
+            // Generate embedding if we have enough frames
+            if self.mel_buffer.len() >= 76 {
+                // Use most recent 76 frames for embedding
+                let start_idx = self.mel_buffer.len() - 76;
+                let mut embedding_input = Vec::with_capacity(76 * 32);
+
+                for i in start_idx..self.mel_buffer.len() {
+                    embedding_input.extend(&self.mel_buffer[i]);
+                }
+
+                if embedding_input.len() != 2432 {
+                    log::warn!(
+                        "Embedding input size mismatch: got {}, expected 2432",
+                        embedding_input.len()
+                    );
+                    continue;
+                }
+
+                // Stage 2: Embedding (76 mel frames → single embedding)
+                let embeddings = self.embedding_model.predict(&embedding_input)?;
+
+                if self.debug_mode {
+                    log::info!(
+                        "✅ Generated embedding {} using frames {}-{}, first 5 values: [{:.3}, {:.3}, {:.3}, {:.3}, {:.3}]",
+                        embeddings.len(),
+                        start_idx,
+                        self.mel_buffer.len() - 1,
+                        embeddings.get(0).unwrap_or(&0.0),
+                        embeddings.get(1).unwrap_or(&0.0),
+                        embeddings.get(2).unwrap_or(&0.0),
+                        embeddings.get(3).unwrap_or(&0.0),
+                        embeddings.get(4).unwrap_or(&0.0)
+                    );
+                }
+
+                // Add embedding to sliding window
+                self.embedding_buffer.push_back(embeddings);
+
+                // Maintain sliding window of 16 embeddings (matching real OpenWakeWord)
+                while self.embedding_buffer.len() > 16 {
+                    self.embedding_buffer.pop_front();
+                }
+
+                // Stage 3: Wakeword prediction (every 80ms using sliding window of embeddings)
+                if self.embedding_buffer.len() >= 1 {
+                    let mut wakeword_input = Vec::with_capacity(1536);
+
+                    if self.embedding_buffer.len() >= 16 {
+                        // Use most recent 16 embeddings (not 64!)
+                        let start_idx = self.embedding_buffer.len() - 16;
+                        for i in start_idx..self.embedding_buffer.len() {
+                            wakeword_input.extend(&self.embedding_buffer[i]);
+                        }
+                    } else {
+                        // Zero-pad for early frames (like real OpenWakeWord)
+                        // Zero-pad the missing slots FIRST
+                        let missing_embeddings = 16 - self.embedding_buffer.len();
+                        for _ in 0..missing_embeddings {
+                            wakeword_input.extend(vec![0.0f32; 96]);
+                        }
+
+                        // Then add all available embeddings at the END
+                        for embedding in &self.embedding_buffer {
+                            wakeword_input.extend(embedding);
+                        }
+                    }
+
+                    if wakeword_input.len() != 1536 {
+                        log::warn!(
+                            "Wakeword input size mismatch: got {}, expected 1536",
+                            wakeword_input.len()
+                        );
+                        continue;
+                    }
+
+                    if self.debug_mode {
+                        log::info!(
+                            "Wakeword input prepared: {} embeddings, last 5 values: [{:.3}, {:.3}, {:.3}, {:.3}, {:.3}]",
+                            self.embedding_buffer.len(),
+                            wakeword_input.get(1531).unwrap_or(&0.0),
+                            wakeword_input.get(1532).unwrap_or(&0.0),
+                            wakeword_input.get(1533).unwrap_or(&0.0),
+                            wakeword_input.get(1534).unwrap_or(&0.0),
+                            wakeword_input.get(1535).unwrap_or(&0.0)
+                        );
+                    }
+
+                    // This is the correct OpenWakeWord approach: prediction every 80ms!
+                    detection.confidence = self.wakeword_model.predict(&wakeword_input)?;
+
+                    if detection.confidence > self.config.detection_threshold {
+                        // Check debouncing
+                        let now = std::time::Instant::now();
+                        let should_trigger = match self.last_detection_time {
+                            Some(last_time) => {
+                                now.duration_since(last_time) >= self.debounce_duration
+                            }
+                            None => true, // First detection
+                        };
+
+                        if should_trigger {
+                            detection.detected = true;
+                            self.last_detection_time = Some(now);
+                            log::info!(
+                                "🎉 WAKEWORD DETECTED! Confidence: {:.3} (using {} embeddings)",
+                                detection.confidence,
+                                self.embedding_buffer.len()
+                            );
+                        } else if self.debug_mode {
+                            let remaining = self.debounce_duration.saturating_sub(
+                                now.duration_since(self.last_detection_time.unwrap()),
+                            );
+                            log::info!(
+                                "Debounced detection: {:.3} confidence ({}ms remaining)",
+                                detection.confidence,
+                                remaining.as_millis()
+                            );
+                        }
+                    } else if self.debug_mode {
+                        log::info!(
+                            "Detection confidence: {:.4} (using {} embeddings)",
+                            detection.confidence,
+                            self.embedding_buffer.len()
+                        );
+                    }
+                }
+            } else if self.debug_mode {
+                log::info!(
+                    "📊 Collecting frames: {}/76 needed for embedding",
+                    self.mel_buffer.len()
+                );
+            }
         }
 
         Ok(detection)
     }
 
-    /// Process audio from an AudioBuffer
-    pub fn process_audio_buffer(
-        &mut self,
-        audio_buffer: &AudioBuffer,
-    ) -> Result<WakewordDetection> {
-        // AudioBuffer is Vec<f32>, so we can pass it directly
-        self.process_chunk(audio_buffer)
-    }
-
-    /// Update internal statistics
-    fn update_stats(&mut self, detection: &WakewordDetection, processing_time_ms: f64) {
-        self.stats.chunks_processed += 1;
-        self.stats.total_processing_time_ms += processing_time_ms;
-        self.stats.avg_processing_time_ms =
-            self.stats.total_processing_time_ms / self.stats.chunks_processed as f64;
-        self.stats.last_confidence = detection.confidence;
-
-        if detection.detected {
-            self.stats.detections_count += 1;
-        }
-    }
-
-    /// Process multiple audio chunks at once
-    pub async fn process_chunks(
-        &mut self,
-        audio_chunks: Vec<&[f32]>,
-    ) -> Result<Vec<WakewordDetection>> {
-        let mut results = Vec::with_capacity(audio_chunks.len());
-
-        for chunk in audio_chunks {
-            let detection = self.process_chunk(chunk)?;
-            if detection.detected {
-                log::info!(
-                    "Wakeword detected in batch processing! Confidence: {:.3}",
-                    detection.confidence
-                );
-            }
-            results.push(detection);
-        }
-
-        Ok(results)
-    }
-
-    /// Get current pipeline statistics
-    pub fn stats(&self) -> &PipelineStats {
-        &self.stats
-    }
-
-    /// Reset pipeline statistics
-    pub fn reset_stats(&mut self) {
-        self.stats = PipelineStats {
-            chunks_processed: 0,
-            detections_count: 0,
-            total_processing_time_ms: 0.0,
-            avg_processing_time_ms: 0.0,
-            last_confidence: 0.0,
-        };
-        log::info!("Pipeline statistics reset");
-    }
-
-    /// Update wakeword detection threshold dynamically
-    pub fn set_threshold(&mut self, _threshold: f32) {
-        // Update the internal configuration
-        // Note: The detector doesn't have a mutable set_threshold method,
-        // so this would require recreating the detector or adding that method
-        log::warn!("Dynamic threshold updates not yet implemented");
-    }
-
-    /// Get current detection threshold
-    pub fn get_threshold(&self) -> f32 {
-        self.wakeword_detector.config().confidence_threshold
-    }
-
-    /// Enable or disable debug mode
-    pub fn set_debug_mode(&mut self, enabled: bool) {
-        self.config.debug_mode = enabled;
-        log::info!(
-            "Debug mode {}",
-            if enabled { "enabled" } else { "disabled" }
-        );
-    }
-
-    /// Get chunk size requirements for this pipeline
-    pub fn chunk_size_samples(&self) -> usize {
-        self.wakeword_detector.config().chunk_size
-    }
-
-    /// Get chunk duration in milliseconds
-    pub fn chunk_duration_ms(&self) -> u32 {
-        let samples = self.chunk_size_samples();
-        let sample_rate = self.wakeword_detector.config().sample_rate;
-        (samples as f64 / sample_rate as f64 * 1000.0) as u32
-    }
-
-    /// Get pipeline configuration
-    pub fn config(&self) -> &PipelineConfig {
-        &self.config
+    pub fn reset(&mut self) {
+        self.audio_buffer.clear();
+        self.mel_buffer.clear();
+        self.embedding_buffer.clear();
+        self.last_detection_time = None;
+        log::info!("Pipeline reset");
     }
 }

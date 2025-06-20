@@ -2,9 +2,7 @@ use crate::audio::{AudioBuffer, ChannelExtractor};
 use crate::error::{EdgeError, Result};
 use libpulse_binding as pulse;
 use libpulse_simple_binding as psimple;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 /// Configuration for PulseAudio capture
@@ -40,6 +38,8 @@ pub struct PulseAudioCapture {
     _audio_sender: Option<mpsc::Sender<AudioBuffer>>,
     capture_thread: Option<thread::JoinHandle<()>>,
     stop_flag: Arc<Mutex<bool>>,
+    // Buffer to accumulate samples for 80ms chunks
+    sample_buffer: Vec<i16>,
 }
 
 impl PulseAudioCapture {
@@ -57,6 +57,7 @@ impl PulseAudioCapture {
             _audio_sender: None,
             capture_thread: None,
             stop_flag: Arc::new(Mutex::new(false)),
+            sample_buffer: Vec::new(),
         })
     }
 
@@ -185,17 +186,18 @@ impl PulseAudioCapture {
                     let channel_data = channel_extractor.extract_channel(&samples);
                     sample_count += channel_data.len();
 
-                    if let Err(e) = sender.send(channel_data) {
+                    if let Err(e) = sender.send(channel_data.clone()) {
                         log::warn!("Failed to send audio data: {}, stopping capture", e);
                         break;
                     }
 
                     // Log progress occasionally
-                    if sample_count % 32000 == 0 {
-                        // Every ~2 seconds at 16kHz
-                        log::debug!(
-                            "Captured {} samples with controlled latency buffering",
-                            sample_count
+                    if sample_count % 16000 == 0 {
+                        // Every ~1 second at 16kHz
+                        log::info!(
+                            "Audio capture: {} samples total, last chunk: {} samples",
+                            sample_count,
+                            channel_data.len()
                         );
                     }
                 }
@@ -268,5 +270,41 @@ impl PulseAudioCapture {
         // For now, return empty list since this requires more complex PulseAudio setup
         log::warn!("PulseAudio device enumeration not yet implemented");
         Ok(vec![])
+    }
+
+    /// Simple method to read a chunk of audio as i16 samples (for wakeword detection)
+    /// Returns 1280 samples (80ms at 16kHz) when available
+    pub fn read_chunk(&mut self) -> Result<Vec<i16>> {
+        // Accumulate samples until we have enough for an 80ms chunk
+        while self.sample_buffer.len() < 1280 {
+            match self.try_get_audio_buffer()? {
+                Some(audio_buffer) => {
+                    // Convert f32 to i16 and add to buffer
+                    let new_samples: Vec<i16> = audio_buffer
+                        .iter()
+                        .map(|&sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                        .collect();
+
+                    log::debug!(
+                        "Adding {} samples to buffer (current: {}, need: 1280)",
+                        new_samples.len(),
+                        self.sample_buffer.len()
+                    );
+                    self.sample_buffer.extend(new_samples);
+                }
+                None => {
+                    // No audio available yet
+                    return Err(EdgeError::Audio("No audio data available".to_string()));
+                }
+            }
+        }
+
+        // Extract exactly 1280 samples (80ms at 16kHz)
+        let chunk = self.sample_buffer.drain(0..1280).collect();
+        log::debug!(
+            "Returning 1280 samples, {} samples remaining in buffer",
+            self.sample_buffer.len()
+        );
+        Ok(chunk)
     }
 }

@@ -1,192 +1,160 @@
-use anyhow::Result;
-use clap::Parser;
-use env_logger;
-use log::{info, warn};
+use agent_edge_rs::{
+    detection::pipeline::{DetectionPipeline, OpenWakeWordConfig},
+    error::Result,
+};
+use log;
 
-mod audio;
-mod detection;
-mod error;
-mod models;
+fn main() -> Result<()> {
+    env_logger::init();
 
-use crate::detection::{DetectionPipeline, PipelineConfig};
-use crate::models::WakewordConfig;
+    // Show startup banner
+    println!("🎙️  WAKEWORD DETECTION SYSTEM STARTING...");
+    println!("📊 Say: 'hey mycroft' to trigger detection");
+    println!("🔧 Threshold: 0.5 confidence required");
+    println!("⏹️  Press Ctrl+C to stop");
+    println!("");
 
-#[derive(Parser)]
-#[command(name = "agent-edge")]
-#[command(about = "Wakeword-only edge client for low-powered devices")]
-struct Cli {
-    /// Enable verbose logging
-    #[arg(short, long)]
-    verbose: bool,
+    log::info!("Starting agent-edge-rs wakeword detection with proper OpenWakeWord architecture");
 
-    /// Path to the wakeword model file
-    #[arg(long, default_value = "models/hey_mycroft_v0.1.tflite")]
-    wakeword_model: String,
+    // Initialize the 3-stage OpenWakeWord pipeline
+    let config = OpenWakeWordConfig::default();
+    let mut pipeline = DetectionPipeline::new(
+        "models/melspectrogram.tflite",
+        "models/embedding_model.tflite",
+        "models/hey_mycroft_v0.1.tflite",
+        config,
+    )?;
 
-    /// Path to the melspectrogram model file
-    #[arg(long, default_value = "models/melspectrogram.tflite")]
-    melspec_model: String,
+    log::info!("✅ OpenWakeWord pipeline initialized with 3-stage architecture:");
+    log::info!("   Stage 1: Melspectrogram (audio → mel features)");
+    log::info!("   Stage 2: Embedding (mel features → speech embeddings)");
+    log::info!("   Stage 3: Wakeword (embeddings → classification)");
+    log::info!("");
 
-    /// Confidence threshold for wakeword detection
-    #[arg(long, default_value = "0.8")]
-    threshold: f32,
+    log::info!("🎯 Target: 'hey mycroft'");
+    log::info!("📊 Threshold: 0.5");
+    log::info!("⚡ Chunk size: 80ms (1280 samples)");
+    log::info!("");
 
-    /// Enable debug mode for detailed logging
-    #[arg(long)]
-    debug: bool,
+    // Try microphone capture first (if available)
+    #[cfg(all(target_os = "linux", feature = "pulse"))]
+    {
+        use agent_edge_rs::audio::pulse_capture::{PulseAudioCapture, PulseAudioCaptureConfig};
 
-    /// Run basic functionality test
-    #[arg(long)]
-    test: bool,
-}
+        let config = PulseAudioCaptureConfig::default();
+        match PulseAudioCapture::new(config) {
+            Ok(mut audio_capture) => {
+                // Start the capture
+                if let Err(e) = audio_capture.start() {
+                    println!("❌ MICROPHONE START FAILED!");
+                    println!("   Error: {}", e);
+                    println!("");
+                    println!("🔧 TROUBLESHOOTING STEPS:");
+                    println!(
+                        "   1. Check if PulseAudio is running: systemctl --user status pulseaudio"
+                    );
+                    println!("   2. Start PulseAudio if needed: pulseaudio --start");
+                    println!("   3. Check audio devices: pactl list sources short");
+                    println!("   4. Add user to audio group: sudo usermod -a -G audio $USER");
+                    println!("   5. Test basic recording: arecord -f cd -d 1 test.wav");
+                    println!("");
+                    println!("   Run ./debug-audio.sh for detailed diagnostics");
+                    println!("");
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+                    return Err(e);
+                }
 
-    // Initialize logging
-    if cli.verbose {
-        env_logger::Builder::from_default_env()
-            .filter_level(log::LevelFilter::Debug)
-            .init();
-    } else {
-        env_logger::init();
-    }
+                println!("🎤 MICROPHONE ACTIVE - Listening for 'hey mycroft'...");
+                println!("   You should see activity indicators every few seconds below:");
+                println!("");
 
-    info!("Starting Edge AI Wakeword Detection Agent");
+                log::info!("🎤 Using real microphone input");
+                log::info!("Press Ctrl+C to stop or say 'hey mycroft' to test detection!");
+                log::info!("");
 
-    // Create wakeword configuration
-    let wakeword_config = WakewordConfig {
-        wakeword_model_path: cli.wakeword_model,
-        melspec_model_path: cli.melspec_model,
-        confidence_threshold: cli.threshold,
-        sample_rate: 16000,
-        chunk_size: 1280, // 80ms at 16kHz
-    };
+                // Main processing loop
+                let mut i = 0;
+                loop {
+                    // Check for user input to stop
+                    if check_for_stop_input() {
+                        break;
+                    }
 
-    // Create pipeline configuration
-    let pipeline_config = PipelineConfig {
-        wakeword_config,
-        debug_mode: cli.debug,
-    };
+                    // Process audio if available
+                    match audio_capture.read_chunk() {
+                        Ok(audio_chunk) => {
+                            let detection = pipeline.process_audio_chunk(&audio_chunk)?;
+                            i += 1;
 
-    if cli.test {
-        return run_test(pipeline_config);
-    }
+                            if detection.detected {
+                                println!("🚨🎉 WAKEWORD DETECTED! 🎉🚨");
+                                println!("   Confidence: {:.3}", detection.confidence);
+                                println!("   Say 'hey mycroft' again or press Ctrl+C to stop...");
+                                println!("");
 
-    // Initialize the detection pipeline
-    let mut pipeline = DetectionPipeline::new(pipeline_config)?;
+                                log::info!(
+                                    "🎉 WAKEWORD DETECTED! Confidence: {:.3}",
+                                    detection.confidence
+                                );
+                                log::info!("Say 'hey mycroft' again or press Ctrl+C to stop...");
+                            } else if i % 50 == 0 {
+                                // Every 4 seconds - more frequent feedback
+                                println!(
+                                    "🔄 Listening... (confidence: {:.4}) - Try saying 'hey mycroft'",
+                                    detection.confidence
+                                );
+                                log::info!(
+                                    "Listening... (confidence: {:.4}) - Say 'hey mycroft'!",
+                                    detection.confidence
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            // No audio available yet, continue
+                        }
+                    }
 
-    info!("Pipeline initialized successfully");
-    info!(
-        "Chunk size: {} samples ({} ms)",
-        pipeline.chunk_size_samples(),
-        pipeline.chunk_duration_ms()
-    );
-    info!("Detection threshold: {:.2}", pipeline.get_threshold());
-
-    // TODO: Integrate with audio capture system
-    // For now, we'll run a simple test to verify everything works
-    run_audio_test(&mut pipeline)?;
-
-    info!("Edge AI Agent shutting down");
-    Ok(())
-}
-
-/// Run a basic test with synthetic audio
-fn run_test(config: PipelineConfig) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Running basic functionality test...");
-
-    let mut pipeline = DetectionPipeline::new(config)?;
-
-    // Generate test audio: sine wave at 440Hz
-    let chunk_size = pipeline.chunk_size_samples();
-    let sample_rate = 16000.0;
-    let frequency = 440.0; // A4 note
-
-    let test_audio: Vec<f32> = (0..chunk_size)
-        .map(|i| {
-            let t = i as f32 / sample_rate;
-            (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.3
-        })
-        .collect();
-
-    info!("Generated {} samples of test audio", test_audio.len());
-
-    // Process the test audio
-    match pipeline.process_chunk(&test_audio) {
-        Ok(detection) => {
-            info!("✅ Test processing successful!");
-            info!("  - Confidence: {:.3}", detection.confidence);
-            info!("  - Detected: {}", detection.detected);
-
-            let stats = pipeline.stats();
-            info!("  - Processing time: {:.2}ms", stats.avg_processing_time_ms);
-        }
-        Err(e) => {
-            warn!("❌ Test processing failed: {}", e);
-            return Err(e.into());
-        }
-    }
-
-    info!("✅ Basic functionality test completed successfully");
-    Ok(())
-}
-
-/// Run a basic audio processing test
-fn run_audio_test(pipeline: &mut DetectionPipeline) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Running audio processing test with multiple chunks...");
-
-    let chunk_size = pipeline.chunk_size_samples();
-    let sample_rate = 16000.0;
-
-    // Generate different test patterns
-    let test_patterns = vec![
-        ("silence", vec![0.0f32; chunk_size]),
-        (
-            "sine_440hz",
-            (0..chunk_size)
-                .map(|i| {
-                    let t = i as f32 / sample_rate;
-                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3
-                })
-                .collect(),
-        ),
-        (
-            "sine_880hz",
-            (0..chunk_size)
-                .map(|i| {
-                    let t = i as f32 / sample_rate;
-                    (2.0 * std::f32::consts::PI * 880.0 * t).sin() * 0.3
-                })
-                .collect(),
-        ),
-    ];
-
-    for (name, audio_data) in test_patterns {
-        info!("Processing {} pattern...", name);
-
-        match pipeline.process_chunk(&audio_data) {
-            Ok(detection) => {
-                info!("  - Confidence: {:.3}", detection.confidence);
-                info!(
-                    "  - Detected: {}",
-                    if detection.detected { "YES" } else { "no" }
-                );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
             Err(e) => {
-                warn!("  - Error processing {}: {}", name, e);
+                println!("❌ MICROPHONE ACCESS FAILED!");
+                println!("   Error: {}", e);
+                println!("");
+                println!("🔧 TROUBLESHOOTING STEPS:");
+                println!(
+                    "   1. Check if PulseAudio is running: systemctl --user status pulseaudio"
+                );
+                println!("   2. Start PulseAudio if needed: pulseaudio --start");
+                println!("   3. Check audio devices: pactl list sources short");
+                println!("   4. Add user to audio group: sudo usermod -a -G audio $USER");
+                println!("   5. Test basic recording: arecord -f cd -d 1 test.wav");
+                println!("");
+                println!("   Run ./debug-audio.sh for detailed diagnostics");
+                println!("");
+
+                return Err(e);
             }
         }
     }
 
-    let stats = pipeline.stats();
-    info!("Processing complete:");
-    info!("  - Chunks processed: {}", stats.chunks_processed);
-    info!("  - Detections: {}", stats.detections_count);
-    info!(
-        "  - Average processing time: {:.2}ms",
-        stats.avg_processing_time_ms
-    );
+    #[cfg(not(all(target_os = "linux", feature = "pulse")))]
+    {
+        println!("❌ MICROPHONE SUPPORT NOT COMPILED");
+        println!("   This build doesn't include PulseAudio support.");
+        println!("   Please rebuild with: cargo build --release --features pulse");
+        println!("");
+        return Err(crate::error::EdgeError::Audio(
+            "No microphone support compiled into this build".to_string(),
+        )
+        .into());
+    }
 
+    log::info!("Shutting down wakeword detection system");
     Ok(())
+}
+
+fn check_for_stop_input() -> bool {
+    // Simplified for testing - always return false so it runs continuously
+    false
 }

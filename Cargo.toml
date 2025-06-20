@@ -21,15 +21,25 @@ lazy_static = "1.4"
 
 # PulseAudio support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
-libpulse-binding = { version = "2.28", optional = true }
-libpulse-simple-binding = { version = "2.28", optional = true }
+libpulse-binding = { version = "2.0", optional = true }
+libpulse-simple-binding = { version = "2.0", optional = true }
+alsa = { version = "0.7", optional = true }
+
+# Added for synthetic audio generation
+rand = "0.8"
 
 [[bin]]
 name = "agent-edge"
 path = "src/main.rs"
+
+[[bin]]
+name = "inspect_models"
+path = "inspect_models.rs"
+
 [features]
-default = []
+default = ["pulse", "alsa"]
 pulse = ["libpulse-binding", "libpulse-simple-binding"]
+alsa = ["dep:alsa"]
 
 # Profile optimized for static linking
 [profile.release-static]
