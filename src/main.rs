@@ -1,11 +1,16 @@
 use agent_edge_rs::{
     detection::pipeline::{DetectionPipeline, OpenWakeWordConfig},
     error::Result,
+    vad::VADConfig,
 };
 use log;
 
 fn main() -> Result<()> {
-    env_logger::init();
+    // Initialize logging - only show warnings and errors to keep stdout clean
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Warn)
+        .format_timestamp_secs()
+        .init();
 
     // Show startup banner
     println!("🎙️  WAKEWORD DETECTION SYSTEM STARTING...");
@@ -14,7 +19,7 @@ fn main() -> Result<()> {
     println!("⏹️  Press Ctrl+C to stop");
     println!("");
 
-    log::info!("Starting agent-edge-rs wakeword detection with proper OpenWakeWord architecture");
+    println!("🔧 Initializing OpenWakeWord pipeline...");
 
     // Initialize the 3-stage OpenWakeWord pipeline
     let config = OpenWakeWordConfig::default();
@@ -25,16 +30,34 @@ fn main() -> Result<()> {
         config,
     )?;
 
-    log::info!("✅ OpenWakeWord pipeline initialized with 3-stage architecture:");
-    log::info!("   Stage 1: Melspectrogram (audio → mel features)");
-    log::info!("   Stage 2: Embedding (mel features → speech embeddings)");
-    log::info!("   Stage 3: Wakeword (embeddings → classification)");
-    log::info!("");
+    println!("✅ OpenWakeWord pipeline ready (3-stage architecture)");
 
-    log::info!("🎯 Target: 'hey mycroft'");
-    log::info!("📊 Threshold: 0.5");
-    log::info!("⚡ Chunk size: 80ms (1280 samples)");
-    log::info!("");
+    // Enable WebRTC VAD for CPU optimization
+    let vad_enabled = std::env::var("VAD_ENABLED").unwrap_or_else(|_| "true".to_string()) == "true";
+    if vad_enabled {
+        let mut vad_config = VADConfig::default();
+
+        // Allow extra aggressive tuning via environment variables
+        if let Ok(trigger_frames) = std::env::var("VAD_TRIGGER_FRAMES") {
+            if let Ok(frames) = trigger_frames.parse::<usize>() {
+                vad_config.speech_trigger_frames = frames;
+                println!("🎤 VAD: Using custom trigger frames: {}", frames);
+            }
+        }
+
+        if let Ok(silence_frames) = std::env::var("VAD_SILENCE_FRAMES") {
+            if let Ok(frames) = silence_frames.parse::<usize>() {
+                vad_config.silence_stop_frames = frames;
+                println!("🎤 VAD: Using custom silence frames: {}", frames);
+            }
+        }
+
+        pipeline.enable_vad(vad_config)?;
+        println!("✅ WebRTC VAD enabled - will reduce CPU usage during silence");
+    } else {
+        println!("⚠️  WebRTC VAD disabled - processing all audio (original behavior)");
+    }
+    println!("");
 
     // Try microphone capture first (if available)
     #[cfg(all(target_os = "linux", feature = "pulse"))]
@@ -68,9 +91,7 @@ fn main() -> Result<()> {
                 println!("   You should see activity indicators every few seconds below:");
                 println!("");
 
-                log::info!("🎤 Using real microphone input");
-                log::info!("Press Ctrl+C to stop or say 'hey mycroft' to test detection!");
-                log::info!("");
+                // Clean startup - no extra logging needed here
 
                 // Main processing loop
                 let mut i = 0;
@@ -92,21 +113,21 @@ fn main() -> Result<()> {
                                 println!("   Say 'hey mycroft' again or press Ctrl+C to stop...");
                                 println!("");
 
-                                log::info!(
-                                    "🎉 WAKEWORD DETECTED! Confidence: {:.3}",
-                                    detection.confidence
-                                );
-                                log::info!("Say 'hey mycroft' again or press Ctrl+C to stop...");
+                                // Wakeword feedback already handled by println! above
                             } else if i % 50 == 0 {
                                 // Every 4 seconds - more frequent feedback
+                                let vad_info = if pipeline.is_vad_enabled() {
+                                    let stats = pipeline.vad_stats();
+                                    format!(" (VAD savings: {:.1}%)", stats.cpu_savings_percent)
+                                } else {
+                                    "".to_string()
+                                };
+
                                 println!(
-                                    "🔄 Listening... (confidence: {:.4}) - Try saying 'hey mycroft'",
-                                    detection.confidence
+                                    "🔄 Listening... (confidence: {:.4}){} - Try saying 'hey mycroft'",
+                                    detection.confidence, vad_info
                                 );
-                                log::info!(
-                                    "Listening... (confidence: {:.4}) - Say 'hey mycroft'!",
-                                    detection.confidence
-                                );
+                                // Status feedback already handled by println! above
                             }
                         }
                         Err(_) => {
@@ -150,7 +171,7 @@ fn main() -> Result<()> {
         .into());
     }
 
-    log::info!("Shutting down wakeword detection system");
+    println!("👋 Shutting down wakeword detection system");
     Ok(())
 }
 

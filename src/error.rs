@@ -30,4 +30,7 @@ pub enum EdgeError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("VAD error: {0}")]
+    VADError(String),
 }

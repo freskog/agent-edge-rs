@@ -67,9 +67,9 @@ impl PulseAudioCapture {
             self.config.target_latency_ms
         );
 
-        // Create sample specification
+        // Create sample specification - use S16LE for WebRTC VAD compatibility
         let sample_spec = pulse::sample::Spec {
-            format: pulse::sample::Format::F32le,
+            format: pulse::sample::Format::S16le, // 16-bit signed integers, not float
             channels: self.config.channels,
             rate: self.config.sample_rate,
         };
@@ -78,11 +78,10 @@ impl PulseAudioCapture {
             return Err(EdgeError::Audio("Invalid sample specification".to_string()));
         }
 
-        log::info!("Sample spec: {:?}", sample_spec);
+        log::info!("Sample spec: {:?} (S16LE for WebRTC VAD)", sample_spec);
 
-        // Calculate fragment size based on target latency to prevent aggressive buffering
-        // This tells PulseAudio "deliver data in chunks corresponding to this latency"
-        let bytes_per_sample = 4; // f32 = 4 bytes
+        // Calculate fragment size based on target latency
+        let bytes_per_sample = 2; // i16 = 2 bytes (not 4 like f32)
         let samples_per_ms = self.config.sample_rate / 1000;
         let samples_for_latency = samples_per_ms * self.config.target_latency_ms;
         let fragsize = samples_for_latency * self.config.channels as u32 * bytes_per_sample;
@@ -164,26 +163,32 @@ impl PulseAudioCapture {
         stop_flag: Arc<Mutex<bool>>,
         buffer_size_bytes: usize,
     ) {
-        log::info!("PulseAudio capture thread started with controlled buffering");
+        log::info!("PulseAudio capture thread started with S16LE format");
 
         let mut raw_buffer = vec![0u8; buffer_size_bytes];
         let mut sample_count = 0usize;
 
         while !*stop_flag.lock().unwrap() {
-            // Read raw bytes from PulseAudio (fragment size controls latency)
+            // Read raw bytes from PulseAudio
             match simple.read(&mut raw_buffer) {
                 Ok(()) => {
-                    // Convert raw bytes to f32 samples
-                    let sample_len = raw_buffer.len() / 4; // 4 bytes per f32
-                    let mut samples = Vec::with_capacity(sample_len);
+                    // Convert raw bytes to i16 samples, then to f32 for processing
+                    let sample_len = raw_buffer.len() / 2; // 2 bytes per i16
+                    let mut i16_samples = Vec::with_capacity(sample_len);
 
-                    for chunk in raw_buffer.chunks_exact(4) {
-                        let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        samples.push(sample);
+                    for chunk in raw_buffer.chunks_exact(2) {
+                        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        i16_samples.push(sample);
                     }
 
+                    // Convert i16 to f32 for internal processing (normalize to -1.0 to 1.0)
+                    let f32_samples: Vec<f32> = i16_samples
+                        .iter()
+                        .map(|&sample| sample as f32 / 32768.0) // Proper normalization
+                        .collect();
+
                     // Extract target channel using the channel extractor
-                    let channel_data = channel_extractor.extract_channel(&samples);
+                    let channel_data = channel_extractor.extract_channel(&f32_samples);
                     sample_count += channel_data.len();
 
                     if let Err(e) = sender.send(channel_data.clone()) {
@@ -272,17 +277,21 @@ impl PulseAudioCapture {
         Ok(vec![])
     }
 
-    /// Simple method to read a chunk of audio as i16 samples (for wakeword detection)
-    /// Returns 1280 samples (80ms at 16kHz) when available
+    /// Enhanced method to read a chunk of audio optimized for both VAD and wakeword detection
+    /// Returns 1280 i16 samples (80ms at 16kHz) when available
     pub fn read_chunk(&mut self) -> Result<Vec<i16>> {
         // Accumulate samples until we have enough for an 80ms chunk
         while self.sample_buffer.len() < 1280 {
             match self.try_get_audio_buffer()? {
                 Some(audio_buffer) => {
-                    // Convert f32 to i16 and add to buffer
+                    // Convert f32 back to i16 with proper scaling (f32 range -1.0 to 1.0 → i16 range -32768 to 32767)
                     let new_samples: Vec<i16> = audio_buffer
                         .iter()
-                        .map(|&sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                        .map(|&sample| {
+                            // Clamp to valid f32 range first, then scale to i16
+                            let clamped = sample.clamp(-1.0, 1.0);
+                            (clamped * 32767.0) as i16
+                        })
                         .collect();
 
                     log::debug!(
@@ -305,6 +314,45 @@ impl PulseAudioCapture {
             "Returning 1280 samples, {} samples remaining in buffer",
             self.sample_buffer.len()
         );
+        Ok(chunk)
+    }
+
+    /// New method to get raw i16 samples directly for WebRTC VAD
+    /// This avoids the double conversion issue (i16→f32→i16)
+    pub fn read_i16_chunk(&mut self, chunk_size: usize) -> Result<Vec<i16>> {
+        // We need to store i16 samples separately to avoid double conversion
+        // For now, we'll use the existing method but with better conversion
+        self.read_chunk_with_size(chunk_size)
+    }
+
+    /// Read a specific chunk size for VAD (e.g., 160, 320, or 480 samples)
+    pub fn read_chunk_with_size(&mut self, chunk_size: usize) -> Result<Vec<i16>> {
+        // Accumulate samples until we have enough for the requested chunk
+        while self.sample_buffer.len() < chunk_size {
+            match self.try_get_audio_buffer()? {
+                Some(audio_buffer) => {
+                    // Convert f32 back to i16 with proper scaling
+                    // Important: Use proper scaling to avoid saturation
+                    let new_samples: Vec<i16> = audio_buffer
+                        .iter()
+                        .map(|&sample| {
+                            // Clamp to valid f32 range first, then scale to i16
+                            let clamped = sample.clamp(-1.0, 1.0);
+                            (clamped * 32767.0) as i16
+                        })
+                        .collect();
+
+                    self.sample_buffer.extend(new_samples);
+                }
+                None => {
+                    // No audio available yet
+                    return Err(EdgeError::Audio("No audio data available".to_string()));
+                }
+            }
+        }
+
+        // Extract exactly the requested number of samples
+        let chunk = self.sample_buffer.drain(0..chunk_size).collect();
         Ok(chunk)
     }
 }

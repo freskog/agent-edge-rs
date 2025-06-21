@@ -2,6 +2,7 @@ use crate::error::Result;
 use crate::models::{
     embedding::EmbeddingModel, melspectrogram::MelspectrogramModel, wakeword::WakewordModel,
 };
+use crate::vad::{VADConfig, VADStats, WebRtcVAD};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ impl Default for OpenWakeWordConfig {
 /// - Generate embedding every 80ms chunk using sliding window of mel frames
 /// - Accumulate embeddings in sliding window
 /// - Make wakeword prediction every 80ms using sliding window of embeddings
+/// - Optional WebRTC VAD for CPU optimization
 pub struct DetectionPipeline<'a> {
     melspectrogram_model: MelspectrogramModel<'a>,
     embedding_model: EmbeddingModel<'a>,
@@ -51,6 +53,10 @@ pub struct DetectionPipeline<'a> {
     // Debouncing to prevent repeated detections
     last_detection_time: Option<std::time::Instant>,
     debounce_duration: std::time::Duration,
+
+    // WebRTC VAD for CPU optimization
+    vad: Option<WebRtcVAD>,
+    vad_stats: VADStats,
 }
 
 impl<'a> DetectionPipeline<'a> {
@@ -85,6 +91,8 @@ impl<'a> DetectionPipeline<'a> {
             debug_mode: true,
             last_detection_time: None,
             debounce_duration: std::time::Duration::from_millis(1500), // 1.5 seconds debounce
+            vad: None,                                                 // VAD is disabled by default
+            vad_stats: VADStats::default(),
         })
     }
 
@@ -105,7 +113,32 @@ impl<'a> DetectionPipeline<'a> {
         while self.audio_buffer.len() >= self.chunk_size {
             let chunk: Vec<i16> = self.audio_buffer.drain(..self.chunk_size).collect();
 
-            // Convert to f32 for model input
+            // Check VAD if enabled - skip expensive processing if no voice activity
+            let _should_process = if let Some(vad) = &mut self.vad {
+                let start_time = std::time::Instant::now();
+                // Use the new i16-based VAD interface to avoid double conversion
+                let should_process = vad.should_process_audio_i16(&chunk)?;
+                let processing_time = start_time.elapsed().as_millis() as u64;
+                self.vad_stats.update(
+                    should_process,
+                    if should_process { processing_time } else { 0 },
+                );
+
+                if !should_process {
+                    if self.debug_mode {
+                        log::debug!(
+                            "VAD: No voice activity detected - skipping expensive processing (CPU savings: {:.1}%)",
+                            self.vad_stats.cpu_savings_percent
+                        );
+                    }
+                    continue; // Skip expensive 3-stage processing
+                }
+                true
+            } else {
+                true // Always process if VAD is disabled
+            };
+
+            // Convert to f32 for model input (only after VAD check)
             let audio_chunk: Vec<f32> = chunk.iter().map(|&x| x as f32).collect();
 
             // Stage 1: Melspectrogram (80ms audio → mel features)
@@ -282,6 +315,40 @@ impl<'a> DetectionPipeline<'a> {
         self.mel_buffer.clear();
         self.embedding_buffer.clear();
         self.last_detection_time = None;
+        if let Some(vad) = &mut self.vad {
+            vad.reset();
+        }
+        self.vad_stats.reset();
         log::info!("Pipeline reset");
+    }
+
+    /// Enable WebRTC VAD with the given configuration
+    pub fn enable_vad(&mut self, vad_config: VADConfig) -> Result<()> {
+        self.vad = Some(WebRtcVAD::new(vad_config)?);
+        self.vad_stats.reset();
+        println!("🎤 WebRTC VAD enabled for CPU optimization");
+        Ok(())
+    }
+
+    /// Disable WebRTC VAD
+    pub fn disable_vad(&mut self) {
+        self.vad = None;
+        self.vad_stats.reset();
+        println!("🎤 WebRTC VAD disabled");
+    }
+
+    /// Check if VAD is enabled
+    pub fn is_vad_enabled(&self) -> bool {
+        self.vad.is_some()
+    }
+
+    /// Get VAD statistics
+    pub fn vad_stats(&self) -> &VADStats {
+        &self.vad_stats
+    }
+
+    /// Get current VAD state (if enabled)
+    pub fn is_speech_active(&self) -> bool {
+        self.vad.as_ref().map_or(true, |vad| vad.is_speech_active())
     }
 }

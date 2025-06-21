@@ -1,8 +1,10 @@
+# Version 1.0.1 - Force rebuild
 # Use Ubuntu as base image for better compatibility
 FROM ubuntu:22.04
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -25,57 +27,73 @@ RUN apt-get update && apt-get install -y \
     libclang-dev \
     tar \
     gzip \
+    jq \
+    htop \
+    rsync \
+    man-db \
+    locales \
     ca-certificates \
-    # Clean up
+    sudo \
     && rm -rf /var/lib/apt/lists/*
+
+# Generate locale (devcontainers expect UTF-8)
+RUN locale-gen en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 
 # Install Python dependencies
 RUN pip3 install numpy
 
-# Install Bazelisk (ARM64 version for Apple Silicon and Pi)
+# Install Bazelisk (ARM64 version)
 RUN curl -L -o /usr/local/bin/bazelisk https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-arm64 && \
     chmod +x /usr/local/bin/bazelisk && \
     ln -s /usr/local/bin/bazelisk /usr/local/bin/bazel
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Add Rust target for ARM64 (Raspberry Pi 3)
-RUN rustup target add aarch64-unknown-linux-gnu
-
-# Set working directory
-WORKDIR /workspace
-
-# Create marker file to indicate we're in a container
+# Create marker file to detect container
 RUN touch /.dockerenv
 
-# Create vscode user with proper permissions
+# Add a user for VS Code devcontainers
 ARG USERNAME=vscode
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
 
 RUN groupadd --gid $USER_GID $USERNAME && \
-    useradd --uid $USER_UID --gid $USER_GID -m $USERNAME && \
-    echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash $USERNAME && \
+    echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
+    # Create /workspace and set ownership to vscode
+    mkdir -p /workspace && chown $USERNAME:$USERNAME /workspace && \
+    # Copy skeleton files and set ownership
+    cp /etc/skel/.bashrc /etc/skel/.profile /home/$USERNAME/ && \
+    chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.profile
 
-# Set environment variables for development
+# Make sure bash is default shell for vscode
+RUN chsh -s /bin/bash vscode
+
+# Switch to that user for all remaining operations
+USER $USERNAME
+
+RUN mkdir -p /home/$USERNAME/agent-edge-rs
+
+WORKDIR /home/$USERNAME/agent-edge-rs
+
+# Configure bash colors and aliases for vscode user
+RUN echo 'force_color_prompt=yes' >> ~/.bashrc && \
+    echo 'if [ -n "$force_color_prompt" ]; then' >> ~/.bashrc && \
+    echo '    PS1='"'"'\${debian_chroot:+(\$debian_chroot)}\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '"'" >> ~/.bashrc && \
+    echo 'fi' >> ~/.bashrc && \
+    echo 'alias ls="ls --color=auto"' >> ~/.bashrc && \
+    echo 'alias grep="grep --color=auto"' >> ~/.bashrc
+
+# Install Rust and configure environment
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN . $HOME/.cargo/env && rustup target add aarch64-unknown-linux-gnu
+RUN echo 'source "$HOME/.cargo/env"' >> ~/.bashrc
+
+# Environment for dev tools
+ENV PATH="/home/${USERNAME}/.cargo/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/usr/local/lib"
 ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig"
 
-# Switch to user by default
-USER $USERNAME
-
-# Set up Rust for the vscode user
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/home/$USERNAME/.cargo/bin:${PATH}"
-
-# Configure shell environment
-RUN echo 'export PATH="/home/vscode/.cargo/bin:$PATH"' >> /home/$USERNAME/.bashrc && \
-    echo 'export PS1="\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /home/$USERNAME/.bashrc && \
-    echo 'set -o vi' >> /home/$USERNAME/.bashrc
-
-# Set default shell to bash
-SHELL ["/bin/bash", "-c"]
-
-CMD ["/bin/bash"]
+# Start Bash in login mode so .bashrc is loaded
+CMD [ "/bin/bash" ]

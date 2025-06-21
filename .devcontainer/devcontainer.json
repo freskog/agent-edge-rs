@@ -14,6 +14,16 @@
         }
     },
     "remoteUser": "vscode",
-    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
-    "workspaceFolder": "/workspace"
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/vscode/agent-edge-rs,type=bind,consistency=cached",
+    "workspaceFolder": "/home/vscode/agent-edge-rs",
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": false,
+            "username": "vscode",
+            "userUid": "1000",
+            "userGid": "1000",
+            "upgradePackages": false
+        }
+    },
+    "overrideCommand": true
 }
