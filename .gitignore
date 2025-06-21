@@ -1,3 +1,11 @@
+.bash_history
+.profile
+
+.config/
+.cargo/
+.cursor-server/
+.rustup/
+
 # Rust build artifacts
 /target/
 Cargo.lock
