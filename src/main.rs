@@ -33,30 +33,25 @@ fn main() -> Result<()> {
     println!("✅ OpenWakeWord pipeline ready (3-stage architecture)");
 
     // Enable WebRTC VAD for CPU optimization
-    let vad_enabled = std::env::var("VAD_ENABLED").unwrap_or_else(|_| "true".to_string()) == "true";
-    if vad_enabled {
-        let mut vad_config = VADConfig::default();
+    let mut vad_config = VADConfig::default();
 
-        // Allow extra aggressive tuning via environment variables
-        if let Ok(trigger_frames) = std::env::var("VAD_TRIGGER_FRAMES") {
-            if let Ok(frames) = trigger_frames.parse::<usize>() {
-                vad_config.speech_trigger_frames = frames;
-                println!("🎤 VAD: Using custom trigger frames: {}", frames);
-            }
+    // Allow aggressive tuning via environment variables
+    if let Ok(trigger_frames) = std::env::var("VAD_TRIGGER_FRAMES") {
+        if let Ok(frames) = trigger_frames.parse::<usize>() {
+            vad_config.speech_trigger_frames = frames;
+            println!("🎤 VAD: Using custom trigger frames: {}", frames);
         }
-
-        if let Ok(silence_frames) = std::env::var("VAD_SILENCE_FRAMES") {
-            if let Ok(frames) = silence_frames.parse::<usize>() {
-                vad_config.silence_stop_frames = frames;
-                println!("🎤 VAD: Using custom silence frames: {}", frames);
-            }
-        }
-
-        pipeline.enable_vad(vad_config)?;
-        println!("✅ WebRTC VAD enabled - will reduce CPU usage during silence");
-    } else {
-        println!("⚠️  WebRTC VAD disabled - processing all audio (original behavior)");
     }
+
+    if let Ok(silence_frames) = std::env::var("VAD_SILENCE_FRAMES") {
+        if let Ok(frames) = silence_frames.parse::<usize>() {
+            vad_config.silence_stop_frames = frames;
+            println!("🎤 VAD: Using custom silence frames: {}", frames);
+        }
+    }
+
+    pipeline.enable_vad(vad_config)?;
+    println!("✅ WebRTC VAD enabled - will reduce CPU usage during silence");
     println!("");
 
     // Try microphone capture first (if available)
@@ -116,12 +111,9 @@ fn main() -> Result<()> {
                                 // Wakeword feedback already handled by println! above
                             } else if i % 50 == 0 {
                                 // Every 4 seconds - more frequent feedback
-                                let vad_info = if pipeline.is_vad_enabled() {
-                                    let stats = pipeline.vad_stats();
-                                    format!(" (VAD savings: {:.1}%)", stats.cpu_savings_percent)
-                                } else {
-                                    "".to_string()
-                                };
+                                let stats = pipeline.vad_stats();
+                                let vad_info =
+                                    format!(" (VAD savings: {:.1}%)", stats.cpu_savings_percent);
 
                                 println!(
                                     "🔄 Listening... (confidence: {:.4}){} - Try saying 'hey mycroft'",
