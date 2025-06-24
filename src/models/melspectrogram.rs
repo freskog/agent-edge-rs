@@ -11,10 +11,16 @@
 
 use crate::error::{EdgeError, Result};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
-use tflitec::interpreter::Options;
+use tflitec::interpreter::{Interpreter, Options};
 use tflitec::model::Model;
-use tflitec::tensor;
+use tflitec::tensor::Shape;
+
+// Static storage for the model and interpreter
+static MELSPEC_MODEL: OnceLock<Model<'static>> = OnceLock::new();
+static MELSPEC_INTERPRETER: OnceLock<Mutex<Interpreter<'static>>> = OnceLock::new();
+static MELSPEC_CONFIG: OnceLock<MelSpectrogramConfig> = OnceLock::new();
 
 /// Configuration for mel spectrogram processing
 #[derive(Debug, Clone)]
@@ -37,18 +43,20 @@ impl Default for MelSpectrogramConfig {
     }
 }
 
-/// Mel spectrogram processor using TensorFlow Lite
+/// Mel spectrogram model used by the detection pipeline
 ///
-/// This processor converts raw audio samples to mel spectrogram features
+/// This model converts raw audio samples to mel spectrogram features
 /// using the OpenWakeWord melspectrogram model approach.
-pub struct MelSpectrogramProcessor<'a> {
-    model: Model<'a>,
-    config: MelSpectrogramConfig,
-}
+pub struct MelSpectrogramModel;
 
-impl<'a> MelSpectrogramProcessor<'a> {
-    /// Create a new mel spectrogram processor
-    pub fn new(config: MelSpectrogramConfig) -> Result<Self> {
+impl MelSpectrogramModel {
+    /// Create a new mel spectrogram model
+    pub fn new(model_path: &str) -> Result<Self> {
+        let config = MelSpectrogramConfig {
+            model_path: model_path.to_string(),
+            ..Default::default()
+        };
+
         let model_path = Path::new(&config.model_path);
         if !model_path.exists() {
             return Err(EdgeError::ModelLoadError(format!(
@@ -57,11 +65,57 @@ impl<'a> MelSpectrogramProcessor<'a> {
             )));
         }
 
-        // Load the model
+        // Initialize the static model
         let model = Model::new(&config.model_path)
             .map_err(|e| EdgeError::ModelLoadError(format!("Failed to load model: {}", e)))?;
 
-        Ok(Self { model, config })
+        let model = MELSPEC_MODEL.get_or_init(|| model);
+
+        // Store the config
+        MELSPEC_CONFIG
+            .set(config.clone())
+            .map_err(|_| EdgeError::ModelLoadError("Failed to set config".to_string()))?;
+
+        // Create interpreter options
+        let mut options = Options::default();
+        options.thread_count = 1;
+
+        // Create the static interpreter
+        let interpreter = Interpreter::new(model, Some(options)).map_err(|e| {
+            EdgeError::ModelLoadError(format!("Failed to create interpreter: {}", e))
+        })?;
+
+        // Resize input tensor to expected shape: [1, chunk_size]
+        let input_shape = Shape::new(vec![1, config.chunk_size]);
+        interpreter.resize_input(0, input_shape).map_err(|e| {
+            EdgeError::ModelLoadError(format!("Failed to resize input tensor: {}", e))
+        })?;
+
+        // Allocate tensors after resizing
+        interpreter
+            .allocate_tensors()
+            .map_err(|e| EdgeError::ModelLoadError(format!("Failed to allocate tensors: {}", e)))?;
+
+        // Log the output shape for debugging
+        let output_tensor = interpreter.output(0).map_err(|e| {
+            EdgeError::ModelLoadError(format!("Failed to get melspec output tensor: {}", e))
+        })?;
+        let output_shape = output_tensor.shape();
+        let output_size = output_shape.dimensions().iter().product::<usize>();
+        log::info!(
+            "Melspectrogram model output shape: {:?} (size: {})",
+            output_shape.dimensions(),
+            output_size
+        );
+
+        // Store the interpreter in a mutex for thread safety
+        MELSPEC_INTERPRETER
+            .set(Mutex::new(interpreter))
+            .map_err(|_| {
+                EdgeError::ModelLoadError("Failed to initialize interpreter".to_string())
+            })?;
+
+        Ok(Self)
     }
 
     /// Process audio samples to extract mel spectrogram features
@@ -71,34 +125,26 @@ impl<'a> MelSpectrogramProcessor<'a> {
     ///
     /// # Returns
     /// * `Vec<f32>` - Mel spectrogram features as a flattened vector
-    pub fn process(&self, audio_samples: &[f32]) -> Result<Vec<f32>> {
-        if audio_samples.len() != self.config.chunk_size {
+    pub fn predict(&self, audio_samples: &[f32]) -> Result<Vec<f32>> {
+        let config = MELSPEC_CONFIG.get().ok_or_else(|| {
+            EdgeError::ProcessingError("MelSpectrogram model not initialized".to_string())
+        })?;
+
+        if audio_samples.len() != config.chunk_size {
             return Err(EdgeError::InvalidInput(format!(
                 "Expected {} audio samples, got {}",
-                self.config.chunk_size,
+                config.chunk_size,
                 audio_samples.len()
             )));
         }
 
-        // Create interpreter options
-        let mut options = Options::default();
-        options.thread_count = 1;
-
-        // Create interpreter (borrowing from model)
-        let interpreter = tflitec::interpreter::Interpreter::new(&self.model, Some(options))
-            .map_err(|e| {
-                EdgeError::ProcessingError(format!("Failed to create interpreter: {}", e))
-            })?;
-
-        // Resize input tensor to expected shape: [1, chunk_size]
-        let input_shape = tensor::Shape::new(vec![1, self.config.chunk_size]);
-        interpreter.resize_input(0, input_shape).map_err(|e| {
-            EdgeError::ProcessingError(format!("Failed to resize input tensor: {}", e))
+        // Get the static interpreter
+        let interpreter_mutex = MELSPEC_INTERPRETER.get().ok_or_else(|| {
+            EdgeError::ProcessingError("MelSpectrogram model not initialized".to_string())
         })?;
 
-        // Allocate tensors after resizing
-        interpreter.allocate_tensors().map_err(|e| {
-            EdgeError::ProcessingError(format!("Failed to allocate tensors: {}", e))
+        let interpreter = interpreter_mutex.lock().map_err(|e| {
+            EdgeError::ProcessingError(format!("Failed to lock interpreter: {}", e))
         })?;
 
         // Set input tensor data
@@ -122,114 +168,17 @@ impl<'a> MelSpectrogramProcessor<'a> {
         // Apply OpenWakeWord's melspectrogram transform: x/10 + 2
         let transformed_data: Vec<f32> = output_data.iter().map(|&x| x / 10.0 + 2.0).collect();
 
-        // Debug: Let's see what the melspectrogram is producing
-        if transformed_data.len() >= 10 {
-            log::info!("Melspec output (first 10): {:?}", &transformed_data[0..10]);
-            log::info!(
-                "Melspec output (last 10): {:?}",
-                &transformed_data[transformed_data.len() - 10..]
-            );
-            log::info!(
-                "Melspec stats: min={:.3}, max={:.3}, mean={:.3}",
-                transformed_data
-                    .iter()
-                    .fold(f32::INFINITY, |a, &b| a.min(b)),
-                transformed_data
-                    .iter()
-                    .fold(f32::NEG_INFINITY, |a, &b| a.max(b)),
-                transformed_data.iter().sum::<f32>() / transformed_data.len() as f32
-            );
-        }
-        log::info!("Melspec output total length: {}", transformed_data.len());
+        log::debug!(
+            "Melspectrogram model produced {} features",
+            transformed_data.len()
+        );
 
         Ok(transformed_data)
     }
-
-    /// Get the current configuration
-    pub fn config(&self) -> &MelSpectrogramConfig {
-        &self.config
-    }
-
-    /// Get the expected input shape
-    pub fn input_shape(&self) -> Result<Vec<i32>> {
-        Ok(vec![1, self.config.chunk_size as i32])
-    }
-
-    /// Get the output shape by running a quick inference
-    pub fn output_shape(&self) -> Result<Vec<i32>> {
-        // Create a temporary interpreter to get output shape
-        let mut options = Options::default();
-        options.thread_count = 1;
-
-        let interpreter = tflitec::interpreter::Interpreter::new(&self.model, Some(options))
-            .map_err(|e| {
-                EdgeError::ProcessingError(format!("Failed to create interpreter: {}", e))
-            })?;
-
-        let input_shape = tensor::Shape::new(vec![1, self.config.chunk_size]);
-        interpreter.resize_input(0, input_shape).map_err(|e| {
-            EdgeError::ProcessingError(format!("Failed to resize input tensor: {}", e))
-        })?;
-
-        interpreter.allocate_tensors().map_err(|e| {
-            EdgeError::ProcessingError(format!("Failed to allocate tensors: {}", e))
-        })?;
-
-        let output_tensor = interpreter.output(0).map_err(|e| {
-            EdgeError::ProcessingError(format!("Failed to get output tensor: {}", e))
-        })?;
-
-        Ok(output_tensor
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|&x| x as i32)
-            .collect())
-    }
-
-    pub fn get_expected_input_size(&self) -> usize {
-        self.config.chunk_size
-    }
-
-    pub fn get_expected_output_size(&self) -> usize {
-        // Based on OpenWakeWord, melspectrogram produces [1, 1, 5, 32] = 160 features per chunk
-        160
-    }
 }
 
-/// Simple wrapper for mel spectrogram model used by the detection pipeline
-pub struct MelspectrogramModel<'a> {
-    processor: MelSpectrogramProcessor<'a>,
-}
-
-impl<'a> MelspectrogramModel<'a> {
-    pub fn new(model_path: &str) -> Result<Self> {
-        let config = MelSpectrogramConfig {
-            model_path: model_path.to_string(),
-            ..Default::default()
-        };
-        let processor = MelSpectrogramProcessor::new(config)?;
-        Ok(Self { processor })
-    }
-
-    pub fn compute(&self, audio: &[i16]) -> Result<Vec<f32>> {
-        // Convert i16 to f32
-        let audio_f32: Vec<f32> = audio.iter().map(|&x| x as f32).collect();
-        self.processor.process(&audio_f32)
-    }
-
-    pub fn predict(&self, audio: &[f32]) -> Result<Vec<f32>> {
-        self.processor.process(audio)
-    }
-
-    pub fn get_expected_input_size(&self) -> usize {
-        self.processor.get_expected_input_size()
-    }
-
-    pub fn get_expected_output_size(&self) -> usize {
-        self.processor.get_expected_output_size()
-    }
-}
+/// Type alias for backwards compatibility
+pub type MelspectrogramModel = MelSpectrogramModel;
 
 #[cfg(test)]
 mod tests {
@@ -238,52 +187,30 @@ mod tests {
     #[test]
     fn test_melspec_config_default() {
         let config = MelSpectrogramConfig::default();
+        assert_eq!(config.model_path, "models/melspectrogram.tflite");
         assert_eq!(config.chunk_size, 1280);
         assert_eq!(config.sample_rate, 16000);
-        assert!(config.model_path.contains("melspectrogram.tflite"));
     }
 
     #[test]
-    fn test_melspec_processor_creation() {
-        let config = MelSpectrogramConfig::default();
-
-        // This will fail in CI without the actual model file
-        match MelSpectrogramProcessor::new(config) {
-            Ok(_) => println!("✅ Mel spectrogram processor created successfully"),
-            Err(e) => println!("⚠️  Expected failure without model files: {}", e),
-        }
+    fn test_melspec_model_creation() {
+        let result = MelSpectrogramModel::new("non_existent_model.tflite");
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_audio_sample_generation() {
-        let chunk_size = 1280;
+        // Test generating audio samples
         let sample_rate = 16000;
+        let duration_ms = 80; // 80ms
+        let chunk_size = (sample_rate * duration_ms) / 1000;
 
-        // Generate test sine wave
-        let frequency = 440.0; // A4 note
-        let audio_samples: Vec<f32> = (0..chunk_size)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.5
-            })
-            .collect();
+        assert_eq!(chunk_size, 1280);
 
-        assert_eq!(audio_samples.len(), chunk_size);
+        // Generate some dummy audio samples
+        let audio_samples: Vec<f32> = (0..chunk_size).map(|i| (i as f32 * 0.001).sin()).collect();
 
-        // Verify amplitude range
-        let max_val = audio_samples
-            .iter()
-            .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let min_val = audio_samples.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-
-        assert!(max_val <= 1.0);
-        assert!(min_val >= -1.0);
-
-        println!(
-            "Generated {} audio samples with range [{:.3}, {:.3}]",
-            audio_samples.len(),
-            min_val,
-            max_val
-        );
+        assert_eq!(audio_samples.len(), 1280);
+        assert!(audio_samples.iter().all(|&x| x >= -1.0 && x <= 1.0));
     }
 }

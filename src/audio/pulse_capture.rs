@@ -197,9 +197,9 @@ impl PulseAudioCapture {
                     }
 
                     // Log progress occasionally
-                    if sample_count % 16000 == 0 {
-                        // Every ~1 second at 16kHz
-                        log::info!(
+                    if sample_count % 160000 == 0 {
+                        // Every ~10 seconds at 16kHz
+                        log::debug!(
                             "Audio capture: {} samples total, last chunk: {} samples",
                             sample_count,
                             channel_data.len()

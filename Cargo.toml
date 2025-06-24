@@ -8,10 +8,11 @@ description = "Wakeword-only edge client for low-powered devices"
 [dependencies]
 # Core utilities
 log = "0.4"
-env_logger = "0.10"
+thiserror = "2.0.10"
+env_logger = "0.11.8"
 anyhow = "1.0"
-thiserror = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+strum = { version = "0.26", features = ["derive"] }
 
 # Machine learning
 tflitec = "0.6.0"
@@ -24,29 +25,12 @@ lazy_static = "1.4"
 
 # PulseAudio support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
-libpulse-binding = { version = "2.0", optional = true }
-libpulse-simple-binding = { version = "2.0", optional = true }
-alsa = { version = "0.7", optional = true }
+libpulse-binding = "2.0"
+libpulse-simple-binding = "2.0"
 
-# Added for synthetic audio generation
-rand = "0.8"
+[dev-dependencies]
+hound = "3.5"
 
 [[bin]]
 name = "agent-edge"
 path = "src/main.rs"
-
-[[bin]]
-name = "inspect_models"
-path = "inspect_models.rs"
-
-[features]
-default = ["pulse", "alsa"]
-pulse = ["libpulse-binding", "libpulse-simple-binding"]
-alsa = ["dep:alsa"]
-
-# Profile optimized for static linking
-[profile.release-static]
-inherits = "release"
-lto = true
-codegen-units = 1
-panic = "abort"

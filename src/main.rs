@@ -1,173 +1,77 @@
 use agent_edge_rs::{
-    detection::pipeline::{DetectionPipeline, OpenWakeWordConfig},
+    detection::pipeline::{DetectionPipeline, PipelineConfig},
     error::Result,
-    vad::VADConfig,
+    vad::{VADConfig, WebRtcVAD},
 };
 use log;
 
 fn main() -> Result<()> {
-    // Initialize logging - only show warnings and errors to keep stdout clean
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Warn)
-        .format_timestamp_secs()
-        .init();
+    // Initialize logging with environment variable support (newer env_logger API)
+    env_logger::init();
 
-    // Show startup banner
-    println!("🎙️  WAKEWORD DETECTION SYSTEM STARTING...");
-    println!("📊 Say: 'hey mycroft' to trigger detection");
-    println!("🔧 Threshold: 0.5 confidence required");
-    println!("⏹️  Press Ctrl+C to stop");
-    println!("");
+    log::info!("Initializing agent-edge-rs");
 
-    println!("🔧 Initializing OpenWakeWord pipeline...");
+    // Initialize the detection pipeline with static models
+    let config = PipelineConfig::default();
+    let mut pipeline = DetectionPipeline::new(config)?;
 
-    // Initialize the 3-stage OpenWakeWord pipeline
-    let config = OpenWakeWordConfig::default();
-    let mut pipeline = DetectionPipeline::new(
-        "models/melspectrogram.tflite",
-        "models/embedding_model.tflite",
-        "models/hey_mycroft_v0.1.tflite",
-        config,
-    )?;
+    // Initialize VAD for CPU efficiency
+    let vad_config = VADConfig::default();
+    let mut vad = WebRtcVAD::new(vad_config)?;
+    log::info!("VAD initialized");
 
-    println!("✅ OpenWakeWord pipeline ready (3-stage architecture)");
+    use agent_edge_rs::audio::pulse_capture::{PulseAudioCapture, PulseAudioCaptureConfig};
 
-    // Enable WebRTC VAD for CPU optimization
-    let mut vad_config = VADConfig::default();
+    let config = PulseAudioCaptureConfig::default();
+    match PulseAudioCapture::new(config) {
+        Ok(mut audio_capture) => {
+            // Start the capture
+            if let Err(e) = audio_capture.start() {
+                log::error!("❌ MICROPHONE START FAILED! Error: {}", e);
+                return Err(e);
+            }
 
-    // Allow aggressive tuning via environment variables
-    if let Ok(trigger_frames) = std::env::var("VAD_TRIGGER_FRAMES") {
-        if let Ok(frames) = trigger_frames.parse::<usize>() {
-            vad_config.speech_trigger_frames = frames;
-            println!("🎤 VAD: Using custom trigger frames: {}", frames);
-        }
-    }
+            log::info!("Microphone initialized");
 
-    if let Ok(silence_frames) = std::env::var("VAD_SILENCE_FRAMES") {
-        if let Ok(frames) = silence_frames.parse::<usize>() {
-            vad_config.silence_stop_frames = frames;
-            println!("🎤 VAD: Using custom silence frames: {}", frames);
-        }
-    }
+            // Main processing loop
+            loop {
+                // Process audio if available
+                match audio_capture.read_chunk() {
+                    Ok(audio_chunk) => {
+                        // First run VAD on the raw i16 audio
+                        let should_process = vad.should_process_audio(&audio_chunk)?;
 
-    pipeline.enable_vad(vad_config)?;
-    println!("✅ WebRTC VAD enabled - will reduce CPU usage during silence");
-    println!("");
+                        if should_process {
+                            log::debug!("VAD detected speech, running wakeword detection");
 
-    // Try microphone capture first (if available)
-    #[cfg(all(target_os = "linux", feature = "pulse"))]
-    {
-        use agent_edge_rs::audio::pulse_capture::{PulseAudioCapture, PulseAudioCaptureConfig};
+                            // Convert i16 to f32 for the models only when needed
+                            let audio_f32: Vec<f32> =
+                                audio_chunk.iter().map(|&x| x as f32 / 32768.0).collect();
 
-        let config = PulseAudioCaptureConfig::default();
-        match PulseAudioCapture::new(config) {
-            Ok(mut audio_capture) => {
-                // Start the capture
-                if let Err(e) = audio_capture.start() {
-                    println!("❌ MICROPHONE START FAILED!");
-                    println!("   Error: {}", e);
-                    println!("");
-                    println!("🔧 TROUBLESHOOTING STEPS:");
-                    println!(
-                        "   1. Check if PulseAudio is running: systemctl --user status pulseaudio"
-                    );
-                    println!("   2. Start PulseAudio if needed: pulseaudio --start");
-                    println!("   3. Check audio devices: pactl list sources short");
-                    println!("   4. Add user to audio group: sudo usermod -a -G audio $USER");
-                    println!("   5. Test basic recording: arecord -f cd -d 1 test.wav");
-                    println!("");
-                    println!("   Run ./debug-audio.sh for detailed diagnostics");
-                    println!("");
+                            let detection = pipeline.process_audio_chunk(&audio_f32)?;
 
-                    return Err(e);
-                }
-
-                println!("🎤 MICROPHONE ACTIVE - Listening for 'hey mycroft'...");
-                println!("   You should see activity indicators every few seconds below:");
-                println!("");
-
-                // Clean startup - no extra logging needed here
-
-                // Main processing loop
-                let mut i = 0;
-                loop {
-                    // Check for user input to stop
-                    if check_for_stop_input() {
-                        break;
-                    }
-
-                    // Process audio if available
-                    match audio_capture.read_chunk() {
-                        Ok(audio_chunk) => {
-                            let detection = pipeline.process_audio_chunk(&audio_chunk)?;
-                            i += 1;
-
+                            // Handle detection with callback
                             if detection.detected {
                                 println!("🚨🎉 WAKEWORD DETECTED! 🎉🚨");
                                 println!("   Confidence: {:.3}", detection.confidence);
                                 println!("   Say 'hey mycroft' again or press Ctrl+C to stop...");
                                 println!("");
-
-                                // Wakeword feedback already handled by println! above
-                            } else if i % 50 == 0 {
-                                // Every 4 seconds - more frequent feedback
-                                let stats = pipeline.vad_stats();
-                                let vad_info =
-                                    format!(" (VAD savings: {:.1}%)", stats.cpu_savings_percent);
-
-                                println!(
-                                    "🔄 Listening... (confidence: {:.4}){} - Try saying 'hey mycroft'",
-                                    detection.confidence, vad_info
-                                );
-                                // Status feedback already handled by println! above
                             }
-                        }
-                        Err(_) => {
-                            // No audio available yet, continue
+                        } else {
+                            log::trace!("VAD: No speech detected, skipping ML pipeline");
                         }
                     }
-
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    Err(_) => {
+                        // No audio available yet, continue
+                    }
                 }
-            }
-            Err(e) => {
-                println!("❌ MICROPHONE ACCESS FAILED!");
-                println!("   Error: {}", e);
-                println!("");
-                println!("🔧 TROUBLESHOOTING STEPS:");
-                println!(
-                    "   1. Check if PulseAudio is running: systemctl --user status pulseaudio"
-                );
-                println!("   2. Start PulseAudio if needed: pulseaudio --start");
-                println!("   3. Check audio devices: pactl list sources short");
-                println!("   4. Add user to audio group: sudo usermod -a -G audio $USER");
-                println!("   5. Test basic recording: arecord -f cd -d 1 test.wav");
-                println!("");
-                println!("   Run ./debug-audio.sh for detailed diagnostics");
-                println!("");
 
-                return Err(e);
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+        Err(e) => {
+            log::error!("❌ MICROPHONE ACCESS FAILED! Error: {}", e);
+            return Err(e);
+        }
     }
-
-    #[cfg(not(all(target_os = "linux", feature = "pulse")))]
-    {
-        println!("❌ MICROPHONE SUPPORT NOT COMPILED");
-        println!("   This build doesn't include PulseAudio support.");
-        println!("   Please rebuild with: cargo build --release --features pulse");
-        println!("");
-        return Err(crate::error::EdgeError::Audio(
-            "No microphone support compiled into this build".to_string(),
-        )
-        .into());
-    }
-
-    println!("👋 Shutting down wakeword detection system");
-    Ok(())
-}
-
-fn check_for_stop_input() -> bool {
-    // Simplified for testing - always return false so it runs continuously
-    false
 }

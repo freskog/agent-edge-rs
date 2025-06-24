@@ -1,3 +1,4 @@
 pub mod pipeline;
 
-pub use pipeline::{DetectionPipeline, DetectionResult, OpenWakeWordConfig};
+pub use crate::models::wakeword::WakewordDetection;
+pub use pipeline::{DetectionPipeline, PipelineConfig};
