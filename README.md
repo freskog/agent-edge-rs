@@ -36,7 +36,10 @@ The easiest way to develop and test:
    # Run comprehensive tests
    cargo test
    
-   # Deploy to your Pi
+   # First-time deployment to your Pi
+   ./deploy-to-pi.sh --full myuser@192.168.1.100
+   
+   # Quick updates during development
    ./deploy-to-pi.sh myuser@192.168.1.100
    ```
 
@@ -234,9 +237,15 @@ For **other microphones**:
 Use the deployment script to build and deploy to a Pi:
 
 ```bash
-# Deploy to Pi (run from DevContainer, requires SSH access)
+# Quick deploy (default) - only copies binary (fast for development)
 ./deploy-to-pi.sh myuser@192.168.1.100
+
+# Full deploy - complete setup with models and dependencies (first time or major changes)
+./deploy-to-pi.sh --full myuser@192.168.1.100
 ```
+
+**Default behavior**: Quick binary-only deployment for fast development iterations.  
+**Full deployment**: Use `--full` flag for first-time setup or when models/dependencies change.
 
 The script handles ARM64 compilation, file transfer, dependency installation, and setup automatically. **Must be run from within the DevContainer** for correct ARM64 build.
 

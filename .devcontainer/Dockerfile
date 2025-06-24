@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     # Audio system dependencies
     libasound2-dev \
     libpulse-dev \
+    # USB device access for LED ring control
+    libudev-dev \
     # Python dependencies for tflitec
     python3 \
     python3-pip \

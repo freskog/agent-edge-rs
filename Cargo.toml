@@ -23,6 +23,9 @@ webrtc-vad = "0.4.0"
 # Global state management
 lazy_static = "1.4"
 
+# USB control for LED ring
+rusb = "0.9" # For direct USB control transfers
+
 # PulseAudio support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 libpulse-binding = "2.0"

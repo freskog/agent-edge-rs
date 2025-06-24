@@ -107,6 +107,7 @@
 //! - **Accuracy**: High precision/recall with properly tuned confidence threshold
 
 use crate::error::{EdgeError, Result};
+use crate::led_ring::LedRing;
 use crate::models::{
     embedding::EmbeddingModel,
     melspectrogram::MelSpectrogramModel,
@@ -137,6 +138,12 @@ pub struct PipelineConfig {
 
     /// Debouncing parameters
     pub debounce_duration_ms: u64, // Minimum time between detections: 1000ms (1 second)
+
+    /// LED feedback configuration
+    pub enable_led_feedback: bool, // Enable/disable LED ring visual feedback
+    pub led_brightness: u8,                // LED brightness (0-31)
+    pub led_listening_color: (u8, u8, u8), // RGB color when listening for wake word
+    pub led_detected_color: (u8, u8, u8),  // RGB color when wake word detected
 }
 
 impl Default for PipelineConfig {
@@ -151,6 +158,10 @@ impl Default for PipelineConfig {
             window_size: 16,
             overlap_size: 8,
             debounce_duration_ms: 1000,
+            enable_led_feedback: true,
+            led_brightness: 31,
+            led_listening_color: (0, 0, 255),
+            led_detected_color: (0, 255, 0),
         }
     }
 }
@@ -201,6 +212,9 @@ pub struct DetectionPipeline {
     // Tracks the last successful detection to implement temporal suppression
     last_detection_time: Option<std::time::Instant>,
     debounce_duration: std::time::Duration,
+
+    // LED ring for visual feedback (optional)
+    led_ring: Option<LedRing>,
 }
 
 impl DetectionPipeline {
@@ -223,6 +237,37 @@ impl DetectionPipeline {
         // Capture debounce duration before moving config
         let debounce_duration = std::time::Duration::from_millis(config.debounce_duration_ms);
 
+        // Initialize LED ring if enabled
+        let led_ring = if config.enable_led_feedback {
+            match LedRing::new() {
+                Ok(ring) => {
+                    log::info!("LED ring initialized successfully");
+                    // Set initial brightness and listening mode
+                    if let Err(e) = ring.set_brightness(config.led_brightness) {
+                        log::warn!("Failed to set LED brightness: {}", e);
+                    }
+                    if let Err(e) = ring.set_color(
+                        config.led_listening_color.0,
+                        config.led_listening_color.1,
+                        config.led_listening_color.2,
+                    ) {
+                        log::warn!("Failed to set LED listening color: {}", e);
+                    }
+                    Some(ring)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to initialize LED ring: {}. Continuing without LED feedback.",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            log::info!("LED feedback disabled in configuration");
+            None
+        };
+
         log::info!("Detection pipeline initialized successfully");
 
         Ok(Self {
@@ -235,6 +280,7 @@ impl DetectionPipeline {
             melspec_frames_needed,
             last_detection_time: None,
             debounce_duration,
+            led_ring,
         })
     }
 
@@ -457,6 +503,21 @@ impl DetectionPipeline {
                         "🎉 WAKEWORD DETECTED! Confidence: {:.3} (first detection)",
                         confidence
                     );
+
+                    // Trigger LED feedback for wake word detection
+                    if let Some(ref led_ring) = self.led_ring {
+                        if let Err(e) = led_ring.set_color(
+                            self.config.led_detected_color.0,
+                            self.config.led_detected_color.1,
+                            self.config.led_detected_color.2,
+                        ) {
+                            log::warn!("Failed to set LED detection color: {}", e);
+                        }
+
+                        // TODO: Implement non-blocking LED effects
+                        // For now, we just set the detection color. Future implementation
+                        // could use channels or async timers for brief visual effects.
+                    }
                 }
                 Some(last_time) => {
                     let elapsed = now.duration_since(last_time);
@@ -469,6 +530,17 @@ impl DetectionPipeline {
                             confidence,
                             elapsed.as_millis()
                         );
+
+                        // Trigger LED feedback for wake word detection
+                        if let Some(ref led_ring) = self.led_ring {
+                            if let Err(e) = led_ring.set_color(
+                                self.config.led_detected_color.0,
+                                self.config.led_detected_color.1,
+                                self.config.led_detected_color.2,
+                            ) {
+                                log::warn!("Failed to set LED detection color: {}", e);
+                            }
+                        }
                     } else {
                         // Within debounce period - suppress detection
                         let remaining = self.debounce_duration - elapsed;
@@ -530,6 +602,18 @@ impl DetectionPipeline {
         self.embedding_window.clear();
         self.melspec_accumulator.clear();
         self.last_detection_time = None;
+
+        // Reset LED ring to listening mode if available
+        if let Some(ref led_ring) = self.led_ring {
+            if let Err(e) = led_ring.set_color(
+                self.config.led_listening_color.0,
+                self.config.led_listening_color.1,
+                self.config.led_listening_color.2,
+            ) {
+                log::warn!("Failed to reset LED to listening color: {}", e);
+            }
+        }
+
         log::info!("🔄 Pipeline state reset - will need ~1.3s to rebuild context");
     }
 }
