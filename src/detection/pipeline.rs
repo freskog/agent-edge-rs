@@ -157,7 +157,7 @@ impl Default for PipelineConfig {
             confidence_threshold: 0.5,
             window_size: 16,
             overlap_size: 8,
-            debounce_duration_ms: 1000,
+            debounce_duration_ms: 1500,
             enable_led_feedback: true,
             led_brightness: 31,
             led_listening_color: (0, 0, 255),

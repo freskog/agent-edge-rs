@@ -5,6 +5,11 @@ edition = "2024"
 authors = ["Fredrik Skogberg <freskog@gmail.com>"]
 description = "Wakeword-only edge client for low-powered devices"
 
+[features]
+# Default features - LED ring enabled by default (will be available on Linux, stub on others)
+default = ["led_ring"]
+led_ring = ["rusb"]
+
 [dependencies]
 # Core utilities
 log = "0.4"
@@ -23,13 +28,34 @@ webrtc-vad = "0.4.0"
 # Global state management
 lazy_static = "1.4"
 
-# USB control for LED ring
-rusb = "0.9" # For direct USB control transfers
+# Async runtime
+tokio = { version = "1.45.1", features = ["full"] }
 
-# PulseAudio support (Linux only)
+# HTTP client and JSON
+reqwest = { version = "0.12.20", features = ["json", "multipart", "stream"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+# Security
+secrecy = "0.10.3"
+dotenvy = "0.15.7"
+
+# USB control for LED ring (optional)
+rusb = { version = "0.9", optional = true }
+
+# Audio playback
+rodio = "0.20.1"
+
+# Platform-specific audio capture dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 libpulse-binding = "2.0"
 libpulse-simple-binding = "2.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.16.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal = "0.16.0"
 
 [dev-dependencies]
 hound = "3.5"
@@ -37,3 +63,7 @@ hound = "3.5"
 [[bin]]
 name = "agent-edge"
 path = "src/main.rs"
+
+[[bin]]
+name = "audio-demo"
+path = "src/bin/audio_demo.rs"

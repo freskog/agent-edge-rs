@@ -76,11 +76,11 @@ pub struct VADConfig {
 impl Default for VADConfig {
     fn default() -> Self {
         Self {
-            mode: VADMode::Aggressive, // Skew towards false positives over false negatives
+            mode: VADMode::LowBitrate, // Less aggressive to reduce false positives
             sample_rate: VADSampleRate::Rate16kHz,
             frame_duration_ms: 20, // 20ms frames = 320 samples at 16kHz (good balance)
-            speech_trigger_frames: 2, // 40ms of consecutive speech to trigger
-            silence_stop_frames: 5, // 100ms of silence to stop
+            speech_trigger_frames: 3, // 60ms of consecutive speech to trigger (more selective)
+            silence_stop_frames: 15, // 300ms of silence to stop (faster cutoff after speech)
         }
     }
 }
