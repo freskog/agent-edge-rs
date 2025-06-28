@@ -1,49 +1,73 @@
-use reqwest::{Client, multipart};
+use crate::AudioChunk;
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde_json::{self, json};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::broadcast;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use url::Url;
 
 #[derive(Error, Debug)]
 pub enum STTError {
-    #[error("HTTP request failed: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("API error: {status} - {message}")]
-    ApiError { status: u16, message: String },
+    #[error("WebSocket connection failed: {0}")]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("URL parsing error: {0}")]
+    UrlParse(#[from] url::ParseError),
+    #[error("API error: {message}")]
+    ApiError { message: String },
     #[error("Audio format error: {0}")]
     AudioFormat(String),
     #[error("Response parsing error: {0}")]
     ParseError(String),
+    #[error("Streaming error: {0}")]
+    Streaming(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct STTConfig {
-    pub model: String,
     pub language: Option<String>,
     pub temperature: Option<f32>,
-    pub response_format: String,
+    pub prompt: Option<String>,
 }
 
 impl Default for STTConfig {
     fn default() -> Self {
         Self {
-            model: "whisper-v3".to_string(),
-            language: None,         // Auto-detect
-            temperature: Some(0.0), // Deterministic
-            response_format: "json".to_string(),
+            language: None,
+            temperature: Some(0.0),
+            prompt: None, // No biasing prompt - let it transcribe naturally
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct STTResponse {
     pub text: String,
     pub language: Option<String>,
-    pub duration: Option<f32>,
+    pub segments: HashMap<u32, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StreamingResponse {
+    task: Option<String>,
+    language: Option<String>,
+    text: Option<String>,
+    segments: Option<Vec<StreamingSegment>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StreamingSegment {
+    id: u32,
+    text: String,
 }
 
 pub struct FireworksSTT {
-    client: Client,
     api_key: String,
-    base_url: String,
     config: STTConfig,
 }
 
@@ -53,164 +77,193 @@ impl FireworksSTT {
     }
 
     pub fn with_config(api_key: String, config: STTConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self {
-            client,
-            api_key,
-            base_url: "https://api.fireworks.ai/inference/v1".to_string(),
-            config,
-        }
+        Self { api_key, config }
     }
 
-    /// Transcribe audio from raw bytes (WAV format)
-    pub async fn transcribe_bytes(&self, audio_data: &[u8]) -> Result<STTResponse, STTError> {
-        self.transcribe_with_filename(audio_data, "audio.wav").await
-    }
+    /// Establishes a WebSocket connection, streams all audio from a receiver,
+    /// and returns the final transcript received from the server.
+    pub async fn transcribe_stream(
+        self: Arc<Self>,
+        mut audio_receiver: broadcast::Receiver<AudioChunk>,
+    ) -> Result<String, STTError> {
+        // Create WebSocket URL with query parameters
+        let mut url = Url::parse(
+            "wss://audio-streaming.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions/streaming",
+        )?;
 
-    /// Transcribe audio with specific filename for format detection
-    pub async fn transcribe_with_filename(
-        &self,
-        audio_data: &[u8],
-        filename: &str,
-    ) -> Result<STTResponse, STTError> {
-        let url = format!("{}/audio/transcriptions", self.base_url);
-
-        // Build multipart form
-        let mut form = multipart::Form::new()
-            .text("model", self.config.model.clone())
-            .text("response_format", self.config.response_format.clone())
-            .part(
-                "file",
-                multipart::Part::bytes(audio_data.to_vec())
-                    .file_name(filename.to_string())
-                    .mime_str("audio/wav")
-                    .map_err(|e| STTError::AudioFormat(format!("Invalid MIME type: {}", e)))?,
-            );
-
-        // Add optional parameters
+        // Add query parameters
         if let Some(language) = &self.config.language {
-            form = form.text("language", language.clone());
+            url.query_pairs_mut().append_pair("language", language);
         }
 
         if let Some(temperature) = self.config.temperature {
-            form = form.text("temperature", temperature.to_string());
+            url.query_pairs_mut()
+                .append_pair("temperature", &temperature.to_string());
         }
 
-        // Make the request
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
-            .send()
-            .await?;
-
-        let status = response.status();
-
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(STTError::ApiError {
-                status: status.as_u16(),
-                message: error_text,
-            });
+        if let Some(prompt) = &self.config.prompt {
+            url.query_pairs_mut().append_pair("prompt", prompt);
         }
 
-        // Parse response
-        let response_text = response.text().await?;
-        self.parse_response(&response_text)
+        // Set response format to verbose_json for streaming
+        url.query_pairs_mut()
+            .append_pair("response_format", "verbose_json");
+
+        // Add API key as a query parameter (this was working before)
+        url.query_pairs_mut()
+            .append_pair("Authorization", &self.api_key);
+
+        // Connect to WebSocket using the URL as a string
+        let (ws_stream, _) = connect_async(url.as_str()).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Spawn a dedicated task for sending audio.
+        let sender_handle = tokio::spawn(async move {
+            let mut chunk_count = 0;
+            
+            loop {
+                match audio_receiver.recv().await {
+                    Ok(audio_chunk) => {
+                        chunk_count += 1;
+                        let pcm_data = self.samples_to_pcm(&audio_chunk.samples_f32).unwrap(); // Infallible
+                        let samples_count = audio_chunk.samples_f32.len();
+                        let duration_ms = (samples_count as f32 / 16000.0) * 1000.0;
+                        
+                        log::debug!("STT: Sending audio chunk {} ({} samples = {:.1}ms = {} bytes)", 
+                                   chunk_count, samples_count, duration_ms, pcm_data.len());
+                        
+                        if write.send(Message::Binary(pcm_data.into())).await.is_err() {
+                            log::warn!("STT: Failed to send audio chunk {}", chunk_count);
+                            break; // Connection closed
+                        }
+                        // No artificial sleep - we're getting real-time audio from microphone
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("STT: Audio receiver lagged, skipped {} messages", skipped);
+                        continue;
+                    }
+                    Err(_) => {
+                        log::info!("STT: Audio channel closed, sent {} chunks total", chunk_count);
+                        break; // Channel closed
+                    }
+                }
+            }
+            
+            // Send final checkpoint message like Python example
+            let final_checkpoint = json!({"checkpoint_id": "final"});
+            let checkpoint_msg = serde_json::to_string(&final_checkpoint).unwrap();
+            log::info!("STT: Sending final checkpoint");
+            if let Err(e) = write.send(Message::Text(checkpoint_msg.into())).await {
+                log::warn!("STT: Failed to send final checkpoint: {}", e);
+            }
+            
+            log::info!("STT: Closing audio sender, sent {} chunks total", chunk_count);
+            let _ = write.close().await; // Close the write half when done
+        });
+
+        // This main task handles receiving messages and waits for final checkpoint
+        let mut final_transcript = String::new();
+        let mut message_count = 0;
+        let mut received_final_checkpoint = false;
+
+        log::info!("STT: Starting to listen for server responses");
+        
+        // First phase: Process messages until we get final checkpoint or timeout
+        let server_timeout = Duration::from_millis(10000); // 10 seconds to allow for longer processing
+        while let Ok(Some(msg_result)) = tokio::time::timeout(server_timeout, read.next()).await {
+            message_count += 1;
+            match msg_result {
+                Ok(Message::Text(text)) => {
+                    log::debug!("STT: Received text message {}: {}", message_count, text);
+                    
+                    // Check for final checkpoint response
+                    if let Ok(checkpoint_response) = serde_json::from_str::<serde_json::Value>(&text.to_string()) {
+                        if checkpoint_response.get("checkpoint_id").and_then(|v| v.as_str()) == Some("final") {
+                            log::info!("STT: Received final checkpoint acknowledgment from server");
+                            received_final_checkpoint = true;
+                            break; // Exit the loop when we get final checkpoint
+                        }
+                    }
+                    
+                    if let Ok(response) = serde_json::from_str::<StreamingResponse>(&text.to_string()) {
+                        log::debug!("STT: Parsed response - text: {:?}", response.text);
+                        if let Some(text) = response.text {
+                            if !text.is_empty() {
+                                log::info!("STT: Updated transcript: '{}'", text);
+                                final_transcript = text;
+                            }
+                        }
+                    } else {
+                        log::debug!("STT: Non-transcription message: {}", text);
+                    }
+                }
+                Ok(Message::Binary(data)) => {
+                    log::debug!("STT: Received binary message {} ({} bytes)", message_count, data.len());
+                }
+                Ok(Message::Close(frame)) => {
+                    log::info!("STT: Server closed connection: {:?}", frame);
+                    break; // Server closed connection
+                }
+                Err(e) => {
+                    log::error!("STT: WebSocket error: {}", e);
+                    break; // WebSocket error
+                }
+                _ => {
+                    log::debug!("STT: Received other message type {}", message_count);
+                }
+            }
+        }
+
+        // Second phase: Wait for any final transcription updates after checkpoint
+        if received_final_checkpoint {
+            log::info!("STT: Final checkpoint received, waiting for final transcription...");
+            let final_timeout = Duration::from_millis(3000); // 3 seconds for final processing
+            while let Ok(Some(msg_result)) = tokio::time::timeout(final_timeout, read.next()).await {
+                match msg_result {
+                    Ok(Message::Text(text)) => {
+                        log::debug!("STT: Post-checkpoint message: {}", text);
+                        if let Ok(response) = serde_json::from_str::<StreamingResponse>(&text.to_string()) {
+                            if let Some(text) = response.text {
+                                if !text.is_empty() {
+                                    log::info!("STT: Final transcript update: '{}'", text);
+                                    final_transcript = text;
+                                }
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) => {
+                        log::info!("STT: Server closed connection after final checkpoint");
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("STT: Error after final checkpoint: {}", e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            log::warn!("STT: Did not receive final checkpoint acknowledgment from server");
+        }
+
+        log::info!("STT: Transcription complete - received {} messages, final transcript: '{}'", message_count, final_transcript);
+
+        // Ensure the sender task is cleaned up
+        sender_handle.abort();
+
+        Ok(final_transcript)
     }
 
-    /// Parse the JSON response from Fireworks API
-    fn parse_response(&self, response_text: &str) -> Result<STTResponse, STTError> {
-        let json: serde_json::Value = serde_json::from_str(response_text)
-            .map_err(|e| STTError::ParseError(format!("Invalid JSON: {}", e)))?;
+    /// Convert f32 samples to PCM 16-bit little-endian format
+    fn samples_to_pcm(&self, samples: &[f32]) -> Result<Vec<u8>, STTError> {
+        let mut pcm_data = Vec::with_capacity(samples.len() * 2);
 
-        let text = json["text"]
-            .as_str()
-            .ok_or_else(|| STTError::ParseError("Missing 'text' field".to_string()))?
-            .to_string();
-
-        let language = json["language"].as_str().map(|s| s.to_string());
-        let duration = json["duration"].as_f64().map(|d| d as f32);
-
-        Ok(STTResponse {
-            text,
-            language,
-            duration,
-        })
-    }
-
-    /// Convert audio from f32 samples to WAV bytes for transmission
-    pub fn samples_to_wav(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, STTError> {
-        use std::io::Cursor;
-
-        let mut cursor = Cursor::new(Vec::new());
-
-        // Write WAV header
-        self.write_wav_header(&mut cursor, samples.len() as u32, sample_rate)
-            .map_err(|e| STTError::AudioFormat(format!("WAV header error: {}", e)))?;
-
-        // Convert f32 samples to i16 and write
         for &sample in samples {
             let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            cursor
-                .get_mut()
-                .extend_from_slice(&sample_i16.to_le_bytes());
+            pcm_data.extend_from_slice(&sample_i16.to_le_bytes());
         }
 
-        Ok(cursor.into_inner())
-    }
-
-    /// Write WAV file header
-    fn write_wav_header(
-        &self,
-        cursor: &mut std::io::Cursor<Vec<u8>>,
-        num_samples: u32,
-        sample_rate: u32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::Write;
-
-        let byte_rate = sample_rate * 2; // 16-bit mono
-        let data_size = num_samples * 2;
-        let file_size = 36 + data_size;
-
-        // RIFF chunk
-        cursor.write_all(b"RIFF")?;
-        cursor.write_all(&file_size.to_le_bytes())?;
-        cursor.write_all(b"WAVE")?;
-
-        // fmt chunk
-        cursor.write_all(b"fmt ")?;
-        cursor.write_all(&16u32.to_le_bytes())?; // chunk size
-        cursor.write_all(&1u16.to_le_bytes())?; // audio format (PCM)
-        cursor.write_all(&1u16.to_le_bytes())?; // num channels (mono)
-        cursor.write_all(&sample_rate.to_le_bytes())?;
-        cursor.write_all(&byte_rate.to_le_bytes())?;
-        cursor.write_all(&2u16.to_le_bytes())?; // block align
-        cursor.write_all(&16u16.to_le_bytes())?; // bits per sample
-
-        // data chunk
-        cursor.write_all(b"data")?;
-        cursor.write_all(&data_size.to_le_bytes())?;
-
-        Ok(())
-    }
-
-    /// Convenience method to transcribe f32 audio samples directly
-    pub async fn transcribe_samples(
-        &self,
-        samples: &[f32],
-        sample_rate: u32,
-    ) -> Result<STTResponse, STTError> {
-        let wav_data = self.samples_to_wav(samples, sample_rate)?;
-        self.transcribe_bytes(&wav_data).await
+        Ok(pcm_data)
     }
 }
 
@@ -219,7 +272,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wav_conversion() {
+    fn test_pcm_conversion() {
         let stt = FireworksSTT::new("test_key".to_string());
 
         // Generate a simple sine wave
@@ -234,23 +287,22 @@ mod tests {
             })
             .collect();
 
-        let wav_data = stt.samples_to_wav(&samples, sample_rate).unwrap();
+        let pcm_data = stt.samples_to_pcm(&samples).unwrap();
 
-        // Check WAV header
-        assert_eq!(&wav_data[0..4], b"RIFF");
-        assert_eq!(&wav_data[8..12], b"WAVE");
-        assert_eq!(&wav_data[12..16], b"fmt ");
+        // Check that we have the expected amount of data (16-bit = 2 bytes per sample)
+        assert_eq!(pcm_data.len(), samples.len() * 2);
 
-        // Check that we have the expected amount of data
-        assert!(wav_data.len() > 44); // WAV header is 44 bytes
+        // Check that the data is little-endian
+        assert_eq!(pcm_data[0], 0); // First sample should be close to 0
     }
 
     #[test]
     fn test_config_defaults() {
         let config = STTConfig::default();
-        assert_eq!(config.model, "whisper-v3");
-        assert_eq!(config.response_format, "json");
+        assert_eq!(config.language, None);
         assert_eq!(config.temperature, Some(0.0));
-        assert!(config.language.is_none());
+        assert!(config.prompt.is_some());
     }
 }
+
+

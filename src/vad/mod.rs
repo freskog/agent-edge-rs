@@ -1,12 +1,25 @@
-//! Voice Activity Detection using WebRTC VAD
+//! Voice Activity Detection
 //!
 //! This module provides efficient voice activity detection to reduce CPU usage
 //! by only running the expensive wakeword detection when speech is detected.
+//!
+//! Supports both WebRTC VAD (legacy) and Silero VAD (recommended for better accuracy).
 
 use crate::error::{EdgeError, Result};
 use std::collections::VecDeque;
 use strum::Display;
 use webrtc_vad::{SampleRate, Vad, VadMode};
+
+// Silero VAD implementation
+pub mod silero;
+pub use silero::SileroVAD;
+
+/// VAD implementation type
+#[derive(Debug, Clone, Copy, Display)]
+pub enum VADType {
+    WebRTC,
+    Silero,
+}
 
 /// VAD mode wrapper with automatic string conversion
 #[derive(Debug, Clone, Copy, Display)]
@@ -61,6 +74,8 @@ impl From<VADSampleRate> for u32 {
 /// Configuration for Voice Activity Detection
 #[derive(Debug, Clone)]
 pub struct VADConfig {
+    /// VAD implementation type
+    pub vad_type: VADType,
     /// VAD aggressiveness mode
     pub mode: VADMode,
     /// Sample rate
@@ -76,6 +91,7 @@ pub struct VADConfig {
 impl Default for VADConfig {
     fn default() -> Self {
         Self {
+            vad_type: VADType::WebRTC, // Default to WebRTC for better performance
             mode: VADMode::LowBitrate, // Less aggressive to reduce false positives
             sample_rate: VADSampleRate::Rate16kHz,
             frame_duration_ms: 20, // 20ms frames = 320 samples at 16kHz (good balance)
@@ -83,6 +99,18 @@ impl Default for VADConfig {
             silence_stop_frames: 15, // 300ms of silence to stop (faster cutoff after speech)
         }
     }
+}
+
+/// Unified VAD trait for different implementations
+pub trait VAD {
+    /// Returns true if the VAD thinks the audio chunk should be processed.
+    fn should_process_audio(&mut self, audio: &[i16]) -> Result<bool>;
+
+    /// Returns true if speech is considered active.
+    fn is_speech_active(&self) -> bool;
+
+    /// Resets the VAD's internal state.
+    fn reset(&mut self);
 }
 
 /// WebRTC VAD wrapper with state management
@@ -135,9 +163,11 @@ impl WebRtcVAD {
             audio_buffer: Vec::new(),
         })
     }
+}
 
+impl VAD for WebRtcVAD {
     /// Process i16 audio samples directly and return whether to run wakeword detection
-    pub fn should_process_audio(&mut self, samples: &[i16]) -> Result<bool> {
+    fn should_process_audio(&mut self, samples: &[i16]) -> Result<bool> {
         // Add samples to our buffer
         self.audio_buffer.extend_from_slice(samples);
 
@@ -166,6 +196,21 @@ impl WebRtcVAD {
         Ok(self.is_speech_active || any_speech_detected)
     }
 
+    /// Reset VAD state
+    fn reset(&mut self) {
+        self.recent_decisions.clear();
+        self.is_speech_active = false;
+        self.audio_buffer.clear();
+        log::info!("🔄 WebRTC VAD: State reset");
+    }
+
+    /// Returns true if speech is considered active.
+    fn is_speech_active(&self) -> bool {
+        self.is_speech_active
+    }
+}
+
+impl WebRtcVAD {
     /// Update VAD state based on recent decisions
     fn update_vad_state(&mut self, is_voice: bool) {
         // Add to recent decisions
@@ -210,12 +255,18 @@ impl WebRtcVAD {
             }
         }
     }
+}
 
-    /// Reset VAD state
-    pub fn reset(&mut self) {
-        self.recent_decisions.clear();
-        self.is_speech_active = false;
-        self.audio_buffer.clear();
-        log::info!("🔄 VAD: State reset");
+/// Factory function to create the appropriate VAD implementation
+pub fn create_vad(config: VADConfig) -> Result<Box<dyn VAD>> {
+    match config.vad_type {
+        VADType::WebRTC => {
+            let vad = WebRtcVAD::new(config)?;
+            Ok(Box::new(vad))
+        }
+        VADType::Silero => {
+            let vad = SileroVAD::new(config)?;
+            Ok(Box::new(vad))
+        }
     }
 }

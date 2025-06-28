@@ -79,22 +79,10 @@ fn process_audio_in_chunks(
             let mut padded_chunk = vec![0.0f32; CHUNK_SIZE];
             padded_chunk[..chunk.len()].copy_from_slice(chunk);
 
-            let mut detection = pipeline.process_audio_chunk(&padded_chunk)?;
-
-            // Zero out first 5 frames like OpenWakeWord (model initialization)
-            if chunk_idx < 5 {
-                detection.confidence = 0.0;
-            }
-
+            let detection = pipeline.process_audio_chunk(&padded_chunk)?;
             results.push((detection.confidence, detection.detected));
         } else {
-            let mut detection = pipeline.process_audio_chunk(chunk)?;
-
-            // Zero out first 5 frames like OpenWakeWord (model initialization)
-            if chunk_idx < 5 {
-                detection.confidence = 0.0;
-            }
-
+            let detection = pipeline.process_audio_chunk(chunk)?;
             results.push((detection.confidence, detection.detected));
         }
     }

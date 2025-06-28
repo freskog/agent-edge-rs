@@ -4,22 +4,11 @@
 //! with mel spectrogram feature preprocessing.
 
 use crate::error::{EdgeError, Result};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use tflitec::interpreter::{Interpreter, Options};
 use tflitec::model::Model;
 use tflitec::tensor::Shape;
-
-// Static storage for the wakeword model and interpreter
-static WAKEWORD_MODEL: OnceLock<Model<'static>> = OnceLock::new();
-static WAKEWORD_INTERPRETER: OnceLock<Mutex<Interpreter<'static>>> = OnceLock::new();
-static WAKEWORD_CONFIG: OnceLock<WakewordModelConfig> = OnceLock::new();
-
-/// Configuration for wakeword model
-#[derive(Debug, Clone)]
-struct WakewordModelConfig {
-    expected_input_size: usize,
-}
 
 /// Wakeword detection result
 #[derive(Debug, Clone)]
@@ -33,34 +22,26 @@ pub struct WakewordDetection {
 }
 
 /// Simple wrapper for wakeword model used by the detection pipeline  
-pub struct WakewordModel;
+pub struct WakewordModel {
+    interpreter: Mutex<Interpreter<'static>>,
+    expected_input_size: usize,
+}
 
 impl WakewordModel {
     pub fn new(model_path: &str) -> Result<Self> {
-        // Initialize the static model
-        let model = Model::new(model_path).map_err(|e| {
+        // Load the model and leak it for 'static lifetime
+        let model = Box::leak(Box::new(Model::new(model_path).map_err(|e| {
             EdgeError::ModelLoadError(format!("Failed to load wakeword model: {}", e))
-        })?;
-
-        let model = WAKEWORD_MODEL.get_or_init(|| model);
+        })?));
 
         // Corrected: Model expects [1, 16, 96] = 1536 features (16 embedding frames × 96 features each)
         let expected_input_size = 1536;
-
-        // Store the config
-        let config = WakewordModelConfig {
-            expected_input_size,
-        };
-
-        WAKEWORD_CONFIG
-            .set(config)
-            .map_err(|_| EdgeError::ModelLoadError("Failed to set wakeword config".to_string()))?;
 
         // Create interpreter options
         let mut options = Options::default();
         options.thread_count = 1;
 
-        // Create the static interpreter
+        // Create the interpreter
         let interpreter = Interpreter::new(model, Some(options)).map_err(|e| {
             EdgeError::ModelLoadError(format!("Failed to create wakeword interpreter: {}", e))
         })?;
@@ -76,35 +57,23 @@ impl WakewordModel {
             EdgeError::ModelLoadError(format!("Failed to allocate wakeword tensors: {}", e))
         })?;
 
-        // Store the interpreter in a mutex for thread safety
-        WAKEWORD_INTERPRETER
-            .set(Mutex::new(interpreter))
-            .map_err(|_| {
-                EdgeError::ModelLoadError("Failed to initialize wakeword interpreter".to_string())
-            })?;
-
-        Ok(Self)
+        Ok(Self {
+            interpreter: Mutex::new(interpreter),
+            expected_input_size,
+        })
     }
 
     pub fn predict(&self, features: &[f32]) -> Result<f32> {
-        let config = WAKEWORD_CONFIG.get().ok_or_else(|| {
-            EdgeError::ProcessingError("Wakeword model not initialized".to_string())
-        })?;
-
-        if features.len() != config.expected_input_size {
+        if features.len() != self.expected_input_size {
             return Err(EdgeError::InvalidInput(format!(
                 "Expected {} features, got {}",
-                config.expected_input_size,
+                self.expected_input_size,
                 features.len()
             )));
         }
 
-        // Get the static interpreter
-        let interpreter_mutex = WAKEWORD_INTERPRETER.get().ok_or_else(|| {
-            EdgeError::ProcessingError("Wakeword model not initialized".to_string())
-        })?;
-
-        let interpreter = interpreter_mutex.lock().map_err(|e| {
+        // Get the interpreter
+        let interpreter = self.interpreter.lock().map_err(|e| {
             EdgeError::ProcessingError(format!("Failed to lock interpreter: {}", e))
         })?;
 

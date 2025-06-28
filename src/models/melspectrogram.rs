@@ -11,16 +11,11 @@
 
 use crate::error::{EdgeError, Result};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use tflitec::interpreter::{Interpreter, Options};
 use tflitec::model::Model;
 use tflitec::tensor::Shape;
-
-// Static storage for the model and interpreter
-static MELSPEC_MODEL: OnceLock<Model<'static>> = OnceLock::new();
-static MELSPEC_INTERPRETER: OnceLock<Mutex<Interpreter<'static>>> = OnceLock::new();
-static MELSPEC_CONFIG: OnceLock<MelSpectrogramConfig> = OnceLock::new();
 
 /// Configuration for mel spectrogram processing
 #[derive(Debug, Clone)]
@@ -47,7 +42,10 @@ impl Default for MelSpectrogramConfig {
 ///
 /// This model converts raw audio samples to mel spectrogram features
 /// using the OpenWakeWord melspectrogram model approach.
-pub struct MelSpectrogramModel;
+pub struct MelSpectrogramModel {
+    interpreter: Mutex<Interpreter<'static>>,
+    config: MelSpectrogramConfig,
+}
 
 impl MelSpectrogramModel {
     /// Create a new mel spectrogram model
@@ -65,22 +63,15 @@ impl MelSpectrogramModel {
             )));
         }
 
-        // Initialize the static model
-        let model = Model::new(&config.model_path)
-            .map_err(|e| EdgeError::ModelLoadError(format!("Failed to load model: {}", e)))?;
-
-        let model = MELSPEC_MODEL.get_or_init(|| model);
-
-        // Store the config
-        MELSPEC_CONFIG
-            .set(config.clone())
-            .map_err(|_| EdgeError::ModelLoadError("Failed to set config".to_string()))?;
+        // Load the model and leak it for 'static lifetime
+        let model = Box::leak(Box::new(Model::new(&config.model_path)
+            .map_err(|e| EdgeError::ModelLoadError(format!("Failed to load model: {}", e)))?));
 
         // Create interpreter options
         let mut options = Options::default();
         options.thread_count = 1;
 
-        // Create the static interpreter
+        // Create the interpreter
         let interpreter = Interpreter::new(model, Some(options)).map_err(|e| {
             EdgeError::ModelLoadError(format!("Failed to create interpreter: {}", e))
         })?;
@@ -108,14 +99,10 @@ impl MelSpectrogramModel {
             output_size
         );
 
-        // Store the interpreter in a mutex for thread safety
-        MELSPEC_INTERPRETER
-            .set(Mutex::new(interpreter))
-            .map_err(|_| {
-                EdgeError::ModelLoadError("Failed to initialize interpreter".to_string())
-            })?;
-
-        Ok(Self)
+        Ok(Self {
+            interpreter: Mutex::new(interpreter),
+            config,
+        })
     }
 
     /// Process audio samples to extract mel spectrogram features
@@ -126,24 +113,16 @@ impl MelSpectrogramModel {
     /// # Returns
     /// * `Vec<f32>` - Mel spectrogram features as a flattened vector
     pub fn predict(&self, audio_samples: &[f32]) -> Result<Vec<f32>> {
-        let config = MELSPEC_CONFIG.get().ok_or_else(|| {
-            EdgeError::ProcessingError("MelSpectrogram model not initialized".to_string())
-        })?;
-
-        if audio_samples.len() != config.chunk_size {
+        if audio_samples.len() != self.config.chunk_size {
             return Err(EdgeError::InvalidInput(format!(
                 "Expected {} audio samples, got {}",
-                config.chunk_size,
+                self.config.chunk_size,
                 audio_samples.len()
             )));
         }
 
-        // Get the static interpreter
-        let interpreter_mutex = MELSPEC_INTERPRETER.get().ok_or_else(|| {
-            EdgeError::ProcessingError("MelSpectrogram model not initialized".to_string())
-        })?;
-
-        let interpreter = interpreter_mutex.lock().map_err(|e| {
+        // Get the interpreter
+        let interpreter = self.interpreter.lock().map_err(|e| {
             EdgeError::ProcessingError(format!("Failed to lock interpreter: {}", e))
         })?;
 

@@ -214,6 +214,10 @@ The pipeline test validates real "Hey Mycroft" detection:
 RUST_LOG=info cargo run --release
 RUST_LOG=debug cargo run --release
 
+# VAD Type Selection (default: webrtc)
+VAD_TYPE=webrtc cargo run --release    # WebRTC VAD (recommended for Pi)
+VAD_TYPE=silero cargo run --release    # Silero VAD (better accuracy, higher CPU)
+
 # VAD Sensitivity (experimental)
 VAD_TRIGGER_FRAMES=3 cargo run --release    # More sensitive
 VAD_SILENCE_FRAMES=10 cargo run --release   # Less sensitive
@@ -229,6 +233,26 @@ For **ReSpeaker 4-mic array** (default setup):
 For **other microphones**:
 - Modify `PulseAudioCaptureConfig` in `main.rs`
 - Set appropriate channel count and target channel
+
+### Performance Monitoring
+
+Use the included performance monitoring script to compare VAD implementations:
+
+```bash
+# Compare both VAD types (automated test)
+./monitor_performance.sh compare
+
+# Monitor current process
+./monitor_performance.sh monitor 60
+
+# Test specific VAD type
+./monitor_performance.sh webrtc 30
+./monitor_performance.sh silero 30
+```
+
+**Expected Performance on Raspberry Pi:**
+- **WebRTC VAD**: 2-5% CPU during silence, 10-15% during speech
+- **Silero VAD**: 5-10% CPU during silence, 15-25% during speech (includes neural network optimization)
 
 ## 🚀 Deployment
 

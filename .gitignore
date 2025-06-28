@@ -49,6 +49,9 @@ logs/
 .env
 .env.local
 
+# Python
+.venv/
+
 # Build directories for cross-compilation
 cross-target/
 

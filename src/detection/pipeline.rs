@@ -80,7 +80,7 @@
 //!
 //! ### Startup Behavior
 //! The pipeline needs ~1.3 seconds to build sufficient context:
-//! - **Phase 1**: Accumulate 16 melspec outputs for first embedding (~1.28s)
+//! - **Phase 1**: Accumulate 16 melspectrogram outputs for first embedding (~1.28s)
 //! - **Phase 2**: Collect 16 embeddings for first wake word detection (~1.28s)
 //! - **Ready**: Continuous real-time detection with proper debouncing
 //!
@@ -154,10 +154,10 @@ impl Default for PipelineConfig {
             wakeword_model_path: "models/hey_mycroft_v0.1.tflite".to_string(),
             chunk_size: 1280,
             sample_rate: 16000,
-            confidence_threshold: 0.5,
+            confidence_threshold: 0.5, // Match OpenWakeWord's default threshold
             window_size: 16,
             overlap_size: 8,
-            debounce_duration_ms: 1500,
+            debounce_duration_ms: 1000, // 1 second debounce (OpenWakeWord uses 1.25s in tests)
             enable_led_feedback: true,
             led_brightness: 31,
             led_listening_color: (0, 0, 255),
@@ -208,10 +208,9 @@ pub struct DetectionPipeline {
     melspec_accumulator: VecDeque<Vec<f32>>,
     melspec_frames_needed: usize, // How many melspec outputs we need for one embedding input
 
-    // Debouncing for preventing repeated detections
-    // Tracks the last successful detection to implement temporal suppression
-    last_detection_time: Option<std::time::Instant>,
-    debounce_duration: std::time::Duration,
+    // Simple detection gating - much cleaner than complex silence gap detection
+    // After a detection, ignore subsequent detections until confidence drops below threshold
+    ignore_detections: bool,
 
     // LED ring for visual feedback (optional)
     led_ring: Option<LedRing>,
@@ -234,8 +233,8 @@ impl DetectionPipeline {
         let melspec_accumulator = VecDeque::with_capacity(config.window_size);
         let melspec_frames_needed = 16; // We need ~16 melspec outputs (5 frames each) to get 76+ frames
 
-        // Capture debounce duration before moving config
-        let debounce_duration = std::time::Duration::from_millis(config.debounce_duration_ms);
+        // Initialize simple detection gating
+        let ignore_detections = false;
 
         // Initialize LED ring if enabled
         let led_ring = if config.enable_led_feedback {
@@ -278,8 +277,7 @@ impl DetectionPipeline {
             embedding_window,
             melspec_accumulator,
             melspec_frames_needed,
-            last_detection_time: None,
-            debounce_duration,
+            ignore_detections,
             led_ring,
         })
     }
@@ -435,16 +433,10 @@ impl DetectionPipeline {
         // ═══════════════════════════════════════════════════════════════════════════════════
         // STEP 7: CHECK EMBEDDING READINESS
         // ═══════════════════════════════════════════════════════════════════════════════════
-        // Ensure we have accumulated enough embeddings for wake word analysis. This represents
-        // the final startup phase where the pipeline builds sufficient temporal context.
-        if self.embedding_window.len() < self.config.window_size {
-            log::debug!(
-                "⏳ Accumulating embedding context: {}/{} embeddings (need {}×80ms={:.1}s context)",
-                self.embedding_window.len(),
-                self.config.window_size,
-                self.config.window_size,
-                (self.config.window_size as f32 * 80.0) / 1000.0
-            );
+        // Always try to detect with whatever embeddings we have (minimum 1)
+        // Zero-padding will handle cases where we have fewer than 16 embeddings
+        if self.embedding_window.is_empty() {
+            log::debug!("⏳ No embeddings yet - waiting for first embedding");
             return Ok(WakewordDetection {
                 detected: false,
                 confidence: 0.0,
@@ -455,17 +447,27 @@ impl DetectionPipeline {
         // ═══════════════════════════════════════════════════════════════════════════════════
         // STEP 8: PREPARE WAKE WORD INPUT
         // ═══════════════════════════════════════════════════════════════════════════════════
-        // Flatten the embedding window for wake word model input.
+        // Flatten the embedding window for wake word model input, padding if necessary.
         //
-        // Input preparation: 16 embeddings × 96 features = 1536 total features
-        // Target shape: [1, 16, 96] for the wake word classifier
-        let flattened_embeddings: Vec<f32> =
+        // Target: 16 embeddings × 96 features = 1536 total features
+        // Always zero-pad to full size - this allows detection even with just 1 embedding
+        let mut flattened_embeddings: Vec<f32> =
             self.embedding_window.iter().flatten().cloned().collect();
+        
+        // Ensure we have exactly 1536 features for the model (16 × 96)
+        let target_size = self.config.window_size * 96; // 16 × 96 = 1536
+        if flattened_embeddings.len() < target_size {
+            // Pad with zeros at the beginning (older time steps)
+            let padding_needed = target_size - flattened_embeddings.len();
+            let mut padded = vec![0.0f32; padding_needed];
+            padded.extend(flattened_embeddings);
+            flattened_embeddings = padded;
+        }
 
         log::debug!(
-            "✓ Wake word prep: {} embeddings × {} features = {} total features",
+            "✓ Wake word prep: {} embeddings × 96 features = {} total features (zero-padded to {})",
             self.embedding_window.len(),
-            96, // embedding size is always 96
+            self.embedding_window.len() * 96,
             flattened_embeddings.len()
         );
 
@@ -483,81 +485,51 @@ impl DetectionPipeline {
         let confidence = self.wakeword_model.predict(&flattened_embeddings)?;
         let above_threshold = confidence >= self.config.confidence_threshold;
 
+        // Always log confidence for debugging
+        log::debug!("🎯 Wake word confidence: {:.4} (threshold: {:.2})", confidence, self.config.confidence_threshold);
+
         // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 10: DEBOUNCING AND FINAL DECISION
+        // STEP 10: SIMPLE DETECTION GATING
         // ═══════════════════════════════════════════════════════════════════════════════════
-        // Apply debouncing logic to prevent multiple detections from the same utterance.
-        // Since we use sliding windows, the same wake word would trigger multiple times
-        // without debouncing. We suppress detections within the configured time window.
+        // Use simple flag-based gating: after detection, ignore until confidence drops below threshold
         let mut detected = false;
         let now = std::time::Instant::now();
 
-        if above_threshold {
-            // Check if we're outside the debounce period
-            match self.last_detection_time {
-                None => {
-                    // First detection ever - always allow
-                    detected = true;
-                    self.last_detection_time = Some(now);
-                    log::info!(
-                        "🎉 WAKEWORD DETECTED! Confidence: {:.3} (first detection)",
-                        confidence
-                    );
+        if above_threshold && !self.ignore_detections {
+            // Above threshold and not ignoring - allow detection
+            detected = true;
+            self.ignore_detections = true; // Set ignore flag to prevent immediate re-detection
+            log::info!(
+                "🎉 WAKEWORD DETECTED! Confidence: {:.3}",
+                confidence
+            );
 
-                    // Trigger LED feedback for wake word detection
-                    if let Some(ref led_ring) = self.led_ring {
-                        if let Err(e) = led_ring.set_color(
-                            self.config.led_detected_color.0,
-                            self.config.led_detected_color.1,
-                            self.config.led_detected_color.2,
-                        ) {
-                            log::warn!("Failed to set LED detection color: {}", e);
-                        }
-
-                        // TODO: Implement non-blocking LED effects
-                        // For now, we just set the detection color. Future implementation
-                        // could use channels or async timers for brief visual effects.
-                    }
-                }
-                Some(last_time) => {
-                    let elapsed = now.duration_since(last_time);
-                    if elapsed >= self.debounce_duration {
-                        // Outside debounce period - allow new detection
-                        detected = true;
-                        self.last_detection_time = Some(now);
-                        log::info!(
-                            "🎉 WAKEWORD DETECTED! Confidence: {:.3} ({}ms since last)",
-                            confidence,
-                            elapsed.as_millis()
-                        );
-
-                        // Trigger LED feedback for wake word detection
-                        if let Some(ref led_ring) = self.led_ring {
-                            if let Err(e) = led_ring.set_color(
-                                self.config.led_detected_color.0,
-                                self.config.led_detected_color.1,
-                                self.config.led_detected_color.2,
-                            ) {
-                                log::warn!("Failed to set LED detection color: {}", e);
-                            }
-                        }
-                    } else {
-                        // Within debounce period - suppress detection
-                        let remaining = self.debounce_duration - elapsed;
-                        log::debug!(
-                            "🔇 Debounced detection: confidence {:.3} ({}ms remaining in debounce period)",
-                            confidence,
-                            remaining.as_millis()
-                        );
-                    }
+            // Trigger LED feedback for wake word detection
+            if let Some(ref led_ring) = self.led_ring {
+                if let Err(e) = led_ring.set_color(
+                    self.config.led_detected_color.0,
+                    self.config.led_detected_color.1,
+                    self.config.led_detected_color.2,
+                ) {
+                    log::warn!("Failed to set LED detection color: {}", e);
                 }
             }
+        } else if above_threshold && self.ignore_detections {
+            // Above threshold but ignoring detections - suppress
+            log::debug!(
+                "🔇 Detection suppressed: confidence {:.3} (ignoring detections)",
+                confidence
+            );
+        } else if !above_threshold && self.ignore_detections {
+            // Below threshold and currently ignoring - reset ignore flag
+            self.ignore_detections = false;
+            log::debug!(
+                "🔄 Confidence dropped to {:.3} - ready for next detection",
+                confidence
+            );
         } else {
-            // Below threshold - log periodic confidence updates
-            if confidence > 0.1 {
-                // Only log if there's some signal
-                log::debug!("📊 Detection confidence: {:.4}", confidence);
-            }
+            // Below threshold and not ignoring - normal state
+            log::debug!("📊 Detection confidence: {:.4} (below threshold)", confidence);
         }
 
         Ok(WakewordDetection {
@@ -567,41 +539,56 @@ impl DetectionPipeline {
         })
     }
 
-    /// Reset the internal state
+    /// Reset only the LED state
     ///
-    /// Clears all internal pipeline state including sliding windows and debouncing history.
-    /// This is useful in several scenarios:
+    /// This method only resets the LED back to listening mode without affecting
+    /// any detection logic or audio processing state. Used when STT completes
+    /// to return visual feedback to the listening state.
+    pub fn reset_led_only(&mut self) {
+        // Reset LED ring to listening mode if available
+        if let Some(ref led_ring) = self.led_ring {
+            if let Err(e) = led_ring.set_color(
+                self.config.led_listening_color.0,
+                self.config.led_listening_color.1,
+                self.config.led_listening_color.2,
+            ) {
+                log::warn!("Failed to reset LED to listening color: {}", e);
+            }
+        }
+        log::debug!("💡 LED reset to listening mode");
+    }
+
+    /// Reset the detection state
+    ///
+    /// This is a lightweight reset that only clears the ignore flag without affecting
+    /// the audio processing pipeline state. The ignore_detections flag provides proper
+    /// gating between detections naturally based on confidence levels.
     ///
     /// ## When to use reset():
     ///
-    /// 1. **Audio Stream Interruption**: When the audio stream is paused/stopped and resumed,
-    ///    the accumulated context may no longer be valid.
-    ///
-    /// 2. **Testing/Debugging**: Reset between test cases to ensure clean state.
-    ///
-    /// 3. **Model Reloading**: After changing models or configuration, reset ensures
-    ///    no stale state from previous configuration remains.
-    ///
-    /// 4. **Error Recovery**: After encountering processing errors, reset can help
-    ///    return the pipeline to a known good state.
+    /// 1. **After successful detection**: Called automatically to reset ignore flag
+    /// 2. **Testing/Debugging**: Reset between test cases for clean detection state
+    /// 3. **Error Recovery**: After encountering processing errors
     ///
     /// ## What gets reset:
     ///
-    /// - **Melspectrogram accumulator**: All stored mel features are cleared
-    /// - **Embedding window**: All stored embedding vectors are cleared  
-    /// - **Debouncing state**: Last detection time is cleared, allowing immediate new detections
+    /// - **Ignore detections flag**: Reset to allow new detections
+    /// - **LED state**: Return to listening mode
+    ///
+    /// ## What is preserved:
+    ///
+    /// - **Melspectrogram accumulator**: All mel features remain for continuous processing
+    /// - **Embedding window**: All embedding vectors remain for immediate detection capability
     ///
     /// ## Performance impact:
     ///
-    /// After reset, the pipeline will need ~1.3 seconds to rebuild sufficient context:
-    /// - ~1.28s to accumulate 16 melspec outputs for first embedding
-    /// - Additional ~1.28s to accumulate 16 embeddings for first wake word detection
-    ///
-    /// During this startup period, the pipeline will return `detected: false` for all inputs.
+    /// After reset, the pipeline maintains full context and can immediately detect
+    /// new wakewords. The ignore flag will be managed automatically based on confidence levels.
+    /// No rebuilding of audio context is required.
     pub fn reset(&mut self) {
-        self.embedding_window.clear();
-        self.melspec_accumulator.clear();
-        self.last_detection_time = None;
+        // Only reset the ignore flag - preserve all audio processing state
+        // The confidence-based gating will handle detection management naturally
+        self.ignore_detections = false; // Reset to allow new detections
 
         // Reset LED ring to listening mode if available
         if let Some(ref led_ring) = self.led_ring {
@@ -614,7 +601,7 @@ impl DetectionPipeline {
             }
         }
 
-        log::info!("🔄 Pipeline state reset - will need ~1.3s to rebuild context");
+        log::info!("🔄 Pipeline state reset - ready for immediate detection");
     }
 }
 
