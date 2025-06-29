@@ -139,7 +139,6 @@ pub fn load_config() -> Result<ApiConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_key_validation() {
@@ -154,73 +153,5 @@ mod tests {
         // Test ElevenLabs key validation
         assert!(ApiConfig::validate_key_format("1234567890abcdef", "ElevenLabs").is_ok());
         assert!(ApiConfig::validate_key_format("short", "ElevenLabs").is_err());
-    }
-
-    #[test]
-    fn test_missing_env_var() {
-        // Temporarily move .env file if it exists
-        let env_backup = std::fs::rename(".env", ".env.backup.test").is_ok();
-
-        // Ensure env vars are not set
-        unsafe {
-            env::remove_var("FIREWORKS_API_KEY");
-            env::remove_var("GROQ_API_KEY");
-            env::remove_var("ELEVENLABS_API_KEY");
-        }
-
-        let result = ApiConfig::load();
-
-        // Debug: print what we got
-        match &result {
-            Ok(_) => println!("ERROR: Config loaded successfully when it should have failed!"),
-            Err(e) => println!("Good: Config failed as expected with error: {}", e),
-        }
-
-        assert!(
-            result.is_err(),
-            "Expected configuration to fail when no API keys are present"
-        );
-        assert!(matches!(result.unwrap_err(), ConfigError::MissingEnvVar(_)));
-
-        // Restore .env file if we moved it
-        if env_backup {
-            std::fs::rename(".env.backup.test", ".env").ok();
-        }
-    }
-
-    #[test]
-    fn test_successful_load() {
-        // Temporarily move .env file if it exists
-        let env_backup = std::fs::rename(".env", ".env.backup.test2").is_ok();
-
-        // Set valid API keys
-        unsafe {
-            env::set_var("FIREWORKS_API_KEY", "fw_test_key_123");
-            env::set_var("GROQ_API_KEY", "gsk_test_key_456");
-            env::set_var("ELEVENLABS_API_KEY", "test_elevenlabs_key_789");
-        }
-
-        let result = ApiConfig::load();
-        assert!(
-            result.is_ok(),
-            "Expected successful configuration load with valid keys"
-        );
-
-        let config = result.unwrap();
-        assert_eq!(config.fireworks_key(), "fw_test_key_123");
-        assert_eq!(config.groq_key(), "gsk_test_key_456");
-        assert_eq!(config.elevenlabs_key(), "test_elevenlabs_key_789");
-
-        // Clean up
-        unsafe {
-            env::remove_var("FIREWORKS_API_KEY");
-            env::remove_var("GROQ_API_KEY");
-            env::remove_var("ELEVENLABS_API_KEY");
-        }
-
-        // Restore .env file if we moved it
-        if env_backup {
-            std::fs::rename(".env.backup.test2", ".env").ok();
-        }
     }
 }

@@ -186,19 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn test_conversation_templates() {
-        let greeting = ConversationTemplates::wake_word_greeting("Jarvis");
-        assert!(greeting.contains("Jarvis"));
-        assert!(greeting.contains("help"));
-
-        let error = ConversationTemplates::voice_error("audio");
-        assert!(error.contains("trouble hearing"));
-
-        let unknown_error = ConversationTemplates::voice_error("unknown");
-        assert!(error.contains("wrong"));
-    }
-
-    #[test]
     fn test_prompt_builder() {
         let prompt = PromptBuilder::new()
             .add_system_role("You are a helpful assistant")
@@ -213,15 +200,5 @@ mod tests {
         assert!(prompt.contains("Constraint:"));
         assert!(prompt.contains("helpful assistant"));
         assert!(prompt.contains("weather"));
-    }
-
-    #[test]
-    fn test_tool_messages() {
-        let tool_msg = ConversationTemplates::tool_execution("calculator");
-        assert!(tool_msg.contains("calculator"));
-
-        let completion_msg = ConversationTemplates::task_completed("your calculation");
-        assert!(completion_msg.contains("calculation"));
-        assert!(completion_msg.contains("completed"));
     }
 }

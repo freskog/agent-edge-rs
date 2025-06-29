@@ -34,3 +34,10 @@ pub enum EdgeError {
     #[error("VAD error: {0}")]
     VADError(String),
 }
+
+// Add conversion from ConfigError to EdgeError
+impl From<crate::config::ConfigError> for EdgeError {
+    fn from(err: crate::config::ConfigError) -> Self {
+        EdgeError::Config(err.to_string())
+    }
+}

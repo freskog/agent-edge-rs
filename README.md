@@ -351,3 +351,71 @@ MIT License - see LICENSE file for details.
 ---
 
 **Built with** OpenWakeWord models, TensorFlow Lite, WebRTC VAD, and Rust 🦀 
+
+## Testing
+
+The project includes comprehensive test coverage across multiple levels:
+
+### Unit Tests
+```bash
+# Run all unit tests
+cargo test --lib
+
+# Run specific module tests
+cargo test stt::tests::
+cargo test audio::tests::
+```
+
+### Integration Tests
+```bash
+# Run all tests (integration tests auto-run with API key)
+export FIREWORKS_API_KEY=fw_your_key_here
+cargo test
+
+# Run only integration tests
+FIREWORKS_API_KEY=fw_your_key_here cargo test --test integration_tests
+
+# Integration tests skip gracefully without API key
+cargo test --test integration_tests
+# Output: "⏭️ Skipping integration test - FIREWORKS_API_KEY not found"
+```
+
+### Test Categories
+
+1. **STT Unit Tests** (7 tests) - Core STT functionality
+2. **STT State Machine Tests** (5 tests) - Speech detection patterns and timing
+3. **Audio Infrastructure Tests** (8 tests) - Audio processing and format conversion
+4. **Wakeword Pipeline Tests** (1 test) - End-to-end pipeline with real audio
+5. **Model Loading Tests** (2 tests) - TensorFlow Lite model integration
+6. **Integration Tests** (4 tests) - Full API integration with real STT service
+
+### Transcription Verification
+
+Integration tests use robust word-based verification:
+- **Required words**: "what", "time", "is", "it" 
+- **Case insensitive**: Works with any capitalization
+- **Spacing tolerant**: Ignores filler words, extra punctuation
+- **Examples**: "What time is it?", "um what time is it", "WHAT TIME IS IT???"
+
+### API Key Requirements
+
+Integration tests require a valid Fireworks AI API key:
+- Set `FIREWORKS_API_KEY=fw_your_key_here` in environment
+- Or add to `.env` file: `FIREWORKS_API_KEY=fw_your_key_here`
+- Tests automatically skip without API key (no failures)
+- With API key, tests make real API calls and consume credits
+
+## Setup
+
+1. Install Rust and Cargo
+2. Clone the repository
+3. Set up environment variables (optional for integration tests)
+4. Run tests: `cargo test`
+
+## Development
+
+The codebase is structured for modularity and testability:
+- All major components have unit tests
+- Integration tests verify end-to-end functionality
+- Tests run in parallel for fast feedback
+- No test overlap - each suite covers unique functionality 
