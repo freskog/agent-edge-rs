@@ -6,7 +6,7 @@ A high-performance Rust implementation of OpenWakeWord for real-time "Hey Mycrof
 
 This project provides a complete wake word detection solution optimized for edge devices:
 
-- **🎤 Real-time Audio**: PulseAudio integration with 6-channel ReSpeaker support
+- **�� Real-time Audio**: Cross-platform audio capture using CPAL with ReSpeaker support
 - **🧠 OpenWakeWord Pipeline**: 3-stage ML pipeline with TensorFlow Lite models
 - **⚡ VAD Optimization**: WebRTC Voice Activity Detection reduces CPU usage by 80-90%
 - **🔄 Debouncing**: Prevents repeated detections from single utterances
@@ -186,8 +186,8 @@ The pipeline test validates real "Hey Mycroft" detection:
 
 - **Platform**: Raspberry Pi (Pi Zero 2W minimum, Pi 3+ recommended)
 - **RAM**: 50MB for models + pipeline state  
-- **Audio**: 16kHz capable microphone (ReSpeaker 4-mic array recommended)
-- **OS**: Raspberry Pi OS with PulseAudio
+- **Audio**: CPAL-compatible audio device
+- **OS**: Raspberry Pi OS, macOS, or Windows
 
 ### Runtime Performance
 

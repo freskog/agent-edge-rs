@@ -7,7 +7,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
+    && apt-get -y install --no-install-recommends \
     curl \
     wget \
     build-essential \
@@ -18,7 +19,6 @@ RUN apt-get update && apt-get install -y \
     git \
     # Audio system dependencies
     libasound2-dev \
-    libpulse-dev \
     # USB device access for LED ring control
     libudev-dev \
     # Python dependencies for tflitec

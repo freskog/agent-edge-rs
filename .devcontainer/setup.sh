@@ -5,12 +5,7 @@ echo "🔧 Setting up Agent Edge RS development environment..."
 
 # Update package lists
 echo "📦 Updating package lists..."
-sudo apt-get update
-
-# Install system dependencies for building (if not already installed)
-echo "🔨 Installing build dependencies..."
-sudo apt-get install -y \
-    build-essential \
+sudo apt-get update && sudo apt-get install -y \
     pkg-config \
     libssl-dev \
     libpulse-dev \
@@ -25,7 +20,8 @@ sudo apt-get install -y \
     curl \
     wget \
     git \
-    ca-certificates
+    ca-certificates \
+    libudev-dev
 
 # Install Rust target for aarch64 (matching Pi 3)
 echo "🦀 Installing Rust aarch64 target..."

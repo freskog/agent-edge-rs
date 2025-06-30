@@ -6,8 +6,11 @@
 use agent_edge_rs::{
     detection::pipeline::{DetectionPipeline, PipelineConfig},
     error::{EdgeError, Result},
+    vad::{create_vad, ChunkSize, VADConfig, VADSampleRate},
+    AudioChunk,
 };
 use hound;
+use std::time::Instant;
 
 const SAMPLE_RATE: u32 = 16000;
 const CHUNK_SIZE: usize = 1280; // 80ms at 16kHz
@@ -43,6 +46,56 @@ fn load_test_audio(filename: &str) -> Result<Vec<f32>> {
     };
 
     samples
+}
+
+/// Helper function to create test audio chunks
+fn create_test_chunks(audio_data: &[f32], chunk_size: usize) -> Vec<AudioChunk> {
+    let mut chunks = Vec::new();
+    let padded_audio = if audio_data.len() % chunk_size != 0 {
+        let padding_size = chunk_size - (audio_data.len() % chunk_size);
+        let mut padded = Vec::with_capacity(audio_data.len() + padding_size);
+        padded.extend_from_slice(audio_data);
+        padded.extend(std::iter::repeat(0.0).take(padding_size));
+        padded
+    } else {
+        audio_data.to_vec()
+    };
+
+    for (_chunk_idx, chunk_start) in (0..padded_audio.len()).step_by(chunk_size).enumerate() {
+        let chunk_end = (chunk_start + chunk_size).min(padded_audio.len());
+        let samples_f32 = padded_audio[chunk_start..chunk_end].to_vec();
+        let samples_i16: Vec<i16> = samples_f32.iter().map(|&x| (x * 32768.0) as i16).collect();
+
+        chunks.push(AudioChunk {
+            samples_i16,
+            samples_f32,
+            timestamp: Instant::now(),
+            should_process: true,
+        });
+    }
+
+    chunks
+}
+
+/// Process audio chunks through VAD to set should_process flags
+fn apply_vad_to_chunks(mut chunks: Vec<AudioChunk>) -> Result<Vec<AudioChunk>> {
+    // Create VAD configuration optimized for wakeword detection
+    let vad_config = VADConfig {
+        sample_rate: VADSampleRate::Rate16kHz,
+        chunk_size: ChunkSize::Small, // 512 samples (32ms) for low latency
+        threshold: 0.5,               // Default Silero threshold
+        speech_trigger_chunks: 6,     // More sensitive for wakeword detection
+        silence_stop_chunks: 8,       // Longer silence for stability
+    };
+
+    let mut vad = create_vad(vad_config)?;
+
+    // Process each chunk through VAD
+    for chunk in chunks.iter_mut() {
+        chunk.should_process = vad.should_process_audio(&chunk.samples_i16)?;
+    }
+
+    Ok(chunks)
 }
 
 fn process_audio_in_chunks(

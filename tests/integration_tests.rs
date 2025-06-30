@@ -66,6 +66,7 @@ use agent_edge_rs::{
     detection::pipeline::{DetectionPipeline, PipelineConfig},
     error::Result,
     stt::{FireworksSTT, STTConfig},
+    vad::{create_vad, ChunkSize, VADConfig, VADSampleRate},
     AudioChunk,
 };
 use hound::WavReader;
@@ -263,15 +264,13 @@ fn load_audio_file<P: AsRef<Path>>(path: P) -> Result<Vec<AudioChunk>> {
 
 /// Process audio chunks through VAD to set should_process flags
 fn apply_vad_to_chunks(mut chunks: Vec<AudioChunk>) -> Result<Vec<AudioChunk>> {
-    use agent_edge_rs::vad::{create_vad, VADConfig, VADMode, VADType};
-
-    // Use Silero VAD for tests to match OpenWakeWord expectations
+    // Create VAD configuration optimized for wakeword detection
     let vad_config = VADConfig {
-        vad_type: VADType::Silero,     // Use Silero for better wakeword detection
-        mode: VADMode::VeryAggressive, // Most aggressive mode to reduce false positives
-        speech_trigger_frames: 6,      // More sensitive for Silero (better for wakewords)
-        silence_stop_frames: 8,        // Longer silence for Silero stability
-        ..VADConfig::default()
+        sample_rate: VADSampleRate::Rate16kHz,
+        chunk_size: ChunkSize::Small, // 512 samples (32ms) for low latency
+        threshold: 0.5,               // Default Silero threshold
+        speech_trigger_chunks: 6,     // More sensitive for wakeword detection
+        silence_stop_chunks: 8,       // Longer silence for stability
     };
 
     let mut vad = create_vad(vad_config)?;

@@ -1,5 +1,28 @@
 # Build Instructions
 
+## System Requirements
+
+### Operating System
+- **Linux**: ALSA development libraries
+- **macOS**: No special requirements
+- **Windows**: No special requirements
+
+### Dependencies
+- **Rust**: 1.75.0 or later
+- **Audio**: CPAL backend (requires ALSA development libraries on Linux)
+- **Build Tools**: pkg-config, gcc
+
+### Linux Setup
+
+```bash
+# Install system dependencies
+sudo apt-get update
+sudo apt-get install -y \
+    pkg-config \
+    libasound2-dev \
+    gcc
+```
+
 ## Platform-Specific Audio Backends
 
 The system automatically uses the right audio backend for each platform:

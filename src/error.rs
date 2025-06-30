@@ -41,3 +41,10 @@ impl From<crate::config::ConfigError> for EdgeError {
         EdgeError::Config(err.to_string())
     }
 }
+
+// Add conversion from AudioCaptureError to EdgeError
+impl From<crate::audio_capture::AudioCaptureError> for EdgeError {
+    fn from(err: crate::audio_capture::AudioCaptureError) -> Self {
+        EdgeError::Audio(err.to_string())
+    }
+}

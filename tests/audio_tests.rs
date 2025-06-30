@@ -1,73 +1,64 @@
-use agent_edge_rs::audio_capture::{AudioCapture, AudioCaptureConfig, PlatformAudioCapture};
+use agent_edge_rs::audio_capture::AudioCaptureConfig;
 
 #[test]
-fn test_audio_capture_config_default() {
+fn test_audio_config_default() {
     let config = AudioCaptureConfig::default();
-    assert_eq!(config.sample_rate, 16000);
-    assert_eq!(config.channels, 1);
+    assert_eq!(config.channel_capacity, 100);
+    assert_eq!(config.chunk_size, 256);
+    assert_eq!(config.device_name, None);
     assert_eq!(config.target_channel, 0);
-    assert_eq!(config.target_latency_ms, 50);
-    assert_eq!(config.app_name, "agent-edge");
-    assert_eq!(config.stream_name, "audio-capture");
+    assert_eq!(config.target_latency_ms, 30);
 }
 
 #[test]
-fn test_audio_capture_config_custom() {
+fn test_audio_config_custom() {
     let config = AudioCaptureConfig {
-        sample_rate: 48000,
-        channels: 6,
-        target_channel: 0,
+        channel_capacity: 200,
+        chunk_size: 512,
         device_name: Some("test-device".to_string()),
-        target_latency_ms: 100,
-        app_name: "test-app".to_string(),
-        stream_name: "test-stream".to_string(),
+        target_channel: 1,
+        target_latency_ms: 50,
     };
 
-    assert_eq!(config.sample_rate, 48000);
-    assert_eq!(config.channels, 6);
-    assert_eq!(config.target_channel, 0);
+    assert_eq!(config.channel_capacity, 200);
+    assert_eq!(config.chunk_size, 512);
     assert_eq!(config.device_name, Some("test-device".to_string()));
-    assert_eq!(config.target_latency_ms, 100);
-    assert_eq!(config.app_name, "test-app");
-    assert_eq!(config.stream_name, "test-stream");
+    assert_eq!(config.target_channel, 1);
+    assert_eq!(config.target_latency_ms, 50);
 }
 
 #[test]
-fn test_audio_capture_creation() {
-    // This test just verifies that we can create an audio capture instance
-    // without actually starting it (which would require audio hardware)
-    let config = AudioCaptureConfig::default();
-    let result = PlatformAudioCapture::new(config);
+fn test_audio_config_clone() {
+    let config = AudioCaptureConfig {
+        channel_capacity: 150,
+        chunk_size: 1024,
+        device_name: Some("test-device".to_string()),
+        target_channel: 2,
+        target_latency_ms: 40,
+    };
 
-    // On platforms without audio support, this might fail
-    // But the important thing is that the API works
-    match result {
-        Ok(_) => {
-            // Success - we have audio support
-        }
-        Err(e) => {
-            // Expected in headless environments
-            println!("Audio capture creation failed (expected in CI): {}", e);
-        }
-    }
+    let cloned = config.clone();
+    assert_eq!(config.channel_capacity, cloned.channel_capacity);
+    assert_eq!(config.chunk_size, cloned.chunk_size);
+    assert_eq!(config.device_name, cloned.device_name);
+    assert_eq!(config.target_channel, cloned.target_channel);
+    assert_eq!(config.target_latency_ms, cloned.target_latency_ms);
 }
 
 #[test]
 fn test_respeaker_config() {
     // Test configuration suitable for ReSpeaker 4-mic array
     let config = AudioCaptureConfig {
-        sample_rate: 16000,
-        channels: 6,       // ReSpeaker has 6 channels
-        target_channel: 0, // Extract first channel
-        device_name: None,
-        target_latency_ms: 50,
-        app_name: "agent-edge".to_string(),
-        stream_name: "wakeword-capture".to_string(),
+        channel_capacity: 100,
+        chunk_size: 256,
+        device_name: Some("respeaker-4-mic".to_string()),
+        target_channel: 0,
+        target_latency_ms: 30,
     };
 
-    assert_eq!(config.channels, 6);
-    assert_eq!(config.target_channel, 0);
-    assert_eq!(config.sample_rate, 16000);
+    // Note: The actual channel handling is now done in the PulseAudio/CPAL implementation
+    // rather than in the config struct
+    assert_eq!(config.device_name, Some("respeaker-4-mic".to_string()));
 }
 
 #[test]
@@ -139,4 +130,21 @@ fn test_empty_audio_handling() {
         .collect::<Vec<i16>>();
 
     assert_eq!(result, Vec::<i16>::new());
+}
+
+#[test]
+fn test_wakeword_optimized_config() {
+    let config = AudioCaptureConfig {
+        channel_capacity: 100,
+        chunk_size: 256, // 16ms chunks optimal for wakeword detection
+        device_name: None,
+        target_channel: 0,
+        target_latency_ms: 30,
+    };
+
+    assert_eq!(config.channel_capacity, 100);
+    assert_eq!(config.chunk_size, 256);
+    assert_eq!(config.device_name, None);
+    assert_eq!(config.target_channel, 0);
+    assert_eq!(config.target_latency_ms, 30);
 }

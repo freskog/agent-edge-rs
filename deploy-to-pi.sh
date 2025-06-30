@@ -178,7 +178,7 @@ if [ "$FULL_DEPLOY" = true ]; then
     echo -e "${YELLOW}🔧 Installing dependencies on Pi...${NC}"
     ssh "$PI_TARGET" "
         sudo apt update > /dev/null 2>&1 && 
-        sudo apt install -y pulseaudio pulseaudio-utils alsa-utils libudev-dev > /dev/null 2>&1 &&
+        sudo apt install -y libasound2-dev alsa-utils libudev-dev > /dev/null 2>&1 &&
         sudo usermod -a -G audio \$USER
     " || echo -e "${YELLOW}⚠️ Some dependencies may need manual installation${NC}"
 
