@@ -130,7 +130,7 @@ pub struct PipelineConfig {
     /// Processing parameters
     pub chunk_size: usize, // Audio chunk size: 1280 samples = 80ms at 16kHz
     pub sample_rate: u32, // Audio sampling rate: 16000 Hz (required by models)
-    pub confidence_threshold: f32, // Detection threshold: 0.5 (50% confidence)
+    pub confidence_threshold: f32, // Detection threshold: 0.3 (30% confidence)
 
     /// Windowing parameters  
     pub window_size: usize, // Embedding window size: 16 embeddings = ~1.28s context
@@ -154,7 +154,7 @@ impl Default for PipelineConfig {
             wakeword_model_path: "models/hey_mycroft_v0.1.tflite".to_string(),
             chunk_size: 1280,
             sample_rate: 16000,
-            confidence_threshold: 0.5, // Match OpenWakeWord's default threshold
+            confidence_threshold: 0.3, // Lower threshold for better real-world performance
             window_size: 16,
             overlap_size: 8,
             debounce_duration_ms: 1000, // 1 second debounce (OpenWakeWord uses 1.25s in tests)
@@ -301,7 +301,7 @@ impl DetectionPipeline {
     /// 4. **Embedding Windowing**: Collect 16 embeddings for wake word analysis
     /// 5. **Wake Word Detection**: 1536 features (16×96) → confidence score
     /// 6. **Debouncing**: Prevent repeated detections from same utterance
-    pub fn process_audio_chunk(&mut self, audio_chunk: &[f32]) -> Result<WakewordDetection> {
+    pub fn process_audio_chunk(&mut self, audio_chunk: &[f32; 1280]) -> Result<WakewordDetection> {
         // Input validation: Ensure we have exactly 80ms worth of 16kHz audio
         if audio_chunk.len() != self.config.chunk_size {
             return Err(EdgeError::InvalidInput(format!(
@@ -453,7 +453,7 @@ impl DetectionPipeline {
         // Always zero-pad to full size - this allows detection even with just 1 embedding
         let mut flattened_embeddings: Vec<f32> =
             self.embedding_window.iter().flatten().cloned().collect();
-        
+
         // Ensure we have exactly 1536 features for the model (16 × 96)
         let target_size = self.config.window_size * 96; // 16 × 96 = 1536
         if flattened_embeddings.len() < target_size {
@@ -486,7 +486,11 @@ impl DetectionPipeline {
         let above_threshold = confidence >= self.config.confidence_threshold;
 
         // Always log confidence for debugging
-        log::debug!("🎯 Wake word confidence: {:.4} (threshold: {:.2})", confidence, self.config.confidence_threshold);
+        log::debug!(
+            "🎯 Wake word confidence: {:.4} (threshold: {:.2})",
+            confidence,
+            self.config.confidence_threshold
+        );
 
         // ═══════════════════════════════════════════════════════════════════════════════════
         // STEP 10: SIMPLE DETECTION GATING
@@ -499,10 +503,7 @@ impl DetectionPipeline {
             // Above threshold and not ignoring - allow detection
             detected = true;
             self.ignore_detections = true; // Set ignore flag to prevent immediate re-detection
-            log::info!(
-                "🎉 WAKEWORD DETECTED! Confidence: {:.3}",
-                confidence
-            );
+            log::info!("🎉 WAKEWORD DETECTED! Confidence: {:.3}", confidence);
 
             // Trigger LED feedback for wake word detection
             if let Some(ref led_ring) = self.led_ring {
@@ -529,7 +530,10 @@ impl DetectionPipeline {
             );
         } else {
             // Below threshold and not ignoring - normal state
-            log::debug!("📊 Detection confidence: {:.4} (below threshold)", confidence);
+            log::debug!(
+                "📊 Detection confidence: {:.4} (below threshold)",
+                confidence
+            );
         }
 
         Ok(WakewordDetection {
@@ -603,6 +607,16 @@ impl DetectionPipeline {
 
         log::info!("🔄 Pipeline state reset - ready for immediate detection");
     }
+
+    /// Reset the melspec accumulator when it gets corrupted with bad audio
+    ///
+    /// This method clears the melspectrogram accumulator when we suspect it's filled
+    /// with non-speech audio that's preventing wakeword detection. Used when the
+    /// system has been stuck accumulating context for too long without making progress.
+    pub fn reset_melspec_accumulator(&mut self) {
+        self.melspec_accumulator.clear();
+        log::info!("🔄 Melspec accumulator reset - clearing old audio context");
+    }
 }
 
 #[cfg(test)]
@@ -614,7 +628,7 @@ mod tests {
         let config = PipelineConfig::default();
         assert_eq!(config.chunk_size, 1280);
         assert_eq!(config.sample_rate, 16000);
-        assert_eq!(config.confidence_threshold, 0.5);
+        assert_eq!(config.confidence_threshold, 0.3);
         assert_eq!(config.window_size, 16);
         assert_eq!(config.overlap_size, 8);
     }

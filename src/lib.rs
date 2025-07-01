@@ -14,12 +14,11 @@ pub mod models;
 pub mod speech_producer;
 pub mod stt;
 pub mod tts;
-pub mod vad;
+pub mod user_instruction;
 
 // Re-export key types for convenience
 pub use error::{EdgeError, Result};
 pub use stt::{FireworksSTT, STTConfig};
-pub use vad::VADConfig;
 
 /// Represents a chunk of audio data captured from the microphone.
 ///

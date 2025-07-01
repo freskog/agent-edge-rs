@@ -1,66 +1,3 @@
-use agent_edge_rs::audio_capture::AudioCaptureConfig;
-
-#[test]
-fn test_audio_config_default() {
-    let config = AudioCaptureConfig::default();
-    assert_eq!(config.channel_capacity, 100);
-    assert_eq!(config.chunk_size, 256);
-    assert_eq!(config.device_name, None);
-    assert_eq!(config.target_channel, 0);
-    assert_eq!(config.target_latency_ms, 30);
-}
-
-#[test]
-fn test_audio_config_custom() {
-    let config = AudioCaptureConfig {
-        channel_capacity: 200,
-        chunk_size: 512,
-        device_name: Some("test-device".to_string()),
-        target_channel: 1,
-        target_latency_ms: 50,
-    };
-
-    assert_eq!(config.channel_capacity, 200);
-    assert_eq!(config.chunk_size, 512);
-    assert_eq!(config.device_name, Some("test-device".to_string()));
-    assert_eq!(config.target_channel, 1);
-    assert_eq!(config.target_latency_ms, 50);
-}
-
-#[test]
-fn test_audio_config_clone() {
-    let config = AudioCaptureConfig {
-        channel_capacity: 150,
-        chunk_size: 1024,
-        device_name: Some("test-device".to_string()),
-        target_channel: 2,
-        target_latency_ms: 40,
-    };
-
-    let cloned = config.clone();
-    assert_eq!(config.channel_capacity, cloned.channel_capacity);
-    assert_eq!(config.chunk_size, cloned.chunk_size);
-    assert_eq!(config.device_name, cloned.device_name);
-    assert_eq!(config.target_channel, cloned.target_channel);
-    assert_eq!(config.target_latency_ms, cloned.target_latency_ms);
-}
-
-#[test]
-fn test_respeaker_config() {
-    // Test configuration suitable for ReSpeaker 4-mic array
-    let config = AudioCaptureConfig {
-        channel_capacity: 100,
-        chunk_size: 256,
-        device_name: Some("respeaker-4-mic".to_string()),
-        target_channel: 0,
-        target_latency_ms: 30,
-    };
-
-    // Note: The actual channel handling is now done in the PulseAudio/CPAL implementation
-    // rather than in the config struct
-    assert_eq!(config.device_name, Some("respeaker-4-mic".to_string()));
-}
-
 #[test]
 fn test_i16_to_f32_conversion() {
     // Test i16 to f32 conversion (as used in audio processing)
@@ -130,21 +67,4 @@ fn test_empty_audio_handling() {
         .collect::<Vec<i16>>();
 
     assert_eq!(result, Vec::<i16>::new());
-}
-
-#[test]
-fn test_wakeword_optimized_config() {
-    let config = AudioCaptureConfig {
-        channel_capacity: 100,
-        chunk_size: 256, // 16ms chunks optimal for wakeword detection
-        device_name: None,
-        target_channel: 0,
-        target_latency_ms: 30,
-    };
-
-    assert_eq!(config.channel_capacity, 100);
-    assert_eq!(config.chunk_size, 256);
-    assert_eq!(config.device_name, None);
-    assert_eq!(config.target_channel, 0);
-    assert_eq!(config.target_latency_ms, 30);
 }

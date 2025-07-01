@@ -2,20 +2,17 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, FromSample, Host, Sample, SampleFormat, SizedSample, Stream as CpalStream,
 };
-use futures_util::Stream;
-use std::{
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll},
-};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::mpsc;
 
-const SAMPLE_RATE: u32 = 16_000;
-const CHUNK_SIZE: usize = 256;
+pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size that works with Silero
 
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
+    #[error("No audio devices found")]
+    NoDevices,
     #[error("Audio device error: {0}")]
     Device(String),
     #[error("Audio stream error: {0}")]
@@ -31,8 +28,9 @@ pub struct AudioCaptureConfig {
     pub device_id: Option<String>,
     /// Channel to capture (0-based index)
     pub channel: u32,
-    /// Preferred sample format (None = use device native)
-    pub preferred_format: Option<SampleFormat>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub buffer_size: usize,
 }
 
 impl Default for AudioCaptureConfig {
@@ -40,7 +38,9 @@ impl Default for AudioCaptureConfig {
         Self {
             device_id: None,
             channel: 0,
-            preferred_format: None,
+            sample_rate: 16000, // 16kHz for speech
+            channels: 1,        // Mono
+            buffer_size: 1280,  // 80ms at 16kHz
         }
     }
 }
@@ -54,23 +54,28 @@ pub struct AudioDeviceInfo {
     pub channel_count: u32,
 }
 
-/// A chunk of audio samples in i16 format
 #[derive(Clone, Debug)]
 pub struct AudioChunk {
-    /// Raw samples in i16 format (native for VAD)
     pub samples: Vec<i16>,
+    pub timestamp: Instant,
 }
 
-/// Audio capture implementation using CPAL
-pub struct CpalAudioCapture {
+// Type alias for the callback function
+pub type AudioCallback = Box<dyn FnMut(AudioChunk) + Send + 'static>;
+
+/// Audio capture with ring buffer for historical audio access
+pub struct AudioCapture {
     config: AudioCaptureConfig,
     stream: Option<CpalStream>,
-    rx: mpsc::Receiver<AudioChunk>,
     _host: Host,
+    ring_buffer: Arc<Mutex<VecDeque<AudioChunk>>>,
 }
 
-impl CpalAudioCapture {
-    pub fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
+impl AudioCapture {
+    pub fn new(
+        config: AudioCaptureConfig,
+        callback: AudioCallback,
+    ) -> Result<Self, AudioCaptureError> {
         let host = cpal::default_host();
 
         // Get the device
@@ -84,48 +89,9 @@ impl CpalAudioCapture {
                 .ok_or_else(|| AudioCaptureError::Device("No default input device found".into()))?
         };
 
-        // Create channel for audio data
-        let (tx, rx) = mpsc::channel(32);
-        let tx = Arc::new(Mutex::new(tx));
-
-        // Get supported configs
-        let supported_configs: Vec<_> = device
-            .supported_input_configs()
-            .map_err(|e| AudioCaptureError::Config(e.to_string()))?
-            .collect();
-
-        // Try to find a config that supports our required sample rate
-        let mut supported_config = None;
-
-        // First, try to find a config that natively supports 16kHz
-        for config in &supported_configs {
-            if config.min_sample_rate().0 <= SAMPLE_RATE
-                && config.max_sample_rate().0 >= SAMPLE_RATE
-            {
-                supported_config = Some(config.with_sample_rate(cpal::SampleRate(SAMPLE_RATE)));
-                log::info!(
-                    "Found config with native 16kHz support: {:?}",
-                    config.sample_format()
-                );
-                break;
-            }
-        }
-
-        // If no native 16kHz support, use default config and let CPAL handle resampling
-        if supported_config.is_none() {
-            supported_config = Some(
-                device
-                    .default_input_config()
-                    .map_err(|e| AudioCaptureError::Config(e.to_string()))?,
-            );
-            log::info!(
-                "Using default config with resampling: {:?} @ {}Hz",
-                supported_config.as_ref().unwrap().sample_format(),
-                supported_config.as_ref().unwrap().sample_rate().0
-            );
-        }
-
-        let supported_config = supported_config.unwrap();
+        let supported_config = device
+            .default_input_config()
+            .map_err(|e| AudioCaptureError::Config(e.to_string()))?;
 
         // Verify channel selection is valid
         if config.channel >= u32::from(supported_config.channels()) {
@@ -136,13 +102,7 @@ impl CpalAudioCapture {
             )));
         }
 
-        // Create a config with our required sample rate
-        let stream_config = cpal::StreamConfig {
-            channels: supported_config.channels(),
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
+        let stream_config = supported_config.config();
         let err_fn = move |err| {
             log::error!("Audio stream error: {}", err);
         };
@@ -151,31 +111,54 @@ impl CpalAudioCapture {
         log::info!(
             "Audio capture configured: {} channels @ {}Hz (format: {:?})",
             stream_config.channels,
-            SAMPLE_RATE,
+            stream_config.sample_rate.0,
             supported_config.sample_format()
         );
 
-        // Create the stream using the device's native format
+        let channel = config.channel;
+        let channels = stream_config.channels as usize;
+
+        // Create ring buffer (keep last ~3 seconds of audio)
+        // At 16kHz with 1280 sample chunks (80ms each), 3 seconds = ~37 chunks
+        let ring_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(40)));
+        let ring_buffer_clone = ring_buffer.clone();
+
+        // Create a buffer to accumulate samples
+        let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(CHUNK_SIZE)));
+
+        // Wrap callback in Arc<Mutex<>> so it can be shared between threads
+        let callback = Arc::new(Mutex::new(callback));
+
+        // Build the stream with the appropriate sample format
         let stream = match supported_config.sample_format() {
-            SampleFormat::I16 => Self::build_stream::<i16>(
+            SampleFormat::I16 => Self::create_input_stream_with_buffer::<i16>(
                 &device,
                 &stream_config,
-                tx.clone(),
-                config.channel,
+                channel,
+                channels,
+                sample_buffer,
+                callback,
+                ring_buffer_clone,
                 err_fn,
             )?,
-            SampleFormat::U16 => Self::build_stream::<u16>(
+            SampleFormat::U16 => Self::create_input_stream_with_buffer::<u16>(
                 &device,
                 &stream_config,
-                tx.clone(),
-                config.channel,
+                channel,
+                channels,
+                sample_buffer,
+                callback,
+                ring_buffer_clone,
                 err_fn,
             )?,
-            SampleFormat::F32 => Self::build_stream::<f32>(
+            SampleFormat::F32 => Self::create_input_stream_with_buffer::<f32>(
                 &device,
                 &stream_config,
-                tx.clone(),
-                config.channel,
+                channel,
+                channels,
+                sample_buffer,
+                callback,
+                ring_buffer_clone,
                 err_fn,
             )?,
             _ => {
@@ -192,44 +175,60 @@ impl CpalAudioCapture {
         Ok(Self {
             config,
             stream: Some(stream),
-            rx,
             _host: host,
+            ring_buffer,
         })
     }
 
-    fn build_stream<T>(
+    fn create_input_stream_with_buffer<T>(
         device: &Device,
         config: &cpal::StreamConfig,
-        tx: Arc<Mutex<mpsc::Sender<AudioChunk>>>,
         channel: u32,
+        channels: usize,
+        buffer: Arc<Mutex<Vec<i16>>>,
+        callback: Arc<Mutex<AudioCallback>>,
+        ring_buffer: Arc<Mutex<VecDeque<AudioChunk>>>,
         err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
     ) -> Result<CpalStream, AudioCaptureError>
     where
         T: Sample + SizedSample + Send + Sync + 'static,
         i16: FromSample<T>,
     {
-        let mut buffer = Vec::with_capacity(CHUNK_SIZE);
-        let channels = config.channels as usize;
-
         device
             .build_input_stream(
                 config,
                 move |data: &[T], _: &cpal::InputCallbackInfo| {
                     // Extract the specified channel and convert to i16
-                    for frame in data.chunks(channels) {
-                        if let Some(sample) = frame.get(channel as usize) {
-                            // Convert to i16 using CPAL's conversion trait
-                            let value = i16::from_sample(*sample);
-                            buffer.push(value);
+                    if let Ok(mut buffer) = buffer.lock() {
+                        for frame in data.chunks(channels) {
+                            if let Some(sample) = frame.get(channel as usize) {
+                                let value = i16::from_sample(*sample);
+                                buffer.push(value);
 
-                            if buffer.len() >= CHUNK_SIZE {
-                                if let Ok(tx) = tx.lock() {
+                                // If we have enough samples, create and send a chunk
+                                if buffer.len() >= CHUNK_SIZE {
+                                    let mut chunk_samples = [0i16; CHUNK_SIZE];
+                                    chunk_samples.copy_from_slice(&buffer[..CHUNK_SIZE]);
+                                    buffer.drain(..CHUNK_SIZE);
+
                                     let chunk = AudioChunk {
-                                        samples: buffer.clone(),
+                                        samples: chunk_samples.to_vec(),
+                                        timestamp: Instant::now(),
                                     };
-                                    let _ = tx.try_send(chunk);
+
+                                    // Add to ring buffer
+                                    if let Ok(mut ring_buf) = ring_buffer.try_lock() {
+                                        ring_buf.push_back(chunk.clone());
+                                        if ring_buf.len() > 40 {
+                                            ring_buf.pop_front();
+                                        }
+                                    }
+
+                                    // Call user callback
+                                    if let Ok(mut callback) = callback.try_lock() {
+                                        callback(chunk);
+                                    }
                                 }
-                                buffer.clear();
                             }
                         }
                     }
@@ -269,16 +268,28 @@ impl CpalAudioCapture {
 
         Ok(result)
     }
-}
 
-impl Stream for CpalAudioCapture {
-    type Item = Result<AudioChunk, AudioCaptureError>;
+    /// Get recent audio chunks from the ring buffer
+    /// Returns up to the last 3 seconds of audio
+    pub fn get_recent_audio(&self) -> Vec<AudioChunk> {
+        if let Ok(buffer) = self.ring_buffer.lock() {
+            buffer.iter().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(chunk))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+    /// Get recent audio chunks as raw samples for STT
+    /// Flattens all chunks into a single contiguous buffer
+    pub fn get_recent_audio_flat(&self) -> Vec<i16> {
+        if let Ok(buffer) = self.ring_buffer.lock() {
+            buffer
+                .iter()
+                .flat_map(|chunk| chunk.samples.iter())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
         }
     }
 }
