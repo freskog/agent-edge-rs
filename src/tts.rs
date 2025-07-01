@@ -86,22 +86,22 @@ impl ElevenLabsTTS {
 
     /// Synthesize text to speech and play it through the configured audio sink
     pub async fn synthesize(&self, text: &str, cancel: CancellationToken) -> Result<(), TTSError> {
-        println!("TTS: Starting synthesis for text: {}", text);
+        log::info!("TTS: Starting synthesis for text: {}", text);
 
         // Connect to WebSocket
         let ws_url = format!(
             "wss://api.elevenlabs.io/v1/text-to-speech/{}/stream-input?model_id={}&output_format=pcm_16000",
             self.config.voice_id, self.config.model
         );
-        println!("TTS: Connecting to WebSocket at {}", ws_url);
+        log::debug!("TTS: Connecting to WebSocket at {}", ws_url);
 
         let ws_stream = match connect_async(ws_url).await {
             Ok((ws_stream, _)) => {
-                println!("TTS: Successfully connected to WebSocket");
+                log::debug!("TTS: Successfully connected to WebSocket");
                 ws_stream
             }
             Err(e) => {
-                println!("TTS: Failed to connect to WebSocket: {}", e);
+                log::error!("TTS: Failed to connect to WebSocket: {}", e);
                 return Err(TTSError::Connection(e.to_string()));
             }
         };
@@ -121,10 +121,10 @@ impl ElevenLabsTTS {
         })
         .to_string();
 
-        println!("TTS: Sending initial configuration");
+        log::debug!("TTS: Sending initial configuration");
         // Send BOS message
         if let Err(e) = write.send(Message::Text(bos_message.into())).await {
-            println!("TTS: Failed to send initial configuration: {}", e);
+            log::error!("TTS: Failed to send initial configuration: {}", e);
             return Err(TTSError::WebSocket(e.to_string()));
         }
 
@@ -135,9 +135,9 @@ impl ElevenLabsTTS {
         })
         .to_string();
 
-        println!("TTS: Sending text for synthesis");
+        log::debug!("TTS: Sending text for synthesis");
         if let Err(e) = write.send(Message::Text(text_message.into())).await {
-            println!("TTS: Failed to send text message: {}", e);
+            log::error!("TTS: Failed to send text message: {}", e);
             return Err(TTSError::WebSocket(e.to_string()));
         }
 
@@ -147,19 +147,19 @@ impl ElevenLabsTTS {
         })
         .to_string();
 
-        println!("TTS: Sending end of stream message");
+        log::debug!("TTS: Sending end of stream message");
         if let Err(e) = write.send(Message::Text(eos_message.into())).await {
-            println!("TTS: Failed to send EOS message: {}", e);
+            log::error!("TTS: Failed to send EOS message: {}", e);
             return Err(TTSError::WebSocket(e.to_string()));
         }
 
-        println!("TTS: Starting audio stream processing");
+        log::debug!("TTS: Starting audio stream processing");
         // Process incoming audio data
         loop {
             select! {
                 // Check for cancellation
                 _ = cancel.cancelled() => {
-                    println!("TTS: Synthesis cancelled");
+                    log::info!("TTS: Synthesis cancelled");
                     self.sink.stop().await?;
                     return Err(TTSError::Cancelled);
                 }
@@ -168,20 +168,20 @@ impl ElevenLabsTTS {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Binary(audio_data))) => {
-                            println!("TTS: Received {} bytes of audio data", audio_data.len());
+                            log::debug!("TTS: Received {} bytes of audio data", audio_data.len());
                             match self.sink.write(audio_data.as_slice()).await {
-                                Ok(_) => println!("TTS: Successfully wrote audio data to sink"),
+                                                                  Ok(_) => log::debug!("TTS: Successfully wrote audio data to sink"),
                                 Err(e) => {
-                                    println!("TTS: Failed to write audio data to sink: {}", e);
+                                    log::error!("TTS: Failed to write audio data to sink: {}", e);
                                     return Err(e.into());
                                 }
                             }
                         }
                         Some(Ok(Message::Text(text))) => {
-                            println!("TTS: Received text message: {}", text);
+                            log::debug!("TTS: Received text message: {}", text);
                             let text_str = text.to_string();
                             if text_str.contains("error") {
-                                println!("TTS: Error in text message");
+                                log::error!("TTS: Error in text message");
                                 return Err(TTSError::ApiError {
                                     status: 400,
                                     message: text_str,
@@ -199,15 +199,15 @@ impl ElevenLabsTTS {
                                         )))
                                     })?;
 
-                                    println!("TTS: Decoded {} bytes of audio data from base64", audio_data.len());
+                                    log::debug!("TTS: Decoded {} bytes of audio data from base64", audio_data.len());
 
                                     // Write audio data in smaller chunks
                                     const CHUNK_SIZE: usize = 1024; // 1KB chunks
                                     for chunk in audio_data.chunks(CHUNK_SIZE) {
                                         match self.sink.write(chunk).await {
-                                            Ok(_) => println!("TTS: Successfully wrote {} bytes to sink", chunk.len()),
+                                            Ok(_) => log::debug!("TTS: Successfully wrote {} bytes to sink", chunk.len()),
                                             Err(e) => {
-                                                println!("TTS: Failed to write audio chunk to sink: {}", e);
+                                                log::error!("TTS: Failed to write audio chunk to sink: {}", e);
                                                 return Err(e.into());
                                             }
                                         }
@@ -218,19 +218,19 @@ impl ElevenLabsTTS {
                             }
                         }
                         Some(Ok(Message::Close(_))) => {
-                            println!("TTS: Received close frame, synthesis complete");
+                            log::info!("TTS: Received close frame, synthesis complete");
                             break;
                         }
                         Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
                             // Ignore control frames
-                            println!("TTS: Received control frame (ping/pong/frame)");
+                            log::debug!("TTS: Received control frame (ping/pong/frame)");
                         }
                         Some(Err(e)) => {
-                            println!("TTS: WebSocket error: {}", e);
+                            log::error!("TTS: WebSocket error: {}", e);
                             return Err(TTSError::WebSocket(e.to_string()));
                         }
                         None => {
-                            println!("TTS: WebSocket stream ended");
+                            log::info!("TTS: WebSocket stream ended");
                             break;
                         }
                     }
@@ -238,7 +238,7 @@ impl ElevenLabsTTS {
             }
         }
 
-        println!("TTS: Synthesis completed successfully");
+        log::info!("TTS: Synthesis completed successfully");
         Ok(())
     }
 
@@ -387,7 +387,7 @@ mod tests {
         match ApiConfig::load() {
             Ok(config) => config.elevenlabs_key().to_string(),
             Err(_) => {
-                println!("⚠️  Skipping ElevenLabs tests - API key not found");
+                log::warn!("⚠️  Skipping ElevenLabs tests - API key not found");
                 panic!("Test skipped - no API key");
             }
         }
@@ -400,7 +400,7 @@ mod tests {
         let sink = match CpalSink::new(CpalConfig::default()) {
             Ok(sink) => Arc::new(sink) as Arc<dyn AudioSink>,
             Err(e) => {
-                println!(
+                log::warn!(
                     "Audio device not available in test environment - this is expected: {}",
                     e
                 );
@@ -421,7 +421,7 @@ mod tests {
         let sink = match CpalSink::new(CpalConfig::default()) {
             Ok(sink) => Arc::new(sink) as Arc<dyn AudioSink>,
             Err(e) => {
-                println!(
+                log::warn!(
                     "Audio device not available in test environment - this is expected: {}",
                     e
                 );

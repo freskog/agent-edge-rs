@@ -59,7 +59,7 @@ pub trait AudioSink: Send + Sync {
 }
 
 pub struct CpalConfig {
-    /// Buffer size in milliseconds (default 2000ms)
+    /// Buffer size in milliseconds (default 45000ms)
     pub buffer_size_ms: u32,
     /// Warning threshold for low buffer (percentage)
     pub low_buffer_warning: u8,
@@ -70,7 +70,7 @@ pub struct CpalConfig {
 impl Default for CpalConfig {
     fn default() -> Self {
         Self {
-            buffer_size_ms: 2000,
+            buffer_size_ms: 45000,
             low_buffer_warning: 20,
             high_buffer_warning: 80,
         }
@@ -118,7 +118,7 @@ pub struct CpalSink {
 
 impl CpalSink {
     pub fn new(config: CpalConfig) -> Result<Self, AudioError> {
-        println!("AudioSink: Creating new CpalSink");
+        log::debug!("AudioSink: Creating new CpalSink");
         let (audio_sender, audio_receiver) = channel();
         let stats = Arc::new(CpalStats::new(
             (config.buffer_size_ms as usize * 16000) / 1000,
@@ -127,15 +127,15 @@ impl CpalSink {
         let is_stopped = Arc::new(AtomicBool::new(false));
 
         let host = cpal::default_host();
-        println!("AudioSink: Using audio host: {:?}", host.id());
+        log::debug!("AudioSink: Using audio host: {:?}", host.id());
 
         let device = match host.default_output_device() {
             Some(dev) => {
-                println!("AudioSink: Using output device: {:?}", dev.name());
+                log::debug!("AudioSink: Using output device: {:?}", dev.name());
                 dev
             }
             None => {
-                println!("AudioSink: No output device found!");
+                log::error!("AudioSink: No output device found!");
                 return Err(AudioError::DeviceError(
                     "No output device found".to_string(),
                 ));
@@ -147,7 +147,7 @@ impl CpalSink {
             .default_output_config()
             .map_err(|e| AudioError::DeviceError(e.to_string()))?;
 
-        println!("AudioSink: Using output config: {:?}", supported_config);
+        log::debug!("AudioSink: Using output config: {:?}", supported_config);
 
         let output_sample_rate = supported_config.sample_rate().0;
         let output_channels = supported_config.channels() as usize;
@@ -159,7 +159,7 @@ impl CpalSink {
         let samples_queue_clone = Arc::clone(&samples_queue);
 
         let audio_thread = thread::spawn(move || {
-            println!("AudioSink: Audio thread started");
+            log::debug!("AudioSink: Audio thread started");
             let stream = match device.build_output_stream(
                 &supported_config.config(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -217,7 +217,7 @@ impl CpalSink {
 
                     let samples_played = initial_len - queue.len();
                     if samples_played > 0 {
-                        println!(
+                        log::debug!(
                             "AudioSink: Played {} samples ({} remaining)",
                             samples_played,
                             queue.len()
@@ -227,29 +227,29 @@ impl CpalSink {
                     stats_clone.update_buffer_size(queue.len());
                 },
                 move |err| {
-                    println!("AudioSink: Stream error: {}", err);
+                    log::error!("AudioSink: Stream error: {}", err);
                 },
                 None,
             ) {
                 Ok(stream) => stream,
                 Err(e) => {
-                    println!("AudioSink: Failed to create audio stream: {}", e);
+                    log::error!("AudioSink: Failed to create audio stream: {}", e);
                     return;
                 }
             };
 
-            println!("AudioSink: Starting audio playback stream");
+            log::debug!("AudioSink: Starting audio playback stream");
             if let Err(e) = stream.play() {
-                println!("AudioSink: Failed to start audio stream: {}", e);
+                log::error!("AudioSink: Failed to start audio stream: {}", e);
                 return;
             }
 
-            println!("AudioSink: Audio stream started successfully");
+            log::debug!("AudioSink: Audio stream started successfully");
 
             while let Ok(command) = audio_receiver.recv() {
                 match command {
                     AudioCommand::PlayAudio(audio_data) => {
-                        println!(
+                        log::debug!(
                             "AudioSink: Received {} bytes of audio data",
                             audio_data.len()
                         );
@@ -260,20 +260,20 @@ impl CpalSink {
                             let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
                             queue.push(sample as f32 / i16::MAX as f32);
                         }
-                        println!("AudioSink: Converted and queued {} samples", queue.len());
+                        log::debug!("AudioSink: Converted and queued {} samples", queue.len());
                     }
                     AudioCommand::Stop => {
-                        println!("AudioSink: Received stop command");
+                        log::debug!("AudioSink: Received stop command");
                         break;
                     }
                 }
             }
 
-            println!("AudioSink: Audio thread exiting");
+            log::debug!("AudioSink: Audio thread exiting");
             // Stream is automatically dropped here when thread exits
         });
 
-        println!("AudioSink: Successfully created CpalSink");
+        log::debug!("AudioSink: Successfully created CpalSink");
         Ok(Self {
             audio_sender,
             stats,
@@ -311,29 +311,31 @@ impl Drop for CpalSink {
 impl AudioSink for CpalSink {
     async fn write(&self, audio_data: &[u8]) -> Result<(), AudioError> {
         if self.is_stopped.load(Ordering::Acquire) {
-            println!("AudioSink: Cannot write - sink is stopped");
+            log::warn!("AudioSink: Cannot write - sink is stopped");
             return Err(AudioError::WriteError("Sink is stopped".to_string()));
         }
 
         let buffer_percentage = self.stats.buffer_percentage();
         if buffer_percentage > self.config.high_buffer_warning {
-            println!(
+            log::warn!(
                 "AudioSink: Buffer high warning: {}% (threshold: {}%)",
-                buffer_percentage, self.config.high_buffer_warning
+                buffer_percentage,
+                self.config.high_buffer_warning
             );
         } else if buffer_percentage < self.config.low_buffer_warning {
-            println!(
-                "AudioSink: Buffer low warning: {}% (threshold: {}%)",
-                buffer_percentage, self.config.low_buffer_warning
+            log::debug!(
+                "AudioSink: Buffer low: {}% (threshold: {}%)",
+                buffer_percentage,
+                self.config.low_buffer_warning
             );
         }
 
         if buffer_percentage >= 100 {
-            println!("AudioSink: Buffer full!");
+            log::warn!("AudioSink: Buffer full!");
             return Err(AudioError::BufferFull);
         }
 
-        println!(
+        log::debug!(
             "AudioSink: Writing {} bytes of audio data (buffer: {}%)",
             audio_data.len(),
             buffer_percentage
@@ -343,9 +345,9 @@ impl AudioSink for CpalSink {
             .audio_sender
             .send(AudioCommand::PlayAudio(audio_data.to_vec()))
         {
-            Ok(_) => println!("AudioSink: Successfully queued audio data"),
+            Ok(_) => log::debug!("AudioSink: Successfully queued audio data"),
             Err(e) => {
-                println!("AudioSink: Failed to queue audio data: {}", e);
+                log::error!("AudioSink: Failed to queue audio data: {}", e);
                 return Err(AudioError::WriteError(e.to_string()));
             }
         }
@@ -358,18 +360,18 @@ impl AudioSink for CpalSink {
             .store(interval, Ordering::Release);
         *last_write = now;
 
-        println!("AudioSink: Write complete (interval: {}ms)", interval);
+        log::debug!("AudioSink: Write complete (interval: {}ms)", interval);
 
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), AudioError> {
-        println!("AudioSink: Stopping sink");
+        log::debug!("AudioSink: Stopping sink");
         self.is_stopped.store(true, Ordering::Release);
         match self.audio_sender.send(AudioCommand::Stop) {
-            Ok(_) => println!("AudioSink: Successfully sent stop command"),
+            Ok(_) => log::debug!("AudioSink: Successfully sent stop command"),
             Err(e) => {
-                println!("AudioSink: Failed to send stop command: {}", e);
+                log::error!("AudioSink: Failed to send stop command: {}", e);
                 return Err(AudioError::StopError(e.to_string()));
             }
         }
@@ -390,7 +392,7 @@ mod tests {
                 Ok(())
             }
             Err(e) => {
-                println!(
+                log::warn!(
                     "Audio device not available in test environment - this is expected: {}",
                     e
                 );
@@ -422,7 +424,7 @@ mod tests {
                 Ok(())
             }
             Err(e) => {
-                println!(
+                log::warn!(
                     "Audio device not available in test environment - this is expected: {}",
                     e
                 );
@@ -441,7 +443,7 @@ mod tests {
                 Ok(())
             }
             Err(e) => {
-                println!(
+                log::warn!(
                     "Audio device not available in test environment - this is expected: {}",
                     e
                 );
