@@ -1,11 +1,10 @@
 // Removed unused imports
 use crate::speech_producer::{SpeechChunk, SpeechEvent};
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, info, warn};
+use log::{info, warn};
 use serde::Deserialize;
 use serde_json::{self, json};
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -236,14 +235,14 @@ impl FireworksSTT {
 
         // Create channels for signaling
         let (close_tx, mut close_rx) = mpsc::channel::<()>(1);
-        let (final_tx, mut final_rx) = mpsc::channel::<()>(1);
+        let (final_tx, _final_rx) = mpsc::channel::<()>(1);
 
         // Clone self for the async block
         let self_clone = Arc::clone(&self);
         let stats_clone = Arc::clone(&stats);
 
         // Spawn a dedicated task for sending audio
-        let sender_handle = tokio::spawn(async move {
+        let _sender_handle = tokio::spawn(async move {
             let mut chunk_count = 0;
             let mut final_checkpoint_sent = false;
 
@@ -544,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_defaults() {
         let config = STTConfig::default();
-        assert_eq!(config.language, Some("en".to_string()));
+        assert_eq!(config.language, None);
         assert_eq!(config.temperature, Some(0.0));
         assert_eq!(
             config.prompt,

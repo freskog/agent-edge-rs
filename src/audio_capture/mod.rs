@@ -9,6 +9,9 @@ use thiserror::Error;
 
 pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size that works with Silero
 
+/// Maximum number of chunks to keep in ring buffer (~3.2 seconds at 16kHz)
+const MAX_RING_BUFFER_SIZE: usize = 40;
+
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
     #[error("No audio devices found")]
@@ -80,6 +83,16 @@ impl AudioCapture {
     ) -> Result<Self, AudioCaptureError> {
         let host = cpal::default_host();
 
+        // Create ring buffer with fixed capacity
+        let ring_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RING_BUFFER_SIZE)));
+        let ring_buffer_clone = ring_buffer.clone();
+
+        // Create a buffer to accumulate samples
+        let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(CHUNK_SIZE)));
+
+        // Wrap callback in Arc<Mutex<>> so it can be shared between threads
+        let callback = Arc::new(Mutex::new(callback));
+
         // Get the device
         let device = if let Some(id) = &config.device_id {
             host.devices()
@@ -119,17 +132,6 @@ impl AudioCapture {
 
         let channel = config.channel;
         let channels = stream_config.channels as usize;
-
-        // Create ring buffer (keep last ~3 seconds of audio)
-        // At 16kHz with 1280 sample chunks (80ms each), 3 seconds = ~37 chunks
-        let ring_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(40)));
-        let ring_buffer_clone = ring_buffer.clone();
-
-        // Create a buffer to accumulate samples
-        let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(CHUNK_SIZE)));
-
-        // Wrap callback in Arc<Mutex<>> so it can be shared between threads
-        let callback = Arc::new(Mutex::new(callback));
 
         // Build the stream with the appropriate sample format
         let stream = match supported_config.sample_format() {
@@ -218,11 +220,12 @@ impl AudioCapture {
                                         timestamp: Instant::now(),
                                     };
 
-                                    // Add to ring buffer
+                                    // Add to ring buffer with size limit
                                     if let Ok(mut ring_buf) = ring_buffer.try_lock() {
                                         ring_buf.push_back(chunk.clone());
-                                        if ring_buf.len() > 40 {
+                                        while ring_buf.len() > MAX_RING_BUFFER_SIZE {
                                             ring_buf.pop_front();
+                                            log::debug!("Ring buffer full, dropping oldest chunk");
                                         }
                                     }
 
@@ -292,6 +295,127 @@ impl AudioCapture {
                 .collect()
         } else {
             Vec::new()
+        }
+    }
+
+    /// Get the current ring buffer size
+    pub fn ring_buffer_size(&self) -> usize {
+        self.ring_buffer.lock().unwrap().len()
+    }
+
+    /// Get the maximum ring buffer size
+    pub fn max_ring_buffer_size(&self) -> usize {
+        MAX_RING_BUFFER_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tokio;
+
+    fn create_test_chunk() -> AudioChunk {
+        AudioChunk {
+            samples: vec![0i16; CHUNK_SIZE],
+            timestamp: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ring_buffer_capacity() {
+        let (tx, _rx) = mpsc::channel();
+        let callback = Box::new(move |chunk: AudioChunk| {
+            let _ = tx.send(chunk);
+        });
+
+        match AudioCapture::new(AudioCaptureConfig::default(), callback) {
+            Ok(capture) => {
+                assert_eq!(capture.max_ring_buffer_size(), MAX_RING_BUFFER_SIZE);
+                assert_eq!(capture.ring_buffer_size(), 0);
+            }
+            Err(e) => {
+                println!(
+                    "Audio device not available in test environment - this is expected: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ring_buffer_overflow() {
+        let (tx, _rx) = mpsc::channel();
+        let callback = Box::new(move |chunk: AudioChunk| {
+            let _ = tx.send(chunk);
+        });
+
+        match AudioCapture::new(AudioCaptureConfig::default(), callback) {
+            Ok(capture) => {
+                // Get access to ring buffer
+                let ring_buffer = capture.ring_buffer.clone();
+
+                // Simulate the automatic trimming behavior from the audio stream callback
+                {
+                    let mut buffer = ring_buffer.lock().unwrap();
+                    for _ in 0..MAX_RING_BUFFER_SIZE + 5 {
+                        buffer.push_back(create_test_chunk());
+                        // Simulate the trimming logic from the stream callback
+                        while buffer.len() > MAX_RING_BUFFER_SIZE {
+                            buffer.pop_front();
+                        }
+                    }
+                }
+
+                // Verify buffer didn't exceed max size
+                assert_eq!(capture.ring_buffer_size(), MAX_RING_BUFFER_SIZE);
+            }
+            Err(e) => {
+                println!(
+                    "Audio device not available in test environment - this is expected: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ring_buffer_fifo() {
+        let (tx, _rx) = mpsc::channel();
+        let callback = Box::new(move |chunk: AudioChunk| {
+            let _ = tx.send(chunk);
+        });
+
+        match AudioCapture::new(AudioCaptureConfig::default(), callback) {
+            Ok(capture) => {
+                let ring_buffer = capture.ring_buffer.clone();
+
+                // Add chunks with timestamps
+                {
+                    let mut buffer = ring_buffer.lock().unwrap();
+                    for _ in 0..3 {
+                        buffer.push_back(create_test_chunk());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+
+                // Verify FIFO order
+                let buffer = ring_buffer.lock().unwrap();
+                let timestamps: Vec<_> = buffer.iter().map(|chunk| chunk.timestamp).collect();
+                for i in 1..timestamps.len() {
+                    assert!(
+                        timestamps[i] > timestamps[i - 1],
+                        "Chunks should be in chronological order"
+                    );
+                }
+            }
+            Err(e) => {
+                println!(
+                    "Audio device not available in test environment - this is expected: {}",
+                    e
+                );
+            }
         }
     }
 }

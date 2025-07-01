@@ -10,6 +10,11 @@ description = "Wakeword-only edge client for low-powered devices"
 default = ["led_ring"]
 led_ring = ["rusb"]
 
+# Test features for different test categories
+test-integration = [] # Full integration tests with external dependencies
+test-audio = []       # Tests requiring audio devices
+test-api = []         # Tests requiring API keys
+
 [dependencies]
 # Core utilities
 log = "0.4"
@@ -49,8 +54,7 @@ dotenvy = "0.15.7"
 rusb = { version = "0.9", optional = true }
 
 # Audio playback and capture
-rodio = "0.20.1"
-cpal = "0.15.2"
+cpal = "0.16.0"
 
 voice_activity_detector = "0.2.0"
 ort-sys = "=2.0.0-rc.9"

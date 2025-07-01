@@ -8,7 +8,6 @@ use agent_edge_rs::{
     error::{EdgeError, Result},
 };
 use hound;
-use std::time::Instant;
 
 const SAMPLE_RATE: u32 = 16000;
 const CHUNK_SIZE: usize = 1280; // 80ms at 16kHz
@@ -70,7 +69,7 @@ fn process_audio_in_chunks(
     let mut results = Vec::new();
 
     // Process audio in chunks
-    for (chunk_idx, chunk_start) in (0..padded_audio.len()).step_by(CHUNK_SIZE).enumerate() {
+    for (_chunk_idx, chunk_start) in (0..padded_audio.len()).step_by(CHUNK_SIZE).enumerate() {
         let chunk_end = (chunk_start + CHUNK_SIZE).min(padded_audio.len());
         let chunk = &padded_audio[chunk_start..chunk_end];
 

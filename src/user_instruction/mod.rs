@@ -227,12 +227,42 @@ mod tests {
     use std::env;
     use std::sync::Arc;
 
+    // Helper function to check environment requirements
+    fn check_test_requirements() -> (bool, bool) {
+        let has_api_key = env::var("FIREWORKS_API_KEY").is_ok();
+        let has_audio = SpeechHub::new(AudioCaptureConfig::default(), 0.5).is_ok();
+        (has_api_key, has_audio)
+    }
+
     #[tokio::test]
-    async fn test_user_instruction_detector() {
-        // Skip test if no API key
-        if env::var("FIREWORKS_API_KEY").is_err() {
-            println!("⏭️  Skipping test - FIREWORKS_API_KEY not found");
-            return;
+    async fn test_user_instruction_detector_basic() {
+        // Basic test that doesn't require API or audio devices
+        let config = Config::default();
+
+        // Test that config is properly constructed
+        assert_eq!(config.wakeword_config.confidence_threshold, 0.3);
+        assert_eq!(
+            config.stt_config.server_timeout,
+            std::time::Duration::from_secs(30)
+        );
+
+        println!("✅ Basic UserInstructionDetector configuration test passed");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "test-api"),
+        ignore = "requires API key - run with --features test-api"
+    )]
+    async fn test_user_instruction_detector_with_api() {
+        let (has_api_key, has_audio) = check_test_requirements();
+
+        if !has_api_key {
+            panic!("This test requires FIREWORKS_API_KEY environment variable");
+        }
+
+        if !has_audio {
+            panic!("This test requires an available audio input device");
         }
 
         // Create speech hub
@@ -242,5 +272,62 @@ mod tests {
         let config = Config::default();
         let detector = UserInstructionDetector::new(config, speech_hub);
         assert!(detector.is_ok());
+        println!("✅ UserInstructionDetector created successfully");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "test-audio"),
+        ignore = "requires audio device - run with --features test-audio"
+    )]
+    async fn test_user_instruction_detector_audio_only() {
+        let (_, has_audio) = check_test_requirements();
+
+        if !has_audio {
+            panic!("This test requires an available audio input device");
+        }
+
+        // Test just the audio components without API dependency
+        let speech_hub_result = SpeechHub::new(AudioCaptureConfig::default(), 0.5);
+        assert!(speech_hub_result.is_ok());
+        println!("✅ Audio device is available and working");
+    }
+
+    // This test will always run and report what's available
+    #[tokio::test]
+    async fn test_environment_capabilities() {
+        let (has_api_key, has_audio) = check_test_requirements();
+
+        println!("🔍 Environment Capabilities:");
+        println!(
+            "  - API Key (FIREWORKS_API_KEY): {}",
+            if has_api_key {
+                "✅ Available"
+            } else {
+                "❌ Missing"
+            }
+        );
+        println!(
+            "  - Audio Device: {}",
+            if has_audio {
+                "✅ Available"
+            } else {
+                "❌ Missing"
+            }
+        );
+
+        if !has_api_key && !has_audio {
+            println!("💡 To run full tests:");
+            println!("  - Set FIREWORKS_API_KEY environment variable");
+            println!("  - Ensure audio input device is available");
+            println!("  - Run: cargo test --features test-api,test-audio");
+        } else if !has_api_key {
+            println!("💡 To run API tests: cargo test --features test-api");
+        } else if !has_audio {
+            println!("💡 To run audio tests: cargo test --features test-audio");
+        }
+
+        // This test always passes but provides useful information
+        assert!(true, "Environment check completed");
     }
 }
