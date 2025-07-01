@@ -1,5 +1,5 @@
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -28,9 +28,9 @@ pub struct LLMConfig {
 impl Default for LLMConfig {
     fn default() -> Self {
         Self {
-            model: "llama-3.3-70b-versatile".to_string(),
-            temperature: 0.7,
-            max_tokens: Some(4096),
+            model: "meta-llama/llama-4-maverick-17b-128e-instruct".to_string(),
+            temperature: 0.3,
+            max_tokens: Some(8192),
             top_p: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
@@ -67,12 +67,20 @@ impl Message {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
 #[derive(Debug)]
 pub struct LLMResponse {
     pub content: String,
     pub usage: Option<Usage>,
     pub model: String,
     pub finish_reason: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug)]
@@ -113,11 +121,31 @@ impl GroqLLM {
         self.complete_with_config(messages, &self.config).await
     }
 
+    /// Generate a completion with tools using the internal config
+    pub async fn complete_with_internal_tools(
+        &self,
+        messages: Vec<Message>,
+        tools: &[Value],
+    ) -> Result<LLMResponse, LLMError> {
+        self.complete_with_tools(messages, &self.config, tools)
+            .await
+    }
+
     /// Generate a completion with custom config
     pub async fn complete_with_config(
         &self,
         messages: Vec<Message>,
         config: &LLMConfig,
+    ) -> Result<LLMResponse, LLMError> {
+        self.complete_with_tools(messages, config, &[]).await
+    }
+
+    /// Generate a completion with tools
+    pub async fn complete_with_tools(
+        &self,
+        messages: Vec<Message>,
+        config: &LLMConfig,
+        tools: &[Value],
     ) -> Result<LLMResponse, LLMError> {
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -143,6 +171,12 @@ impl GroqLLM {
 
         if let Some(max_tokens) = config.max_tokens {
             payload["max_tokens"] = json!(max_tokens);
+        }
+
+        // Add tools if provided
+        if !tools.is_empty() {
+            payload["tools"] = json!(tools);
+            payload["tool_choice"] = json!("auto");
         }
 
         let response = self
@@ -248,7 +282,7 @@ impl GroqLLM {
 
         let content = message["content"]
             .as_str()
-            .ok_or_else(|| LLMError::ParseError("Missing message content".to_string()))?
+            .unwrap_or("") // Content can be null when tool calls are made
             .to_string();
 
         let finish_reason = first_choice["finish_reason"]
@@ -270,11 +304,36 @@ impl GroqLLM {
             None
         };
 
+        // Parse tool calls if present
+        let mut tool_calls = Vec::new();
+        if let Some(tool_calls_json) = message.get("tool_calls") {
+            if let Some(tool_calls_array) = tool_calls_json.as_array() {
+                for tool_call_json in tool_calls_array {
+                    if let (Some(id), Some(name), Some(function)) = (
+                        tool_call_json["id"].as_str(),
+                        tool_call_json["function"]["name"].as_str(),
+                        tool_call_json["function"]["arguments"].as_str(),
+                    ) {
+                        let arguments: Value = serde_json::from_str(function).map_err(|e| {
+                            LLMError::ParseError(format!("Invalid tool call arguments: {}", e))
+                        })?;
+
+                        tool_calls.push(ToolCall {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            arguments,
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(LLMResponse {
             content,
             usage,
             model,
             finish_reason,
+            tool_calls,
         })
     }
 
@@ -320,6 +379,7 @@ impl GroqLLM {
             usage: None, // Usage not typically provided in streaming
             model,
             finish_reason,
+            tool_calls: Vec::new(), // Tool calls not supported in streaming for now
         })
     }
 
@@ -380,6 +440,26 @@ impl GroqLLM {
     }
 }
 
+#[async_trait::async_trait]
+pub trait LLMClient: Send + Sync {
+    async fn complete_with_internal_tools(
+        &self,
+        messages: Vec<Message>,
+        tools: &[serde_json::Value],
+    ) -> Result<LLMResponse, LLMError>;
+}
+
+#[async_trait::async_trait]
+impl LLMClient for GroqLLM {
+    async fn complete_with_internal_tools(
+        &self,
+        messages: Vec<Message>,
+        tools: &[serde_json::Value],
+    ) -> Result<LLMResponse, LLMError> {
+        self.complete_with_internal_tools(messages, tools).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,9 +482,12 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = LLMConfig::default();
-        assert_eq!(config.model, "llama-3.3-70b-versatile");
-        assert_eq!(config.temperature, 0.7);
-        assert_eq!(config.max_tokens, Some(4096));
+        assert_eq!(
+            config.model,
+            "meta-llama/llama-4-maverick-17b-128e-instruct"
+        );
+        assert_eq!(config.temperature, 0.3);
+        assert_eq!(config.max_tokens, Some(8192));
         assert_eq!(config.top_p, 1.0);
         assert_eq!(config.frequency_penalty, 0.0);
         assert_eq!(config.presence_penalty, 0.0);

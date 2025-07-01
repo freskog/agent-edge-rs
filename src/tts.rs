@@ -86,47 +86,80 @@ impl ElevenLabsTTS {
 
     /// Synthesize text to speech and play it through the configured audio sink
     pub async fn synthesize(&self, text: &str, cancel: CancellationToken) -> Result<(), TTSError> {
+        println!("TTS: Starting synthesis for text: {}", text);
+
         // Connect to WebSocket
         let ws_url = format!(
-            "wss://api.elevenlabs.io/v1/text-to-speech/{}/stream-input?model_id={}",
+            "wss://api.elevenlabs.io/v1/text-to-speech/{}/stream-input?model_id={}&output_format=pcm_16000",
             self.config.voice_id, self.config.model
         );
+        println!("TTS: Connecting to WebSocket at {}", ws_url);
 
         let ws_stream = match connect_async(ws_url).await {
-            Ok((ws_stream, _)) => ws_stream,
-            Err(e) => return Err(TTSError::Connection(e.to_string())),
+            Ok((ws_stream, _)) => {
+                println!("TTS: Successfully connected to WebSocket");
+                ws_stream
+            }
+            Err(e) => {
+                println!("TTS: Failed to connect to WebSocket: {}", e);
+                return Err(TTSError::Connection(e.to_string()));
+            }
         };
 
         let (mut write, mut read) = ws_stream.split();
 
         // Send initial configuration
         let bos_message = json!({
-            "text": text,
+            "text": " ",  // Initial empty text
             "voice_settings": {
                 "stability": self.config.stability,
                 "similarity_boost": self.config.similarity_boost,
                 "style": self.config.style,
                 "use_speaker_boost": self.config.use_speaker_boost
             },
-            "xi_api_key": self.api_key,
-        });
+            "xi_api_key": self.api_key
+        })
+        .to_string();
 
-        write
-            .send(Message::Text(bos_message.to_string().into()))
-            .await
-            .map_err(|e| TTSError::WebSocket(format!("Failed to send config: {}", e)))?;
+        println!("TTS: Sending initial configuration");
+        // Send BOS message
+        if let Err(e) = write.send(Message::Text(bos_message.into())).await {
+            println!("TTS: Failed to send initial configuration: {}", e);
+            return Err(TTSError::WebSocket(e.to_string()));
+        }
 
-        // Send EOS to indicate we're done sending text
-        write
-            .send(Message::Text("".to_string().into()))
-            .await
-            .map_err(|e| TTSError::WebSocket(format!("Failed to send EOS: {}", e)))?;
+        // Send text message
+        let text_message = json!({
+            "text": text,
+            "try_trigger_generation": true
+        })
+        .to_string();
 
+        println!("TTS: Sending text for synthesis");
+        if let Err(e) = write.send(Message::Text(text_message.into())).await {
+            println!("TTS: Failed to send text message: {}", e);
+            return Err(TTSError::WebSocket(e.to_string()));
+        }
+
+        // Send EOS message
+        let eos_message = json!({
+            "text": ""
+        })
+        .to_string();
+
+        println!("TTS: Sending end of stream message");
+        if let Err(e) = write.send(Message::Text(eos_message.into())).await {
+            println!("TTS: Failed to send EOS message: {}", e);
+            return Err(TTSError::WebSocket(e.to_string()));
+        }
+
+        println!("TTS: Starting audio stream processing");
         // Process incoming audio data
         loop {
             select! {
                 // Check for cancellation
                 _ = cancel.cancelled() => {
+                    println!("TTS: Synthesis cancelled");
                     self.sink.stop().await?;
                     return Err(TTSError::Cancelled);
                 }
@@ -135,28 +168,77 @@ impl ElevenLabsTTS {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Binary(audio_data))) => {
-                            self.sink.write(audio_data.as_slice()).await?;
+                            println!("TTS: Received {} bytes of audio data", audio_data.len());
+                            match self.sink.write(audio_data.as_slice()).await {
+                                Ok(_) => println!("TTS: Successfully wrote audio data to sink"),
+                                Err(e) => {
+                                    println!("TTS: Failed to write audio data to sink: {}", e);
+                                    return Err(e.into());
+                                }
+                            }
                         }
                         Some(Ok(Message::Text(text))) => {
+                            println!("TTS: Received text message: {}", text);
                             let text_str = text.to_string();
                             if text_str.contains("error") {
+                                println!("TTS: Error in text message");
                                 return Err(TTSError::ApiError {
                                     status: 400,
                                     message: text_str,
                                 });
                             }
+
+                            // Parse the JSON response
+                            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&text_str) {
+                                if let Some(audio_b64) = response.get("audio").and_then(|a| a.as_str()) {
+                                    // Decode base64 audio data
+                                    let audio_data = general_purpose::STANDARD.decode(audio_b64).map_err(|e| {
+                                        TTSError::Audio(AudioError::Base64DecodeError(format!(
+                                            "Base64 decode error: {}",
+                                            e
+                                        )))
+                                    })?;
+
+                                    println!("TTS: Decoded {} bytes of audio data from base64", audio_data.len());
+
+                                    // Write audio data in smaller chunks
+                                    const CHUNK_SIZE: usize = 1024; // 1KB chunks
+                                    for chunk in audio_data.chunks(CHUNK_SIZE) {
+                                        match self.sink.write(chunk).await {
+                                            Ok(_) => println!("TTS: Successfully wrote {} bytes to sink", chunk.len()),
+                                            Err(e) => {
+                                                println!("TTS: Failed to write audio chunk to sink: {}", e);
+                                                return Err(e.into());
+                                            }
+                                        }
+                                        // Small delay between chunks to allow playback to catch up
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                    }
+                                }
+                            }
                         }
-                        Some(Ok(Message::Close(_))) => break,
+                        Some(Ok(Message::Close(_))) => {
+                            println!("TTS: Received close frame, synthesis complete");
+                            break;
+                        }
+                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
+                            // Ignore control frames
+                            println!("TTS: Received control frame (ping/pong/frame)");
+                        }
                         Some(Err(e)) => {
+                            println!("TTS: WebSocket error: {}", e);
                             return Err(TTSError::WebSocket(e.to_string()));
                         }
-                        None => break,
-                        _ => {} // Ignore other message types
+                        None => {
+                            println!("TTS: WebSocket stream ended");
+                            break;
+                        }
                     }
                 }
             }
         }
 
+        println!("TTS: Synthesis completed successfully");
         Ok(())
     }
 

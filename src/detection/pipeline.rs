@@ -336,6 +336,18 @@ impl DetectionPipeline {
         // context for the embedding model. We need 76 consecutive mel frames, so we collect
         // ~16 melspec outputs (16 × 5 = 80 frames) and take the most recent 76.
         self.melspec_accumulator.push_back(melspec_features);
+
+        // Check if accumulator has grown too large (2x needed size)
+        if self.melspec_accumulator.len() > self.melspec_frames_needed * 2 {
+            log::warn!("🔄 Melspec accumulator too large - resetting to prevent stall");
+            self.reset_melspec_accumulator();
+            return Ok(WakewordDetection {
+                detected: false,
+                confidence: 0.0,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+
         if self.melspec_accumulator.len() > self.melspec_frames_needed {
             self.melspec_accumulator.pop_front(); // Maintain sliding window
         }
@@ -426,6 +438,18 @@ impl DetectionPipeline {
         // consecutive embeddings (representing ~1.28 seconds of audio) to provide sufficient
         // temporal context for accurate wake word classification.
         self.embedding_window.push_back(embedding_features);
+
+        // Check if window has grown too large (2x needed size)
+        if self.embedding_window.len() > self.config.window_size * 2 {
+            log::warn!("🔄 Embedding window too large - resetting to prevent stall");
+            self.embedding_window.clear();
+            return Ok(WakewordDetection {
+                detected: false,
+                confidence: 0.0,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+
         if self.embedding_window.len() > self.config.window_size {
             self.embedding_window.pop_front(); // Maintain fixed window size
         }

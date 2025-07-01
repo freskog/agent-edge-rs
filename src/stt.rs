@@ -383,6 +383,16 @@ impl FireworksSTT {
         // Process messages until we get final checkpoint or timeout
         while let Ok(Some(msg_result)) = tokio::time::timeout(server_timeout, read.next()).await {
             message_count += 1;
+
+            // Check for timeout since last message
+            if last_message_time.elapsed() > Duration::from_secs(10) {
+                log::warn!("STT: No messages received for 10 seconds");
+                return Err(STTError::Streaming(
+                    "No response for 10 seconds".to_string(),
+                ));
+            }
+
+            // Update last message time
             last_message_time = Instant::now();
 
             match msg_result {
@@ -444,14 +454,6 @@ impl FireworksSTT {
                 _ => {
                     log::debug!("STT: Received other message type {}", message_count);
                 }
-            }
-
-            // Check for timeout since last message
-            if last_message_time.elapsed() > Duration::from_secs(10) {
-                log::warn!("STT: No messages received for 10 seconds");
-                return Err(STTError::Streaming(
-                    "No response for 10 seconds".to_string(),
-                ));
             }
         }
 

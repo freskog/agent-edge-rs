@@ -50,6 +50,9 @@ base64 = "0.22"
 secrecy = "0.10.3"
 dotenvy = "0.15.7"
 
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
 # USB control for LED ring (optional)
 rusb = { version = "0.9", optional = true }
 
@@ -62,6 +65,7 @@ ort-sys = "=2.0.0-rc.9"
 # Audio file I/O for recording and testing
 num-traits = "0.2.19"
 tokio-util = "0.7.15"
+regex = "1.11.1"
 
 [dev-dependencies]
 serial_test = "2.0.0"
