@@ -65,7 +65,9 @@ pub type AudioCallback = Box<dyn FnMut(AudioChunk) + Send + 'static>;
 
 /// Audio capture with ring buffer for historical audio access
 pub struct AudioCapture {
+    #[allow(dead_code)]
     config: AudioCaptureConfig,
+    #[allow(dead_code)]
     stream: Option<CpalStream>,
     _host: Host,
     ring_buffer: Arc<Mutex<VecDeque<AudioChunk>>>,

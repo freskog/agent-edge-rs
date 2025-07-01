@@ -5,6 +5,7 @@
 
 // Public modules, accessible to the binary and other consumers
 pub mod audio_capture;
+pub mod audio_sink;
 pub mod config;
 pub mod detection;
 pub mod error;

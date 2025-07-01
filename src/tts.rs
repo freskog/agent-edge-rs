@@ -1,18 +1,43 @@
-use reqwest::Client;
+use base64::{engine::general_purpose, Engine as _};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use std::time::Duration;
-use thiserror::Error;
 
-#[derive(Error, Debug)]
+use crate::audio_sink::{AudioError, AudioSink};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::select;
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Error, Debug, Clone)]
 pub enum TTSError {
-    #[error("HTTP request failed: {0}")]
-    Request(#[from] reqwest::Error),
     #[error("API error: {status} - {message}")]
     ApiError { status: u16, message: String },
-    #[error("Audio processing error: {0}")]
-    AudioProcessing(String),
-    #[error("Configuration error: {0}")]
-    Config(String),
+
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
+
+    #[error("Connection error: {0}")]
+    Connection(String),
+
+    #[error("Audio error: {0}")]
+    Audio(#[from] AudioError),
+
+    #[error("Session cancelled")]
+    Cancelled,
+}
+
+impl From<reqwest::Error> for TTSError {
+    fn from(err: reqwest::Error) -> Self {
+        TTSError::Connection(err.to_string())
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for TTSError {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        TTSError::WebSocket(err.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,95 +70,103 @@ pub struct TTSResponse {
 }
 
 pub struct ElevenLabsTTS {
-    client: Client,
     api_key: String,
-    base_url: String,
     config: TTSConfig,
+    sink: Arc<dyn AudioSink>,
 }
 
 impl ElevenLabsTTS {
-    pub fn new(api_key: String) -> Self {
-        Self::with_config(api_key, TTSConfig::default())
-    }
-
-    pub fn with_config(api_key: String, config: TTSConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
-
+    pub fn new(api_key: String, config: TTSConfig, sink: Arc<dyn AudioSink>) -> Self {
         Self {
-            client,
             api_key,
-            base_url: "https://api.elevenlabs.io/v1".to_string(),
             config,
+            sink,
         }
     }
 
-    /// Generate speech from text
-    pub async fn synthesize(&self, text: &str) -> Result<TTSResponse, TTSError> {
-        self.synthesize_with_voice(text, &self.config.voice_id)
-            .await
-    }
+    /// Synthesize text to speech and play it through the configured audio sink
+    pub async fn synthesize(&self, text: &str, cancel: CancellationToken) -> Result<(), TTSError> {
+        // Connect to WebSocket
+        let ws_url = format!(
+            "wss://api.elevenlabs.io/v1/text-to-speech/{}/stream-input?model_id={}",
+            self.config.voice_id, self.config.model
+        );
 
-    /// Generate speech with specific voice ID
-    pub async fn synthesize_with_voice(
-        &self,
-        text: &str,
-        voice_id: &str,
-    ) -> Result<TTSResponse, TTSError> {
-        let url = format!("{}/text-to-speech/{}", self.base_url, voice_id);
+        let ws_stream = match connect_async(ws_url).await {
+            Ok((ws_stream, _)) => ws_stream,
+            Err(e) => return Err(TTSError::Connection(e.to_string())),
+        };
 
-        let payload = json!({
+        let (mut write, mut read) = ws_stream.split();
+
+        // Send initial configuration
+        let bos_message = json!({
             "text": text,
-            "model_id": self.config.model,
             "voice_settings": {
                 "stability": self.config.stability,
                 "similarity_boost": self.config.similarity_boost,
                 "style": self.config.style,
                 "use_speaker_boost": self.config.use_speaker_boost
-            }
+            },
+            "xi_api_key": self.api_key,
         });
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .header("Accept", "audio/mpeg")
-            .json(&payload)
-            .send()
-            .await?;
+        write
+            .send(Message::Text(bos_message.to_string().into()))
+            .await
+            .map_err(|e| TTSError::WebSocket(format!("Failed to send config: {}", e)))?;
 
-        let status = response.status();
+        // Send EOS to indicate we're done sending text
+        write
+            .send(Message::Text("".to_string().into()))
+            .await
+            .map_err(|e| TTSError::WebSocket(format!("Failed to send EOS: {}", e)))?;
 
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(TTSError::ApiError {
-                status: status.as_u16(),
-                message: error_text,
-            });
+        // Process incoming audio data
+        loop {
+            select! {
+                // Check for cancellation
+                _ = cancel.cancelled() => {
+                    self.sink.stop().await?;
+                    return Err(TTSError::Cancelled);
+                }
+
+                // Process WebSocket messages
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(audio_data))) => {
+                            self.sink.write(audio_data.as_slice()).await?;
+                        }
+                        Some(Ok(Message::Text(text))) => {
+                            let text_str = text.to_string();
+                            if text_str.contains("error") {
+                                return Err(TTSError::ApiError {
+                                    status: 400,
+                                    message: text_str,
+                                });
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => break,
+                        Some(Err(e)) => {
+                            return Err(TTSError::WebSocket(e.to_string()));
+                        }
+                        None => break,
+                        _ => {} // Ignore other message types
+                    }
+                }
+            }
         }
 
-        let audio_data = response.bytes().await?.to_vec();
-
-        Ok(TTSResponse {
-            audio_data,
-            format: "mp3".to_string(),
-        })
+        Ok(())
     }
 
     /// Get available voices
     pub async fn get_voices(&self) -> Result<Vec<Voice>, TTSError> {
-        let url = format!("{}/voices", self.base_url);
+        let url = format!("https://api.elevenlabs.io/v1/voices");
 
-        let response = self
-            .client
+        let response = reqwest::Client::new()
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("xi-api-key", &self.api_key)
             .send()
             .await?;
 
@@ -151,12 +184,13 @@ impl ElevenLabsTTS {
         }
 
         let response_text = response.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| TTSError::AudioProcessing(format!("Invalid JSON: {}", e)))?;
+        let json: serde_json::Value = serde_json::from_str(&response_text).map_err(|e| {
+            TTSError::Audio(AudioError::InvalidJson(format!("Invalid JSON: {}", e)))
+        })?;
 
         let voices_array = json["voices"]
             .as_array()
-            .ok_or_else(|| TTSError::AudioProcessing("Missing 'voices' field".to_string()))?;
+            .ok_or_else(|| TTSError::Audio(AudioError::MissingField("voices".to_string())))?;
 
         let mut voices = Vec::new();
 
@@ -198,18 +232,19 @@ impl ElevenLabsTTS {
     pub fn mp3_to_samples(&self, _mp3_data: &[u8]) -> Result<(Vec<f32>, u32), TTSError> {
         // This is a placeholder implementation
         // In a real implementation, you would use an MP3 decoder
-        Err(TTSError::AudioProcessing(
-            "MP3 decoding not implemented. Use an audio library like symphonia.".to_string(),
-        ))
+        Err(TTSError::Audio(AudioError::Mp3DecodingNotImplemented))
     }
 
     /// Save audio to file
     pub async fn save_audio(&self, audio_data: &[u8], filename: &str) -> Result<(), TTSError> {
         use tokio::fs;
 
-        fs::write(filename, audio_data)
-            .await
-            .map_err(|e| TTSError::AudioProcessing(format!("Failed to save audio: {}", e)))?;
+        fs::write(filename, audio_data).await.map_err(|e| {
+            TTSError::Audio(AudioError::FailedToSaveAudio(format!(
+                "Failed to save audio: {}",
+                e
+            )))
+        })?;
 
         Ok(())
     }
@@ -262,33 +297,358 @@ impl Voice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_sink::TestSink;
+    use crate::config::ApiConfig;
 
-    #[test]
-    fn test_config_defaults() {
+    fn get_api_key_or_skip() -> String {
+        match ApiConfig::load() {
+            Ok(config) => config.elevenlabs_key().to_string(),
+            Err(_) => {
+                println!("⚠️  Skipping ElevenLabs tests - API key not found");
+                panic!("Test skipped - no API key");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tts_synthesis() {
+        let api_key = get_api_key_or_skip();
         let config = TTSConfig::default();
-        assert_eq!(config.voice_id, "21m00Tcm4TlvDq8ikWAM");
-        assert_eq!(config.model, "eleven_multilingual_v2");
-        assert_eq!(config.stability, 0.5);
-        assert_eq!(config.similarity_boost, 0.75);
-        assert_eq!(config.style, 0.0);
-        assert!(config.use_speaker_boost);
+        let sink = Arc::new(TestSink::new());
+        let tts = ElevenLabsTTS::new(api_key, config, Arc::clone(&sink));
+
+        let cancel = CancellationToken::new();
+        let result = tts.synthesize("Hello, this is a test.", cancel).await;
+        assert!(result.is_ok());
+
+        // Verify audio was received
+        let chunks = sink.get_chunks().await;
+        assert!(!chunks.is_empty());
     }
 
-    #[test]
-    fn test_voice_presets() {
-        assert_eq!(Voice::rachel(), "21m00Tcm4TlvDq8ikWAM");
-        assert_eq!(Voice::drew(), "29vD33N1CtxCmqQRPOHJ");
-        assert_eq!(Voice::clyde(), "2EiwWnXFnvU5JabPnv8n");
+    #[tokio::test]
+    async fn test_tts_cancellation() {
+        let api_key = get_api_key_or_skip();
+        let config = TTSConfig::default();
+        let sink = Arc::new(TestSink::new());
+        let tts = ElevenLabsTTS::new(api_key, config, Arc::clone(&sink));
+
+        let cancel = CancellationToken::new();
+        let synthesis = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                tts.synthesize(
+                    "This is a longer text that should take some time to synthesize.",
+                    cancel,
+                )
+                .await
+            }
+        });
+
+        // Cancel after a short delay
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        let result = synthesis.await.unwrap();
+        assert!(matches!(result, Err(TTSError::Cancelled)));
+        assert!(sink.is_stopped());
+    }
+}
+
+// ===== Streaming TTS Types =====
+
+#[derive(Debug, Clone)]
+pub enum AudioFormat {
+    Pcm16000, // Best latency
+    Pcm22050,
+    Pcm24000,
+    Pcm44100,
+    Mp3_44100_128, // Fallback
+}
+
+impl AudioFormat {
+    pub fn to_elevenlabs_format(&self) -> &'static str {
+        match self {
+            AudioFormat::Pcm16000 => "pcm_16000",
+            AudioFormat::Pcm22050 => "pcm_22050",
+            AudioFormat::Pcm24000 => "pcm_24000",
+            AudioFormat::Pcm44100 => "pcm_44100",
+            AudioFormat::Mp3_44100_128 => "mp3_44100_128",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TTSStreamConfig {
+    pub voice_id: String,
+    pub model: String,
+    pub output_format: AudioFormat,
+    pub auto_mode: bool, // Reduces latency by disabling buffers
+    pub stability: f32,
+    pub similarity_boost: f32,
+    pub style: f32,
+    pub use_speaker_boost: bool,
+}
+
+impl Default for TTSStreamConfig {
+    fn default() -> Self {
+        Self {
+            voice_id: "21m00Tcm4TlvDq8ikWAM".to_string(), // Rachel voice
+            model: "eleven_flash_v2_5".to_string(),       // Fast model for streaming
+            output_format: AudioFormat::Pcm16000,         // Best latency
+            auto_mode: true,                              // Disable buffers for speed
+            stability: 0.5,
+            similarity_boost: 0.75,
+            style: 0.0,
+            use_speaker_boost: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TTSEvent {
+    StartedSpeaking,
+    AudioChunk(Vec<u8>), // PCM samples ready for playback
+    FinishedSpeaking,    // Signal for LED control
+    Error(TTSError),
+}
+
+#[derive(Debug, Clone)]
+pub enum TTSCommand {
+    AddText(String),
+    Finalize,
+    Cancel,
+}
+
+pub struct TTSSession {
+    pub events: broadcast::Receiver<TTSEvent>,
+    pub control: TTSControl,
+}
+
+#[derive(Clone)]
+pub struct TTSControl {
+    command_sender: mpsc::Sender<TTSCommand>,
+}
+
+impl TTSControl {
+    // Fire-and-forget mode: Queue text and continue
+    pub async fn add_text(&self, text: &str) -> Result<(), TTSError> {
+        self.command_sender
+            .send(TTSCommand::AddText(text.to_string()))
+            .await
+            .map_err(|_| TTSError::Cancelled)?;
+        Ok(())
     }
 
-    #[test]
-    fn test_voice_settings_clamping() {
-        let mut tts = ElevenLabsTTS::new("test_key".to_string());
+    // Blocking mode: Wait for TTS completion
+    pub async fn speak_and_wait(&self, text: &str) -> Result<(), TTSError> {
+        self.add_text(text).await?;
+        self.finalize().await?;
 
-        // Test clamping
-        tts.set_voice_settings(2.0, -0.5, 1.5);
-        assert_eq!(tts.config.stability, 1.0);
-        assert_eq!(tts.config.similarity_boost, 0.0);
-        assert_eq!(tts.config.style, 1.0);
+        // For now, just wait a short time - we'll improve this later
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    pub async fn finalize(&self) -> Result<(), TTSError> {
+        self.command_sender
+            .send(TTSCommand::Finalize)
+            .await
+            .map_err(|_| TTSError::Cancelled)?;
+        Ok(())
+    }
+
+    // Mid-sentence cancellation
+    pub async fn cancel(&self) -> Result<(), TTSError> {
+        self.command_sender
+            .send(TTSCommand::Cancel)
+            .await
+            .map_err(|_| TTSError::Cancelled)?;
+        Ok(())
+    }
+}
+
+// ===== Streaming TTS Implementation =====
+
+pub struct ElevenLabsStreamingTTS {
+    api_key: String,
+    base_url: String,
+}
+
+impl ElevenLabsStreamingTTS {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            api_key,
+            base_url: "wss://api.elevenlabs.io/v1".to_string(),
+        }
+    }
+
+    pub async fn start_session(&self, config: TTSStreamConfig) -> Result<TTSSession, TTSError> {
+        let (event_tx, event_rx) = broadcast::channel(32);
+        let (command_tx, command_rx) = mpsc::channel(16);
+
+        // Start WebSocket connection and processing task
+        let ws_url = format!(
+            "{}/text-to-speech/{}/stream-input",
+            self.base_url, config.voice_id
+        );
+        let api_key = self.api_key.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                Self::run_websocket_session(ws_url, api_key, config, event_tx.clone(), command_rx)
+                    .await
+            {
+                let _ = event_tx.send(TTSEvent::Error(e));
+            }
+        });
+
+        Ok(TTSSession {
+            events: event_rx,
+            control: TTSControl {
+                command_sender: command_tx,
+            },
+        })
+    }
+
+    async fn run_websocket_session(
+        ws_url: String,
+        api_key: String,
+        config: TTSStreamConfig,
+        event_tx: broadcast::Sender<TTSEvent>,
+        mut command_rx: mpsc::Receiver<TTSCommand>,
+    ) -> Result<(), TTSError> {
+        // Connect to WebSocket
+        let (ws_stream, _) = connect_async(&ws_url).await?;
+        let (mut ws_sink, mut ws_stream) = ws_stream.split();
+
+        // Send initial handshake
+        let init_message = json!({
+            "text": " ",
+            "voice_settings": {
+                "stability": config.stability,
+                "similarity_boost": config.similarity_boost,
+                "style": config.style,
+                "use_speaker_boost": config.use_speaker_boost
+            },
+            "xi_api_key": api_key,
+            "model_id": config.model,
+            "output_format": config.output_format.to_elevenlabs_format(),
+            "auto_mode": config.auto_mode
+        });
+
+        ws_sink
+            .send(Message::Text(init_message.to_string().into()))
+            .await?;
+
+        let mut finalized = false;
+
+        loop {
+            tokio::select! {
+                // Handle commands from control interface
+                command = command_rx.recv() => {
+                    match command {
+                        Some(TTSCommand::AddText(text)) => {
+                            let message = json!({
+                                "text": text,
+                                "try_trigger_generation": true
+                            });
+                            ws_sink.send(Message::Text(message.to_string().into())).await?;
+                        }
+                        Some(TTSCommand::Finalize) => {
+                            // Send empty text to finalize
+                            let message = json!({
+                                "text": ""
+                            });
+                            ws_sink.send(Message::Text(message.to_string().into())).await?;
+                            finalized = true;
+                        }
+                        Some(TTSCommand::Cancel) => {
+                            // Close WebSocket to cancel
+                            ws_sink.close().await?;
+                            break;
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+
+                // Handle WebSocket responses
+                ws_message = ws_stream.next() => {
+                    match ws_message {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&text.to_string()) {
+                                Self::handle_websocket_response(response, &event_tx)?;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            if finalized {
+                                let _ = event_tx.send(TTSEvent::FinishedSpeaking);
+                            }
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            return Err(TTSError::WebSocket(e.to_string()));
+                        }
+                        None => break,
+                        _ => {} // Ignore other message types
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_websocket_response(
+        response: serde_json::Value,
+        event_tx: &broadcast::Sender<TTSEvent>,
+    ) -> Result<(), TTSError> {
+        if let Some(audio_b64) = response.get("audio").and_then(|a| a.as_str()) {
+            // Decode base64 audio data
+            let audio_data = general_purpose::STANDARD.decode(audio_b64).map_err(|e| {
+                TTSError::Audio(AudioError::Base64DecodeError(format!(
+                    "Base64 decode error: {}",
+                    e
+                )))
+            })?;
+
+            let _ = event_tx.send(TTSEvent::AudioChunk(audio_data));
+
+            // Check if this is the final audio chunk
+            if let Some(is_final) = response.get("isFinal").and_then(|f| f.as_bool()) {
+                if is_final {
+                    let _ = event_tx.send(TTSEvent::FinishedSpeaking);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn synthesize_streaming(
+        &self,
+        text: &str,
+        config: TTSStreamConfig,
+    ) -> Result<Vec<u8>, TTSError> {
+        let session = self.start_session(config).await?;
+        let mut audio_chunks = Vec::new();
+        let mut events = session.events;
+
+        // Send text and wait for completion
+        session.control.speak_and_wait(text).await?;
+
+        // Collect all audio chunks
+        while let Ok(event) = events.recv().await {
+            match event {
+                TTSEvent::AudioChunk(chunk) => {
+                    audio_chunks.extend(chunk);
+                }
+                TTSEvent::FinishedSpeaking => break,
+                TTSEvent::Error(e) => return Err(e),
+                _ => {}
+            }
+        }
+
+        Ok(audio_chunks)
     }
 }

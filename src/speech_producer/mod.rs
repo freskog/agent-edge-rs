@@ -13,6 +13,7 @@ pub use events::{SpeechChunk, SpeechEvent};
 /// Speech hub that broadcasts speech events to multiple subscribers
 pub struct SpeechHub {
     tx: broadcast::Sender<SpeechChunk>,
+    #[allow(dead_code)]
     audio_capture: Arc<AudioCapture>, // Keep AudioCapture alive and accessible
 }
 
