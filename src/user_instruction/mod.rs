@@ -67,8 +67,12 @@ impl UserInstructionDetector {
         }
 
         match self.pipeline.process_audio_chunk(&chunk.samples_f32) {
-            Ok(detection) if detection.detected => Ok(Some(detection.confidence)),
-            Ok(_) => Ok(None),
+            Ok(detection) => {
+                // Log all confidence scores for debugging
+                log::debug!("🎯 Wakeword confidence: {:.3}", detection.confidence);
+                // Always return the confidence score
+                Ok(Some(detection.confidence))
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -81,6 +85,8 @@ impl UserInstructionDetector {
     /// 3. Start STT immediately after wakeword ends
     /// 4. Return the transcribed instruction
     pub async fn get_instruction(&mut self) -> EdgeResult<UserInstruction> {
+        log::debug!("🎯 Starting get_instruction - waiting for speech chunks");
+        
         let mut confidence = 0.0;
         let mut wakeword_detected = false;
         let mut peak_confidence = 0.0;
@@ -97,11 +103,14 @@ impl UserInstructionDetector {
         // Get a fresh receiver for this entire instruction cycle
         let mut speech_rx = self.speech_hub.subscribe();
 
+        log::info!("👂 Ready for wakeword - say 'Hey Mycroft'");
+
         // Phase 1: Listen for wakeword and detect its end
         loop {
             match speech_rx.recv().await {
                 Ok(chunk) => {
                     chunks_processed += 1;
+                    log::debug!("👂 Received chunk {} for wakeword detection", chunks_processed);
 
                     // Reset wakeword pipeline if stuck for too long
                     if chunks_processed > MAX_CHUNKS_BEFORE_RESET {
@@ -112,12 +121,16 @@ impl UserInstructionDetector {
                     }
 
                     if let Some(conf) = self.check_wakeword(&chunk)? {
-                        if !wakeword_detected {
-                            log::info!("🎤 Wakeword detected! Monitoring for end...");
+                        if !wakeword_detected && conf >= 0.09 {
+                            log::info!("🎤 Wakeword detected! Monitoring for end... (confidence: {:.3})", conf);
                             wakeword_detected = true;
                             peak_confidence = conf;
                             chunks_since_peak = 0;
-                        } else {
+                        } else if wakeword_detected {
+                            // Log confidence scores during wakeword detection
+                            log::debug!("🎯 Monitoring wakeword - current: {:.3}, peak: {:.3}, chunks since peak: {}", 
+                                conf, peak_confidence, chunks_since_peak);
+                            
                             // Always increment chunks since peak when in wakeword mode
                             chunks_since_peak += 1;
 
@@ -125,7 +138,12 @@ impl UserInstructionDetector {
                             if conf > peak_confidence {
                                 peak_confidence = conf;
                                 chunks_since_peak = 0; // Reset counter when we find a new peak
+                                log::debug!("🎯 New peak confidence: {:.3}", peak_confidence);
                             }
+                        } else {
+                            // Log all confidence scores below threshold
+                            log::debug!("🎯 Below threshold - confidence: {:.3}, threshold: {:.3}", 
+                                conf, 0.09);
                         }
 
                         confidence = conf.max(confidence);
@@ -139,30 +157,15 @@ impl UserInstructionDetector {
                         // Check for wakeword end conditions:
                         // 1. Must be at least MIN_CHUNKS_AFTER_PEAK after confidence peak
                         // 2. Current confidence must have dropped significantly from peak
-                        // 3. Recent confidence window should show consistent decline
                         if chunks_since_peak >= MIN_CHUNKS_AFTER_PEAK {
-                            let current_conf = conf;
-                            let conf_drop = peak_confidence - current_conf;
+                            // Calculate average confidence over recent window
+                            let window_avg = confidence_window.iter().sum::<f32>()
+                                / confidence_window.len() as f32;
 
-                            // Calculate if confidence is consistently declining
-                            let mut is_declining = true;
-                            if confidence_window.len() >= 3 {
-                                let window: Vec<f32> = confidence_window.iter().copied().collect();
-                                for i in 1..window.len() {
-                                    if window[i] > window[i - 1] {
-                                        is_declining = false;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if conf_drop > CONFIDENCE_DROP_THRESHOLD && is_declining {
-                                log::info!(
-                                    "🎯 Wakeword ended (peak: {:.3}, current: {:.3}, drop: {:.3}), starting STT...",
-                                    peak_confidence,
-                                    current_conf,
-                                    conf_drop
-                                );
+                            // Check if confidence has dropped enough from peak
+                            if peak_confidence - window_avg >= CONFIDENCE_DROP_THRESHOLD {
+                                log::info!("🎯 Wakeword complete - peak confidence: {:.3}", peak_confidence);
+                                log::info!("🎤 Ready for speech - what can I help you with?");
                                 break;
                             }
                         }

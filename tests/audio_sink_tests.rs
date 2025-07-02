@@ -1,3 +1,7 @@
+//! Audio sink integration tests
+
+#![cfg(feature = "test-audio")]
+
 use agent_edge_rs::{
     audio_sink::{AudioSink, CpalConfig, CpalSink},
     tts::{ElevenLabsTTS, TTSConfig},

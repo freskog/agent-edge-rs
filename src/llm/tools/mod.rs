@@ -2,7 +2,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub mod quick_actions;
+pub mod calendar;
+pub mod dialogue;
 
 #[derive(Error, Debug)]
 pub enum ToolError {
@@ -20,8 +21,9 @@ pub enum ToolError {
 
 #[derive(Debug)]
 pub enum ToolResult {
-    Success(Option<String>), // Happy path: Some(msg) = speak it, None = silent
-    Escalation(Value),       // Tool needs LLM help/intervention
+    Ok,                 // Completed successfully, no additional information required
+    Response(String),   // Completed successfully with some message for the LLM
+    Escalation(String), // Unable to complete goal, reason explains for LLM
 }
 
 #[derive(Debug, Clone)]
@@ -68,10 +70,9 @@ impl ToolRegistry {
         }
 
         match name {
-            "get_time" => quick_actions::get_time(arguments, cancel_token).await,
-            "calculate_future_time" => {
-                quick_actions::calculate_future_time(arguments, cancel_token).await
-            }
+            "get_current_time" => calendar::get_current_time(arguments, cancel_token).await,
+            "get_current_date" => calendar::get_current_date(arguments, cancel_token).await,
+            "tell_user" => dialogue::tell_user(arguments, cancel_token).await,
             _ => Err(ToolError::NotFound(format!("Tool '{}' not found", name))),
         }
     }
@@ -104,40 +105,40 @@ impl Default for ToolRegistry {
 pub fn create_default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
-    // Register quick action tools
+    // Register calendar tools
     registry.register_tool(Tool {
-        name: "get_time".to_string(),
+        name: "get_current_time".to_string(),
         description: "Get the current time in a human-readable format".to_string(),
         parameters: serde_json::json!({
             "type": "object",
-            "properties": {
-                "send_output_directly_to_tts": {
-                    "type": "boolean",
-                    "description": "true = send output directly to speech, false = return data for LLM processing"
-                }
-            },
-            "required": ["send_output_directly_to_tts"]
+            "properties": {},
+            "required": []
         }),
     });
 
     registry.register_tool(Tool {
-        name: "calculate_future_time".to_string(),
-        description:
-            "Calculate what time it will be in a specified number of hours and/or minutes from now"
-                .to_string(),
+        name: "get_current_date".to_string(),
+        description: "Get the current date in a human-readable format".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    });
+
+    // Register dialogue tools
+    registry.register_tool(Tool {
+        name: "tell_user".to_string(),
+        description: "Send a message to the user via text-to-speech. This ends the conversation - use only when you have a final response for the user.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "hours": {
-                    "type": "integer",
-                    "description": "Number of hours to add to current time"
-                },
-                "minutes": {
-                    "type": "integer",
-                    "description": "Number of minutes to add to current time"
+                "message": {
+                    "type": "string",
+                    "description": "The final message to speak to the user. Should be natural and conversational."
                 }
             },
-            "required": ["hours", "minutes"]
+            "required": ["message"]
         }),
     });
 
@@ -207,8 +208,8 @@ mod tests {
         assert!(!registry.get_tools().is_empty());
 
         // Check that get_time tool is registered
-        let time_tool = registry.find_tool("get_time");
+        let time_tool = registry.find_tool("get_current_time");
         assert!(time_tool.is_some());
-        assert_eq!(time_tool.unwrap().name, "get_time");
+        assert_eq!(time_tool.unwrap().name, "get_current_time");
     }
 }

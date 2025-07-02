@@ -9,8 +9,8 @@ use thiserror::Error;
 
 pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size that works with Silero
 
-/// Maximum number of chunks to keep in ring buffer (~3.2 seconds at 16kHz)
-const MAX_RING_BUFFER_SIZE: usize = 40;
+/// Maximum number of chunks to keep in ring buffer (~6.4 seconds at 16kHz)
+const MAX_RING_BUFFER_SIZE: usize = 80;
 
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
@@ -82,6 +82,7 @@ impl AudioCapture {
         callback: AudioCallback,
     ) -> Result<Self, AudioCaptureError> {
         let host = cpal::default_host();
+        log::info!("🎤 Initializing audio capture with host: {:?}", host.id());
 
         // Create ring buffer with fixed capacity
         let ring_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RING_BUFFER_SIZE)));
@@ -104,6 +105,8 @@ impl AudioCapture {
                 .ok_or_else(|| AudioCaptureError::Device("No default input device found".into()))?
         };
 
+        log::info!("🎤 Using input device: {:?}", device.name());
+
         let supported_config = device
             .default_input_config()
             .map_err(|e| AudioCaptureError::Config(e.to_string()))?;
@@ -124,7 +127,7 @@ impl AudioCapture {
 
         // Log the format being used
         log::info!(
-            "Audio capture configured: {} channels @ {}Hz (format: {:?})",
+            "🎤 Audio capture configured: {} channels @ {}Hz (format: {:?})",
             stream_config.channels,
             stream_config.sample_rate.0,
             supported_config.sample_format()
@@ -225,7 +228,6 @@ impl AudioCapture {
                                         ring_buf.push_back(chunk.clone());
                                         while ring_buf.len() > MAX_RING_BUFFER_SIZE {
                                             ring_buf.pop_front();
-                                            log::debug!("Ring buffer full, dropping oldest chunk");
                                         }
                                     }
 

@@ -30,6 +30,8 @@ impl SpeechHub {
             .build()
             .map_err(|err| EdgeError::VADError(err.to_string()))?;
 
+        log::info!("🎤 Voice activity detector initialized (threshold: {:.2})", threshold);
+
         // Track speech state across callbacks
         let is_speaking = Arc::new(AtomicBool::new(false));
         let is_speaking_clone = is_speaking.clone();
@@ -42,6 +44,9 @@ impl SpeechHub {
         // Use different thresholds for different purposes
         let wakeword_threshold = threshold * 0.3; // More lenient for wakeword
         let speech_threshold = threshold * 0.5; // More lenient for speech events
+
+        log::info!("🎤 Speech detection thresholds - wakeword: {:.2}, speech: {:.2}", 
+                  wakeword_threshold, speech_threshold);
 
         // Create audio capture with callback that processes audio and broadcasts speech events
         let audio_capture = AudioCapture::new(
@@ -63,8 +68,10 @@ impl SpeechHub {
 
                     if !was_speaking {
                         is_speaking_clone.store(true, Ordering::Relaxed);
+                        log::debug!("🎤 Speech started (probability: {:.2})", speech_prob);
                         Some(SpeechEvent::StartedSpeaking)
                     } else {
+                        log::debug!("🎤 Speech continuing (probability: {:.2})", speech_prob);
                         Some(SpeechEvent::Speaking)
                     }
                 } else if was_speaking {
@@ -72,37 +79,37 @@ impl SpeechHub {
                     if trailing_frame_count >= TRAILING_FRAME_COUNT {
                         // Only stop if we've sent enough trailing frames
                         is_speaking_clone.store(false, Ordering::Relaxed);
+                        log::debug!("🎤 Speech stopped (after {} trailing frames)", trailing_frame_count);
                         Some(SpeechEvent::StoppedSpeaking)
                     } else {
                         // Still in trailing frame period, send as Speaking
                         trailing_frames_clone.fetch_add(1, Ordering::Relaxed);
+                        log::debug!("🎤 Speech trailing frame {} of {}", trailing_frame_count + 1, TRAILING_FRAME_COUNT);
                         Some(SpeechEvent::Speaking)
                     }
                 } else {
                     None
                 };
 
-                // Always send chunks for wakeword detection when there's any speech-like activity
-                // Also send the final StoppedSpeaking event when we've reached the trailing frame limit
-                if is_speech_for_wakeword
-                    || (was_speaking && trailing_frame_count <= TRAILING_FRAME_COUNT)
-                    || event.is_some()
-                {
-                    // Convert samples to f32
-                    let mut samples_f32 = [0.0; 1280];
-                    for (i, &sample) in chunk.samples.iter().take(1280).enumerate() {
-                        samples_f32[i] = sample as f32 / 32768.0;
-                    }
-
-                    // Use appropriate event or default to Speaking for wakeword processing
-                    let speech_chunk = SpeechChunk::new(
-                        samples_f32,
-                        std::time::Instant::now(),
-                        event.unwrap_or(SpeechEvent::Speaking),
-                    );
-
-                    let _ = tx_clone.send(speech_chunk);
+                // Convert samples to f32 - we'll need this for all chunks
+                let mut samples_f32 = [0.0; 1280];
+                for (i, &sample) in chunk.samples.iter().take(1280).enumerate() {
+                    samples_f32[i] = sample as f32 / 32768.0;
                 }
+
+                // Always send chunks for wakeword detection, regardless of speech activity
+                let speech_chunk = SpeechChunk::new(
+                    samples_f32,
+                    std::time::Instant::now(),
+                    event.unwrap_or(SpeechEvent::Speaking),
+                );
+
+                // Only log potential wakeword activity when speech starts
+                if is_speech_for_wakeword && !was_speaking {
+                    log::debug!("🎤 Potential wakeword activity detected (probability: {:.2})", speech_prob);
+                }
+
+                let _ = tx_clone.send(speech_chunk);
             }),
         )?;
 

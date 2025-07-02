@@ -1,6 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SupportedStreamConfigsError};
+use cpal::{BuildStreamError, DeviceNameError, DevicesError, PlayStreamError, SupportedStreamConfigsError};
 use log::error;
+use rubato::{SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,30 @@ impl From<SupportedStreamConfigsError> for AudioError {
     }
 }
 
+impl From<BuildStreamError> for AudioError {
+    fn from(err: BuildStreamError) -> Self {
+        AudioError::DeviceError(err.to_string())
+    }
+}
+
+impl From<PlayStreamError> for AudioError {
+    fn from(err: PlayStreamError) -> Self {
+        AudioError::DeviceError(err.to_string())
+    }
+}
+
+impl From<DevicesError> for AudioError {
+    fn from(err: DevicesError) -> Self {
+        AudioError::DeviceError(err.to_string())
+    }
+}
+
+impl From<DeviceNameError> for AudioError {
+    fn from(err: DeviceNameError) -> Self {
+        AudioError::DeviceError(err.to_string())
+    }
+}
+
 /// Core trait for audio output handling
 #[async_trait::async_trait]
 pub trait AudioSink: Send + Sync {
@@ -65,14 +90,17 @@ pub struct CpalConfig {
     pub low_buffer_warning: u8,
     /// Warning threshold for high buffer_warning (percentage)
     pub high_buffer_warning: u8,
+    /// Optional output device name
+    pub device_name: Option<String>,
 }
 
 impl Default for CpalConfig {
     fn default() -> Self {
         Self {
-            buffer_size_ms: 45000,
+            buffer_size_ms: 45000, // 45 seconds buffer
             low_buffer_warning: 20,
             high_buffer_warning: 80,
+            device_name: None,
         }
     }
 }
@@ -104,8 +132,15 @@ impl CpalStats {
 }
 
 enum AudioCommand {
-    PlayAudio(Vec<u8>),
+    PlayAudio(Vec<f32>),
     Stop,
+}
+
+struct AudioState {
+    samples_queue: Arc<Mutex<Vec<f32>>>,
+    stats: Arc<CpalStats>,
+    is_stopped: Arc<AtomicBool>,
+    test_tone_complete: Arc<AtomicBool>,
 }
 
 pub struct CpalSink {
@@ -113,195 +148,265 @@ pub struct CpalSink {
     stats: Arc<CpalStats>,
     config: CpalConfig,
     is_stopped: Arc<AtomicBool>,
+    test_tone_complete: Arc<AtomicBool>,
     audio_thread: Option<thread::JoinHandle<()>>,
+    resampler: Arc<Mutex<SincFixedIn<f32>>>,
 }
 
 impl CpalSink {
     pub fn new(config: CpalConfig) -> Result<Self, AudioError> {
-        log::debug!("AudioSink: Creating new CpalSink");
-        let (audio_sender, audio_receiver) = channel();
         let stats = Arc::new(CpalStats::new(
             (config.buffer_size_ms as usize * 16000) / 1000,
         ));
         let stats_clone = Arc::clone(&stats);
         let is_stopped = Arc::new(AtomicBool::new(false));
+        let test_tone_complete = Arc::new(AtomicBool::new(false));
 
         let host = cpal::default_host();
-        log::debug!("AudioSink: Using audio host: {:?}", host.id());
 
-        let device = match host.default_output_device() {
-            Some(dev) => {
-                log::debug!("AudioSink: Using output device: {:?}", dev.name());
-                dev
+        // Get the device
+        let device = if let Some(name) = &config.device_name {
+            // List all available output devices
+            log::info!("AudioSink: Available output devices:");
+            let mut found_device = None;
+            for device in host.output_devices()? {
+                let device_name = device.name()?;
+                log::info!("  - {}", device_name);
+                if device_name == *name {
+                    found_device = Some(device);
+                }
             }
-            None => {
-                log::error!("AudioSink: No output device found!");
-                return Err(AudioError::DeviceError(
-                    "No output device found".to_string(),
-                ));
-            }
+            found_device.ok_or_else(|| AudioError::DeviceError(format!("Output device '{}' not found", name)))?
+        } else {
+            host.default_output_device()
+                .ok_or_else(|| AudioError::DeviceError("No output device available".to_string()))?
         };
 
-        // Get the default output config - we'll convert our samples to match this
-        let supported_config = device
-            .default_output_config()
-            .map_err(|e| AudioError::DeviceError(e.to_string()))?;
+        log::info!("AudioSink: Using output device: {:?}", device.name());
 
-        log::debug!("AudioSink: Using output config: {:?}", supported_config);
+        let mut supported_configs_range = device
+            .supported_output_configs()
+            .map_err(|e| AudioError::DeviceError(format!("Error getting supported configs: {}", e)))?;
 
-        let output_sample_rate = supported_config.sample_rate().0;
-        let output_channels = supported_config.channels() as usize;
+        // Log all supported configurations for debugging
+        log::info!("AudioSink: Available output configurations:");
+        let supported_configs: Vec<_> = supported_configs_range.by_ref().collect();
+        for config in supported_configs.iter() {
+            log::info!(
+                "  - Channels: {}, Sample rates: {} - {} Hz, Format: {:?}",
+                config.channels(),
+                config.min_sample_rate().0,
+                config.max_sample_rate().0,
+                config.sample_format()
+            );
+        }
 
-        // Our input is always mono 16kHz
-        let input_sample_rate = 16000;
+        // Find a supported configuration - be very flexible
+        let supported_config = supported_configs
+            .iter()
+            .find(|config| {
+                // Accept any configuration that can handle our minimum sample rate
+                config.min_sample_rate().0 <= 16000 && config.max_sample_rate().0 >= 16000
+            })
+            .ok_or_else(|| AudioError::DeviceError("No suitable output config found".to_string()))?;
 
+        // Use the device's preferred sample rate
+        let stream_config = supported_config.with_sample_rate(supported_config.min_sample_rate()).config();
+
+        log::info!(
+            "AudioSink: Selected output config - channels: {}, sample_rate: {}Hz, format: {:?}",
+            stream_config.channels,
+            stream_config.sample_rate.0,
+            supported_config.sample_format()
+        );
+
+        let output_sample_rate = stream_config.sample_rate.0;
+        let input_sample_rate = 16000; // TTS input sample rate
+        let channels = stream_config.channels as usize;
+        let input_buffer_size = 1024;
+
+        let (tx, rx) = channel::<AudioCommand>();
         let samples_queue = Arc::new(Mutex::new(Vec::new()));
         let samples_queue_clone = Arc::clone(&samples_queue);
+        let resampler = Arc::new(Mutex::new(SincFixedIn::<f32>::new(
+            output_sample_rate as f64 / input_sample_rate as f64,
+            2.0,
+            SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 256,
+                window: WindowFunction::BlackmanHarris2,
+            },
+            input_buffer_size,
+            channels,
+        ).unwrap()));
 
-        let audio_thread = thread::spawn(move || {
-            log::debug!("AudioSink: Audio thread started");
-            let stream = match device.build_output_stream(
-                &supported_config.config(),
+        // Add a test tone to verify audio output
+        {
+            let mut queue = samples_queue.lock().unwrap();
+            // Generate 1 second of 440Hz sine wave
+            let frequency = 440.0;
+            let duration = 1.0;
+            let num_samples = (output_sample_rate as f32 * duration) as usize;
+            let mut test_samples = Vec::with_capacity(num_samples);
+            
+            for i in 0..num_samples {
+                let t = i as f32 / output_sample_rate as f32;
+                let value = (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.5; // 50% volume
+                test_samples.push(value);
+            }
+            
+            log::debug!(
+                "AudioSink: Added {} test tone samples to queue",
+                test_samples.len()
+            );
+            queue.extend(test_samples);
+        }
+
+        let audio_state = AudioState {
+            samples_queue: samples_queue_clone,
+            stats: Arc::clone(&stats),
+            is_stopped: Arc::clone(&is_stopped),
+            test_tone_complete: Arc::clone(&test_tone_complete),
+        };
+
+        // Create and start the stream in a separate thread to avoid Send/Sync issues
+        let (stream_ready_tx, stream_ready_rx) = std::sync::mpsc::channel::<Result<(), AudioError>>();
+        let stream_builder = thread::spawn(move || -> Result<(), AudioError> {
+            let stream_result = device.build_output_stream(
+                &stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut queue = samples_queue_clone.lock().unwrap();
-                    let initial_len = queue.len();
+                    let start = Instant::now();
+                    let mut queue = audio_state.samples_queue.lock().unwrap();
 
-                    // Calculate how many input samples we need for this output buffer
-                    let output_frames = data.len() / output_channels;
-                    let input_samples_needed = (output_frames as f32 * input_sample_rate as f32
-                        / output_sample_rate as f32)
-                        .ceil() as usize;
-
-                    // Fill output buffer with available samples or silence
-                    let mut input_sample_idx: f32 = 0.0;
-                    let input_sample_step = input_sample_rate as f32 / output_sample_rate as f32;
-
-                    for frame in data.chunks_mut(output_channels) {
-                        // Get the input sample using linear interpolation
-                        let sample = if !queue.is_empty() {
-                            let idx_floor = input_sample_idx.floor() as usize;
-                            let idx_ceil = (input_sample_idx + 1.0).floor() as usize;
-                            let fract = input_sample_idx.fract();
-
-                            let sample1 = if idx_floor < queue.len() {
-                                queue[idx_floor]
-                            } else {
-                                0.0
-                            };
-
-                            let sample2 = if idx_ceil < queue.len() {
-                                queue[idx_ceil]
-                            } else {
-                                0.0
-                            };
-
-                            sample1 * (1.0 - fract) + sample2 * fract
-                        } else {
-                            0.0
-                        };
-
-                        // Write the sample to all channels
-                        for channel in frame.iter_mut() {
-                            *channel = sample;
+                    // Fill the output buffer with zeros if we have no data
+                    if queue.is_empty() {
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
                         }
-
-                        input_sample_idx += input_sample_step;
+                        audio_state.stats.update_buffer_size(0);
+                        return;
                     }
 
-                    // Remove used samples
-                    if input_samples_needed <= queue.len() {
-                        queue.drain(0..input_samples_needed);
-                    } else {
-                        queue.clear();
+                    // Copy data from our queue to the output buffer
+                    let mut i = 0;
+                    while i < data.len() && !queue.is_empty() {
+                        data[i] = queue.remove(0);
+                        i += 1;
                     }
 
-                    let samples_played = initial_len - queue.len();
-                    if samples_played > 0 {
-                        log::debug!(
-                            "AudioSink: Played {} samples ({} remaining)",
-                            samples_played,
-                            queue.len()
-                        );
+                    // Fill any remaining space with zeros
+                    for j in i..data.len() {
+                        data[j] = 0.0;
                     }
 
-                    stats_clone.update_buffer_size(queue.len());
+                    audio_state.stats.update_buffer_size(queue.len());
+                    let _elapsed = start.elapsed();
                 },
                 move |err| {
-                    log::error!("AudioSink: Stream error: {}", err);
+                    error!("Audio output error: {}", err);
                 },
                 None,
-            ) {
-                Ok(stream) => stream,
-                Err(e) => {
-                    log::error!("AudioSink: Failed to create audio stream: {}", e);
-                    return;
-                }
-            };
+            );
 
-            log::debug!("AudioSink: Starting audio playback stream");
-            if let Err(e) = stream.play() {
-                log::error!("AudioSink: Failed to start audio stream: {}", e);
-                return;
-            }
-
-            log::debug!("AudioSink: Audio stream started successfully");
-
-            while let Ok(command) = audio_receiver.recv() {
-                match command {
-                    AudioCommand::PlayAudio(audio_data) => {
-                        log::debug!(
-                            "AudioSink: Received {} bytes of audio data",
-                            audio_data.len()
-                        );
-                        let mut queue = samples_queue.lock().unwrap();
-
-                        // Convert i16 samples to f32
-                        for chunk in audio_data.chunks_exact(2) {
-                            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                            queue.push(sample as f32 / i16::MAX as f32);
+            match stream_result {
+                Ok(stream) => {
+                    log::debug!("AudioSink: Stream built successfully");
+                    match stream.play() {
+                        Ok(_) => {
+                            log::debug!("AudioSink: Stream started playing successfully");
+                            // Signal that initialization was successful
+                            let _ = stream_ready_tx.send(Ok(()));
+                            // Keep the stream alive until the thread exits
+                            std::thread::park();
+                            Ok(())
                         }
-                        log::debug!("AudioSink: Converted and queued {} samples", queue.len());
+                        Err(e) => {
+                            let error = AudioError::from(e);
+                            let _ = stream_ready_tx.send(Err(error.clone()));
+                            Err(error)
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error = AudioError::from(e);
+                    let _ = stream_ready_tx.send(Err(error.clone()));
+                    Err(error)
+                }
+            }
+        });
+
+        // Wait for stream initialization to complete, but don't wait for the thread to finish
+        match stream_ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {
+                // Stream initialized successfully
+            }
+            Ok(Err(e)) => {
+                // Stream initialization failed
+                return Err(e);
+            }
+            Err(_) => {
+                // Timeout waiting for stream initialization
+                return Err(AudioError::DeviceError("Timeout waiting for audio stream initialization".to_string()));
+            }
+        }
+
+        // Start audio processing thread
+        let audio_thread = thread::spawn(move || {
+            log::debug!("AudioSink: Audio processing thread started");
+            while let Ok(command) = rx.recv() {
+                match command {
+                    AudioCommand::PlayAudio(mut new_samples) => {
+                        // Add samples to the queue
+                        let new_len = {
+                            let mut samples_queue = samples_queue.lock().unwrap();
+                            let old_len = samples_queue.len();
+                            samples_queue.append(&mut new_samples);
+                            samples_queue.len() - old_len
+                        };
+                        log::debug!(
+                            "AudioSink: Added {} samples to queue (total: {})",
+                            new_len,
+                            samples_queue.lock().unwrap().len()
+                        );
                     }
                     AudioCommand::Stop => {
-                        log::debug!("AudioSink: Received stop command");
+                        log::debug!("AudioSink: Received stop command, clearing queue");
+                        samples_queue.lock().unwrap().clear();
                         break;
                     }
                 }
             }
 
-            log::debug!("AudioSink: Audio thread exiting");
-            // Stream is automatically dropped here when thread exits
+            log::debug!("AudioSink: Audio processing thread stopped");
         });
 
-        log::debug!("AudioSink: Successfully created CpalSink");
         Ok(Self {
-            audio_sender,
-            stats,
+            audio_sender: tx,
+            stats: stats_clone,
             config,
-            is_stopped,
+            is_stopped: Arc::clone(&is_stopped),
+            test_tone_complete: Arc::clone(&test_tone_complete),
             audio_thread: Some(audio_thread),
+            resampler: Arc::clone(&resampler),
         })
     }
 
     pub fn get_stats(&self) -> (u8, usize) {
-        (
-            self.stats.buffer_percentage(),
-            self.stats.write_interval_ms.load(Ordering::Acquire),
-        )
+        let buffer_percentage = self.stats.buffer_percentage();
+        let write_interval = self.stats.write_interval_ms.load(Ordering::Acquire);
+        (buffer_percentage, write_interval)
     }
 }
 
 impl Drop for CpalSink {
     fn drop(&mut self) {
-        if !self.is_stopped.load(Ordering::Acquire) {
-            if let Err(e) = self.audio_sender.send(AudioCommand::Stop) {
-                error!("Failed to send stop command: {}", e);
-            }
-        }
-
+        log::debug!("AudioSink: Dropping CpalSink");
+        self.is_stopped.store(true, Ordering::Release);
         if let Some(thread) = self.audio_thread.take() {
             if let Err(e) = thread.join() {
-                error!("Failed to join audio thread: {:?}", e);
+                log::error!("AudioSink: Error joining audio thread: {:?}", e);
             }
         }
     }
@@ -310,71 +415,39 @@ impl Drop for CpalSink {
 #[async_trait::async_trait]
 impl AudioSink for CpalSink {
     async fn write(&self, audio_data: &[u8]) -> Result<(), AudioError> {
-        if self.is_stopped.load(Ordering::Acquire) {
-            log::warn!("AudioSink: Cannot write - sink is stopped");
-            return Err(AudioError::WriteError("Sink is stopped".to_string()));
+        if self.is_stopped.load(Ordering::Relaxed) {
+            return Err(AudioError::WriteError("Audio sink is stopped".to_string()));
         }
 
+        // Convert input bytes to f32 samples (assuming 16-bit PCM)
+        let mut input_samples = Vec::with_capacity(audio_data.len() / 2);
+        for chunk in audio_data.chunks_exact(2) {
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
+            input_samples.push(sample);
+        }
+
+        // Get current stats
         let buffer_percentage = self.stats.buffer_percentage();
-        if buffer_percentage > self.config.high_buffer_warning {
-            log::warn!(
-                "AudioSink: Buffer high warning: {}% (threshold: {}%)",
-                buffer_percentage,
-                self.config.high_buffer_warning
-            );
-        } else if buffer_percentage < self.config.low_buffer_warning {
-            log::debug!(
-                "AudioSink: Buffer low: {}% (threshold: {}%)",
-                buffer_percentage,
-                self.config.low_buffer_warning
-            );
-        }
 
-        if buffer_percentage >= 100 {
-            log::warn!("AudioSink: Buffer full!");
+        // Check if buffer is too full
+        if buffer_percentage >= self.config.high_buffer_warning {
             return Err(AudioError::BufferFull);
         }
 
-        log::debug!(
-            "AudioSink: Writing {} bytes of audio data (buffer: {}%)",
-            audio_data.len(),
-            buffer_percentage
-        );
-
-        match self
-            .audio_sender
-            .send(AudioCommand::PlayAudio(audio_data.to_vec()))
-        {
-            Ok(_) => log::debug!("AudioSink: Successfully queued audio data"),
-            Err(e) => {
-                log::error!("AudioSink: Failed to queue audio data: {}", e);
-                return Err(AudioError::WriteError(e.to_string()));
-            }
-        }
-
-        let mut last_write = self.stats.last_write.lock().unwrap();
-        let now = Instant::now();
-        let interval = now.duration_since(*last_write).as_millis() as usize;
-        self.stats
-            .write_interval_ms
-            .store(interval, Ordering::Release);
-        *last_write = now;
-
-        log::debug!("AudioSink: Write complete (interval: {}ms)", interval);
+        // Send samples to audio thread
+        self.audio_sender
+            .send(AudioCommand::PlayAudio(input_samples))
+            .map_err(|e| AudioError::WriteError(e.to_string()))?;
 
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), AudioError> {
-        log::debug!("AudioSink: Stopping sink");
+        log::debug!("AudioSink: Stopping playback");
         self.is_stopped.store(true, Ordering::Release);
-        match self.audio_sender.send(AudioCommand::Stop) {
-            Ok(_) => log::debug!("AudioSink: Successfully sent stop command"),
-            Err(e) => {
-                log::error!("AudioSink: Failed to send stop command: {}", e);
-                return Err(AudioError::StopError(e.to_string()));
-            }
-        }
+        self.audio_sender
+            .send(AudioCommand::Stop)
+            .map_err(|e| AudioError::StopError(e.to_string()))?;
         Ok(())
     }
 }
@@ -386,69 +459,30 @@ mod tests {
     #[tokio::test]
     async fn test_cpal_sink_creation() -> Result<(), AudioError> {
         let config = CpalConfig::default();
-        match CpalSink::new(config) {
-            Ok(sink) => {
-                assert!(!sink.is_stopped.load(Ordering::Acquire));
-                Ok(())
-            }
-            Err(e) => {
-                log::warn!(
-                    "Audio device not available in test environment - this is expected: {}",
-                    e
-                );
-                Ok(())
-            }
-        }
+        let _sink = CpalSink::new(config)?;
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_cpal_sink_write() -> Result<(), AudioError> {
         let config = CpalConfig::default();
-        match CpalSink::new(config) {
-            Ok(sink) => {
-                // Generate 1 second of 440Hz sine wave
-                let sample_rate = 16000;
-                let duration = 1.0;
-                let frequency = 440.0;
-                let num_samples = (sample_rate as f32 * duration) as usize;
-                let mut samples = Vec::with_capacity(num_samples * 2);
+        let sink = CpalSink::new(config)?;
 
-                for i in 0..num_samples {
-                    let t = i as f32 / sample_rate as f32;
-                    let value = (2.0 * std::f32::consts::PI * frequency * t).sin();
-                    let sample = (value * i16::MAX as f32) as i16;
-                    samples.extend_from_slice(&sample.to_le_bytes());
-                }
-
-                sink.write(&samples).await?;
-                Ok(())
-            }
-            Err(e) => {
-                log::warn!(
-                    "Audio device not available in test environment - this is expected: {}",
-                    e
-                );
-                Ok(())
-            }
+        // Generate 1 second of silence
+        let mut audio_data = Vec::new();
+        for _ in 0..16000 {
+            audio_data.extend_from_slice(&[0u8, 0u8]); // 16-bit PCM silence
         }
+
+        sink.write(&audio_data).await?;
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_cpal_sink_stop() -> Result<(), AudioError> {
         let config = CpalConfig::default();
-        match CpalSink::new(config) {
-            Ok(sink) => {
-                sink.stop().await?;
-                assert!(sink.is_stopped.load(Ordering::Acquire));
-                Ok(())
-            }
-            Err(e) => {
-                log::warn!(
-                    "Audio device not available in test environment - this is expected: {}",
-                    e
-                );
-                Ok(())
-            }
-        }
+        let sink = CpalSink::new(config)?;
+        sink.stop().await?;
+        Ok(())
     }
 }

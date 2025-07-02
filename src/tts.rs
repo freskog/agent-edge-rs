@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
+use once_cell::sync::OnceCell;
 use serde_json::json;
 
 use crate::audio_sink::{AudioError, AudioSink};
@@ -54,10 +55,10 @@ impl Default for TTSConfig {
     fn default() -> Self {
         Self {
             voice_id: "21m00Tcm4TlvDq8ikWAM".to_string(), // Rachel voice
-            model: "eleven_multilingual_v2".to_string(),
-            stability: 0.5,
-            similarity_boost: 0.75,
-            style: 0.0,
+            model: "eleven_multilingual_v2".to_string(),   // Better quality model
+            stability: 0.75,                               // More stable voice
+            similarity_boost: 0.85,                        // Better voice matching
+            style: 0.35,                                   // Slight style boost for more natural speech
             use_speaker_boost: true,
         }
     }
@@ -75,6 +76,9 @@ pub struct ElevenLabsTTS {
     sink: Arc<dyn AudioSink>,
 }
 
+// Global instance so other modules (e.g. LLM tools) can trigger speech without wiring TTS through every call.
+static GLOBAL_TTS: OnceCell<Arc<ElevenLabsTTS>> = OnceCell::new();
+
 impl ElevenLabsTTS {
     pub fn new(api_key: String, config: TTSConfig, sink: Arc<dyn AudioSink>) -> Self {
         Self {
@@ -84,9 +88,20 @@ impl ElevenLabsTTS {
         }
     }
 
+    /// Register this TTS engine as the global instance. Should be called once at start-up.
+    pub fn set_global(instance: Arc<ElevenLabsTTS>) {
+        // It is not an error if this is called twice; we only set on first call.
+        let _ = GLOBAL_TTS.set(instance);
+    }
+
+    /// Get a reference to the global TTS instance if it has been registered.
+    pub fn global() -> Option<&'static Arc<ElevenLabsTTS>> {
+        GLOBAL_TTS.get()
+    }
+
     /// Synthesize text to speech and play it through the configured audio sink
     pub async fn synthesize(&self, text: &str, cancel: CancellationToken) -> Result<(), TTSError> {
-        log::info!("TTS: Starting synthesis for text: {}", text);
+        log::debug!("TTS: Starting synthesis for text: {}", text);
 
         // Connect to WebSocket
         let ws_url = format!(
@@ -154,12 +169,15 @@ impl ElevenLabsTTS {
         }
 
         log::debug!("TTS: Starting audio stream processing");
+        let mut total_audio_bytes = 0;
+        let mut chunks_received = 0;
+
         // Process incoming audio data
         loop {
             select! {
                 // Check for cancellation
                 _ = cancel.cancelled() => {
-                    log::info!("TTS: Synthesis cancelled");
+                    log::debug!("TTS: Synthesis cancelled");
                     self.sink.stop().await?;
                     return Err(TTSError::Cancelled);
                 }
@@ -168,11 +186,15 @@ impl ElevenLabsTTS {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Binary(audio_data))) => {
-                            log::debug!("TTS: Received {} bytes of audio data", audio_data.len());
+                            chunks_received += 1;
+                            total_audio_bytes += audio_data.len();
+                            log::debug!("TTS: Received chunk {} ({} bytes, total: {} bytes)", 
+                                      chunks_received, audio_data.len(), total_audio_bytes);
+                            
                             match self.sink.write(audio_data.as_slice()).await {
-                                                                  Ok(_) => log::debug!("TTS: Successfully wrote audio data to sink"),
+                                Ok(_) => log::debug!("TTS: Successfully wrote chunk {} to sink", chunks_received),
                                 Err(e) => {
-                                    log::error!("TTS: Failed to write audio data to sink: {}", e);
+                                    log::error!("TTS: Failed to write audio chunk {} to sink: {}", chunks_received, e);
                                     return Err(e.into());
                                 }
                             }
@@ -181,45 +203,41 @@ impl ElevenLabsTTS {
                             log::debug!("TTS: Received text message: {}", text);
                             let text_str = text.to_string();
                             if text_str.contains("error") {
-                                log::error!("TTS: Error in text message");
+                                log::error!("TTS: Error in text message: {}", text_str);
                                 return Err(TTSError::ApiError {
                                     status: 400,
                                     message: text_str,
                                 });
-                            }
-
-                            // Parse the JSON response
-                            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&text_str) {
-                                if let Some(audio_b64) = response.get("audio").and_then(|a| a.as_str()) {
-                                    // Decode base64 audio data
-                                    let audio_data = general_purpose::STANDARD.decode(audio_b64).map_err(|e| {
-                                        TTSError::Audio(AudioError::Base64DecodeError(format!(
-                                            "Base64 decode error: {}",
-                                            e
-                                        )))
-                                    })?;
-
-                                    log::debug!("TTS: Decoded {} bytes of audio data from base64", audio_data.len());
-
-                                    // Write audio data in smaller chunks
-                                    const CHUNK_SIZE: usize = 1024; // 1KB chunks
-                                    for chunk in audio_data.chunks(CHUNK_SIZE) {
-                                        match self.sink.write(chunk).await {
-                                            Ok(_) => log::debug!("TTS: Successfully wrote {} bytes to sink", chunk.len()),
+                            } else if text_str.contains("\"audio\"") {
+                                // Handle audio data in text message
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text_str) {
+                                    if let Some(audio_b64) = json.get("audio").and_then(|a| a.as_str()) {
+                                        chunks_received += 1;
+                                        let audio_data = general_purpose::STANDARD.decode(audio_b64)
+                                            .map_err(|e| TTSError::Audio(AudioError::Base64DecodeError(e.to_string())))?;
+                                        total_audio_bytes += audio_data.len();
+                                        log::debug!("TTS: Decoded base64 chunk {} ({} bytes, total: {} bytes)", 
+                                                  chunks_received, audio_data.len(), total_audio_bytes);
+                                        
+                                        match self.sink.write(&audio_data).await {
+                                            Ok(_) => log::debug!("TTS: Successfully wrote decoded chunk {} to sink", chunks_received),
                                             Err(e) => {
-                                                log::error!("TTS: Failed to write audio chunk to sink: {}", e);
+                                                log::error!("TTS: Failed to write decoded chunk {} to sink: {}", chunks_received, e);
                                                 return Err(e.into());
                                             }
                                         }
-                                        // Small delay between chunks to allow playback to catch up
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                                     }
                                 }
+                            } else if text_str.contains("\"done\"") {
+                                log::debug!("TTS: Synthesis complete - received {} chunks ({} bytes total)", 
+                                         chunks_received, total_audio_bytes);
+                                return Ok(());
                             }
                         }
                         Some(Ok(Message::Close(_))) => {
-                            log::info!("TTS: Received close frame, synthesis complete");
-                            break;
+                            log::debug!("TTS: Received close frame, synthesis complete");
+                            log::debug!("TTS: Final stats - {} chunks, {} bytes total", chunks_received, total_audio_bytes);
+                            return Ok(());
                         }
                         Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
                             // Ignore control frames
@@ -231,15 +249,13 @@ impl ElevenLabsTTS {
                         }
                         None => {
                             log::info!("TTS: WebSocket stream ended");
-                            break;
+                            log::info!("TTS: Final stats - {} chunks, {} bytes total", chunks_received, total_audio_bytes);
+                            return Ok(());
                         }
                     }
                 }
             }
         }
-
-        log::info!("TTS: Synthesis completed successfully");
-        Ok(())
     }
 
     /// Get available voices

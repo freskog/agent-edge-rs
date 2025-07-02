@@ -3,6 +3,7 @@ use crate::config::ConfigError;
 use crate::stt::STTError;
 use std::io;
 use thiserror::Error;
+use cpal::{DeviceNameError, DevicesError};
 
 pub type Result<T> = std::result::Result<T, EdgeError>;
 
@@ -43,6 +44,9 @@ pub enum EdgeError {
 
     #[error("Unknown error: {0}")]
     Unknown(String),
+
+    #[error("Audio device error: {0}")]
+    AudioDevice(String),
 }
 
 // Add conversion from ConfigError to EdgeError
@@ -63,5 +67,36 @@ impl From<crate::audio_capture::AudioCaptureError> for EdgeError {
 impl From<crate::stt::STTError> for EdgeError {
     fn from(err: crate::stt::STTError) -> Self {
         EdgeError::STT(err)
+    }
+}
+
+impl From<DevicesError> for EdgeError {
+    fn from(err: DevicesError) -> Self {
+        EdgeError::AudioDevice(err.to_string())
+    }
+}
+
+impl From<DeviceNameError> for EdgeError {
+    fn from(err: DeviceNameError) -> Self {
+        EdgeError::AudioDevice(err.to_string())
+    }
+}
+
+// Wrapper types for device errors
+#[derive(Debug)]
+pub struct DevicesErrorWrapper(pub DevicesError);
+
+#[derive(Debug)]
+pub struct DeviceNameErrorWrapper(pub DeviceNameError);
+
+impl From<DevicesErrorWrapper> for EdgeError {
+    fn from(err: DevicesErrorWrapper) -> Self {
+        EdgeError::AudioDevice(err.0.to_string())
+    }
+}
+
+impl From<DeviceNameErrorWrapper> for EdgeError {
+    fn from(err: DeviceNameErrorWrapper) -> Self {
+        EdgeError::AudioDevice(err.0.to_string())
     }
 }

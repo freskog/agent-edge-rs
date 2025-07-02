@@ -130,7 +130,7 @@ pub struct PipelineConfig {
     /// Processing parameters
     pub chunk_size: usize, // Audio chunk size: 1280 samples = 80ms at 16kHz
     pub sample_rate: u32, // Audio sampling rate: 16000 Hz (required by models)
-    pub confidence_threshold: f32, // Detection threshold: 0.3 (30% confidence)
+    pub confidence_threshold: f32, // Detection threshold: 0.09 (9% confidence)
 
     /// Windowing parameters  
     pub window_size: usize, // Embedding window size: 16 embeddings = ~1.28s context
@@ -154,7 +154,7 @@ impl Default for PipelineConfig {
             wakeword_model_path: "models/hey_mycroft_v0.1.tflite".to_string(),
             chunk_size: 1280,
             sample_rate: 16000,
-            confidence_threshold: 0.3, // Lower threshold for better real-world performance
+            confidence_threshold: 0.09, // Lower threshold to match observed wakeword probabilities
             window_size: 16,
             overlap_size: 8,
             debounce_duration_ms: 1000, // 1 second debounce (OpenWakeWord uses 1.25s in tests)
@@ -311,60 +311,25 @@ impl DetectionPipeline {
             )));
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 1: MELSPECTROGRAM FEATURE EXTRACTION
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Convert raw audio (1280 samples) into mel-scale frequency features (160 features)
-        //
-        // Input:  [1280] f32 samples (80ms at 16kHz)
-        // Output: [1, 1, 5, 32] = 160 features (5 time frames × 32 mel bins)
-        //
-        // The melspectrogram represents audio in a perceptually meaningful way, similar to
-        // how the human auditory system processes sound. Each of the 5 time frames represents
-        // ~16ms of audio, and the 32 mel bins capture frequency content from low to high.
-        let melspec_features = self.melspectrogram_model.predict(audio_chunk)?;
-        log::debug!(
-            "✓ Melspectrogram: {} samples → {} mel features (5 frames × 32 bins)",
-            audio_chunk.len(),
-            melspec_features.len()
-        );
+        log::debug!("🎵 Processing audio chunk with {} samples", audio_chunk.len());
 
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 2: MELSPECTROGRAM ACCUMULATION
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Accumulate melspectrogram outputs in a sliding window to build sufficient temporal
-        // context for the embedding model. We need 76 consecutive mel frames, so we collect
-        // ~16 melspec outputs (16 × 5 = 80 frames) and take the most recent 76.
-        self.melspec_accumulator.push_back(melspec_features);
+        // Process audio through melspectrogram model
+        let mel_features = self.melspectrogram_model.predict(audio_chunk)?;
+        log::debug!("🎵 Processed mel features: {} values", mel_features.len());
 
-        // Check if accumulator has grown too large (2x needed size)
-        if self.melspec_accumulator.len() > self.melspec_frames_needed * 2 {
-            log::warn!("🔄 Melspec accumulator too large - resetting to prevent stall");
-            self.reset_melspec_accumulator();
-            return Ok(WakewordDetection {
-                detected: false,
-                confidence: 0.0,
-                timestamp: std::time::Instant::now(),
-            });
+        // Accumulate mel features
+        self.melspec_accumulator.push_back(mel_features);
+        log::debug!("🎵 Mel accumulator size: {}", self.melspec_accumulator.len());
+
+        // Keep only the most recent frames needed
+        while self.melspec_accumulator.len() > self.melspec_frames_needed {
+            self.melspec_accumulator.pop_front();
         }
 
-        if self.melspec_accumulator.len() > self.melspec_frames_needed {
-            self.melspec_accumulator.pop_front(); // Maintain sliding window
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 3: CHECK MELSPECTROGRAM READINESS
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Ensure we have enough melspectrogram outputs to proceed. During startup, we need
-        // to accumulate sufficient context before meaningful embedding generation is possible.
+        // Check if we have enough frames for embedding
         if self.melspec_accumulator.len() < self.melspec_frames_needed {
-            log::debug!(
-                "⏳ Accumulating melspec context: {}/{} outputs (need {}×5={} frames for embedding)",
-                self.melspec_accumulator.len(),
-                self.melspec_frames_needed,
-                self.melspec_frames_needed,
-                self.melspec_frames_needed * 5
-            );
+            log::debug!("⏳ Waiting for more mel frames ({}/{})", 
+                self.melspec_accumulator.len(), self.melspec_frames_needed);
             return Ok(WakewordDetection {
                 detected: false,
                 confidence: 0.0,
@@ -372,198 +337,111 @@ impl DetectionPipeline {
             });
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 4: PREPARE EMBEDDING INPUT
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Reshape accumulated melspectrogram features for the embedding model.
-        //
-        // Process: Flatten all melspec outputs → Extract 76 most recent frames → Pad if needed
-        // Target:  [1, 76, 32, 1] = 2432 features for embedding model input
-        //
-        // Why 76 frames? This provides ~1.5 seconds of audio context (76 × 20ms = 1.52s),
-        // which is optimal for capturing phonetic patterns while remaining computationally efficient.
-        let flattened_melspecs: Vec<f32> =
-            self.melspec_accumulator.iter().flatten().cloned().collect();
-
-        // Calculate frame extraction: each frame is 32 mel features
-        let total_frames = flattened_melspecs.len() / 32;
-        let start_frame = if total_frames >= 76 {
-            total_frames - 76 // Take most recent 76 frames
-        } else {
-            0 // Use all available frames if less than 76
-        };
-
-        // Extract the target frame range
-        let end_frame = (start_frame + 76).min(total_frames);
-        let embedding_input: Vec<f32> =
-            flattened_melspecs[start_frame * 32..end_frame * 32].to_vec();
-
-        // Zero-pad to ensure consistent 2432-feature input (76 × 32)
-        // During startup, this ensures the model receives properly sized input
-        let mut padded_input = vec![0.0f32; 2432];
-        let copy_len = embedding_input.len().min(2432);
-        padded_input[2432 - copy_len..].copy_from_slice(&embedding_input[..copy_len]);
-
-        log::debug!(
-            "✓ Embedding prep: {} melspec outputs → {} total frames → {} target frames → {} features",
-            self.melspec_accumulator.len(),
-            total_frames,
-            end_frame - start_frame,
-            padded_input.len()
-        );
-
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 5: EMBEDDING GENERATION
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Generate semantic embeddings from melspectrogram features.
-        //
-        // Input:  [1, 76, 32, 1] = 2432 mel features (76 time frames × 32 mel bins)
-        // Output: [1, 1, 1, 96] = 96 embedding features
-        //
-        // The embedding model transforms raw acoustic features into a dense semantic
-        // representation that captures phonetic and linguistic patterns relevant for
-        // wake word detection. This abstraction makes the system more robust to speaker
-        // variations, accents, and background noise.
-        let embedding_features = self.embedding_model.predict(&padded_input)?;
-        log::debug!(
-            "✓ Embedding: {} mel features → {} embedding features",
-            padded_input.len(),
-            embedding_features.len()
-        );
-
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 6: EMBEDDING WINDOW MANAGEMENT
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Maintain a sliding window of embeddings for wake word detection. We need 16
-        // consecutive embeddings (representing ~1.28 seconds of audio) to provide sufficient
-        // temporal context for accurate wake word classification.
-        self.embedding_window.push_back(embedding_features);
-
-        // Check if window has grown too large (2x needed size)
-        if self.embedding_window.len() > self.config.window_size * 2 {
-            log::warn!("🔄 Embedding window too large - resetting to prevent stall");
-            self.embedding_window.clear();
-            return Ok(WakewordDetection {
-                detected: false,
-                confidence: 0.0,
-                timestamp: std::time::Instant::now(),
-            });
-        }
-
-        if self.embedding_window.len() > self.config.window_size {
-            self.embedding_window.pop_front(); // Maintain fixed window size
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 7: CHECK EMBEDDING READINESS
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Always try to detect with whatever embeddings we have (minimum 1)
-        // Zero-padding will handle cases where we have fewer than 16 embeddings
-        if self.embedding_window.is_empty() {
-            log::debug!("⏳ No embeddings yet - waiting for first embedding");
-            return Ok(WakewordDetection {
-                detected: false,
-                confidence: 0.0,
-                timestamp: std::time::Instant::now(),
-            });
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 8: PREPARE WAKE WORD INPUT
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Flatten the embedding window for wake word model input, padding if necessary.
-        //
-        // Target: 16 embeddings × 96 features = 1536 total features
-        // Always zero-pad to full size - this allows detection even with just 1 embedding
-        let mut flattened_embeddings: Vec<f32> =
-            self.embedding_window.iter().flatten().cloned().collect();
-
-        // Ensure we have exactly 1536 features for the model (16 × 96)
-        let target_size = self.config.window_size * 96; // 16 × 96 = 1536
-        if flattened_embeddings.len() < target_size {
-            // Pad with zeros at the beginning (older time steps)
-            let padding_needed = target_size - flattened_embeddings.len();
-            let mut padded = vec![0.0f32; padding_needed];
-            padded.extend(flattened_embeddings);
-            flattened_embeddings = padded;
-        }
-
-        log::debug!(
-            "✓ Wake word prep: {} embeddings × 96 features = {} total features (zero-padded to {})",
-            self.embedding_window.len(),
-            self.embedding_window.len() * 96,
-            flattened_embeddings.len()
-        );
-
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 9: WAKE WORD DETECTION
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Run the final classification to determine if the target wake word is present.
-        //
-        // Input:  [1, 16, 96] = 1536 embedding features (16 time steps × 96 features)
-        // Output: [1, 1] = single confidence score (0.0 - 1.0)
-        //
-        // The wake word model is specifically trained on "Hey Mycroft" variations and
-        // produces a confidence score indicating the likelihood that the target phrase
-        // is present in the current audio window.
-        let confidence = self.wakeword_model.predict(&flattened_embeddings)?;
-        let above_threshold = confidence >= self.config.confidence_threshold;
-
-        // Always log confidence for debugging
-        log::debug!(
-            "🎯 Wake word confidence: {:.4} (threshold: {:.2})",
-            confidence,
-            self.config.confidence_threshold
-        );
-
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // STEP 10: SIMPLE DETECTION GATING
-        // ═══════════════════════════════════════════════════════════════════════════════════
-        // Use simple flag-based gating: after detection, ignore until confidence drops below threshold
-        let mut detected = false;
-        let now = std::time::Instant::now();
-
-        if above_threshold && !self.ignore_detections {
-            // Above threshold and not ignoring - allow detection
-            detected = true;
-            self.ignore_detections = true; // Set ignore flag to prevent immediate re-detection
-            log::info!("🎉 WAKEWORD DETECTED! Confidence: {:.3}", confidence);
-
-            // Trigger LED feedback for wake word detection
-            if let Some(ref led_ring) = self.led_ring {
-                if let Err(e) = led_ring.set_color(
-                    self.config.led_detected_color.0,
-                    self.config.led_detected_color.1,
-                    self.config.led_detected_color.2,
-                ) {
-                    log::warn!("Failed to set LED detection color: {}", e);
+        // Flatten mel features for embedding model
+        // Extract exactly 76 frames from the available 80 frames (16 outputs × 5 frames each)
+        // This provides the optimal temporal context for the embedding model
+        let mut flattened_features = Vec::with_capacity(76 * 32); // 2432 features
+        let total_frames_available = self.melspec_accumulator.len() * 5; // Each melspec output has 5 frames
+        
+        if total_frames_available >= 76 {
+            // Take the most recent 76 frames from the available frames
+            let frames_to_skip = total_frames_available - 76;
+            let mut frame_count = 0;
+            
+            for mel_output in &self.melspec_accumulator {
+                // Each mel_output is [5, 32] = 160 features (5 frames × 32 mel bins)
+                for frame_idx in 0..5 {
+                    if frame_count >= frames_to_skip {
+                        // Take this frame (32 mel bins)
+                        let start_idx = frame_idx * 32;
+                        let end_idx = start_idx + 32;
+                        flattened_features.extend(&mel_output[start_idx..end_idx]);
+                    }
+                    frame_count += 1;
+                    if flattened_features.len() >= 76 * 32 {
+                        break;
+                    }
+                }
+                if flattened_features.len() >= 76 * 32 {
+                    break;
                 }
             }
-        } else if above_threshold && self.ignore_detections {
-            // Above threshold but ignoring detections - suppress
-            log::debug!(
-                "🔇 Detection suppressed: confidence {:.3} (ignoring detections)",
-                confidence
-            );
-        } else if !above_threshold && self.ignore_detections {
-            // Below threshold and currently ignoring - reset ignore flag
-            self.ignore_detections = false;
-            log::debug!(
-                "🔄 Confidence dropped to {:.3} - ready for next detection",
-                confidence
-            );
         } else {
-            // Below threshold and not ignoring - normal state
-            log::debug!(
-                "📊 Detection confidence: {:.4} (below threshold)",
-                confidence
-            );
+            // Not enough frames yet, return early
+            log::debug!("⏳ Waiting for more mel frames ({} frames available, need 76)", total_frames_available);
+            return Ok(WakewordDetection {
+                detected: false,
+                confidence: 0.0,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+        
+        log::debug!("🎵 Extracted 76 frames ({} features) from {} available frames", 
+            flattened_features.len(), total_frames_available);
+
+        // Process through embedding model
+        let embedding = self.embedding_model.predict(&flattened_features)?;
+        log::debug!("🧠 Generated embedding: {} features", embedding.len());
+
+        // Add embedding to window
+        self.embedding_window.push_back(embedding);
+        log::debug!("🧠 Embedding window size: {}", self.embedding_window.len());
+
+        // Keep only the most recent embeddings
+        while self.embedding_window.len() > self.config.window_size {
+            self.embedding_window.pop_front();
+        }
+
+        // Check if we have enough embeddings
+        if self.embedding_window.len() < self.config.window_size {
+            log::debug!("⏳ Waiting for more embeddings ({}/{})", 
+                self.embedding_window.len(), self.config.window_size);
+            return Ok(WakewordDetection {
+                detected: false,
+                confidence: 0.0,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+
+        // Flatten embeddings for wakeword model
+        let mut features = Vec::with_capacity(self.config.window_size * 96);
+        for embedding in &self.embedding_window {
+            features.extend(embedding);
+        }
+        log::debug!("🧠 Flattened {} embeddings into {} features", 
+            self.embedding_window.len(), features.len());
+
+        // Get wakeword confidence
+        let confidence = self.wakeword_model.predict(&features)?;
+        
+        // Log all confidence scores for debugging
+        log::debug!("🎯 Wakeword confidence: {:.3}", confidence);
+
+        // Check if we should ignore this detection
+        if self.ignore_detections {
+            if confidence < self.config.confidence_threshold * 0.5 {
+                // Reset ignore flag when confidence drops significantly
+                log::debug!("🔄 Resetting ignore flag (confidence dropped to {:.3})", confidence);
+                self.ignore_detections = false;
+            }
+            return Ok(WakewordDetection {
+                detected: false,
+                confidence,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+
+        let detected = confidence >= self.config.confidence_threshold;
+        if detected {
+            log::info!("🎯 Wakeword detected with {:.1}% confidence!", confidence * 100.0);
+            // Set ignore flag to prevent multiple detections
+            self.ignore_detections = true;
         }
 
         Ok(WakewordDetection {
             detected,
             confidence,
-            timestamp: now,
+            timestamp: std::time::Instant::now(),
         })
     }
 
@@ -652,7 +530,7 @@ mod tests {
         let config = PipelineConfig::default();
         assert_eq!(config.chunk_size, 1280);
         assert_eq!(config.sample_rate, 16000);
-        assert_eq!(config.confidence_threshold, 0.3);
+        assert_eq!(config.confidence_threshold, 0.09);
         assert_eq!(config.window_size, 16);
         assert_eq!(config.overlap_size, 8);
     }
