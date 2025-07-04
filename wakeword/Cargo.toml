@@ -1,0 +1,42 @@
+[package]
+name = "wakeword"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Wakeword detection binary using TensorFlow Lite with XNNPACK"
+license.workspace = true
+
+[features]
+default = ["xnnpack"]
+xnnpack = []
+
+[dependencies]
+audio_api = { path = "../audio_api" }
+
+# TensorFlow Lite (with XNNPACK)
+tflitec = "0.6.0"
+
+# Audio processing
+cpal = "0.16.0"
+
+# Audio file I/O
+hound = "3.5"
+num-traits = "0.2"
+
+# Common dependencies from workspace
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+
+# Additional utilities
+thiserror = "2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+strum = { version = "0.26", features = ["derive"] }
+
+[build-dependencies]
+cc = "1.0"

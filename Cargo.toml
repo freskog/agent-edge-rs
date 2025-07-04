@@ -1,88 +1,18 @@
-[package]
-name = "agent-edge-rs"
+[workspace]
+members = ["agent", "wakeword", "audio_api"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Fredrik Skogberg <freskog@gmail.com>"]
-description = "Wakeword-only edge client for low-powered devices"
+authors = ["Your Name <your.email@example.com>"]
+description = "Agent Edge RS - Split into wakeword, agent, and audio-interface binaries"
+license = "MIT"
 
-[features]
-# Default features - LED ring enabled by default (will be available on Linux, stub on others)
-default = ["led_ring"]
-led_ring = ["rusb"]
-
-# Test features for different test categories
-test-integration = [] # Full integration tests with external dependencies
-test-audio = []       # Tests requiring audio devices
-test-api = []         # Tests requiring API keys
-
-[dependencies]
-# Core utilities
+[workspace.dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 log = "0.4"
-thiserror = "2.0.10"
-env_logger = "0.11.8"
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
-strum = { version = "0.26", features = ["derive"] }
-async-trait = "0.1"
-
-# Audio processing
-hound = "3.5"
-
-# Machine learning
-tflitec = "0.6.0"
-
-# Async runtime
-tokio = { version = "1.45.1", features = ["full"] }
-tokio-stream = "0.1"
-async-stream = "0.3"
-
-# HTTP client and JSON
-reqwest = { version = "0.12.20", features = ["json", "multipart", "stream"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-tokio-tungstenite = { version = "0.25", features = ["native-tls"] }
-url = "2.5"
-futures-util = "0.3"
-http = "1.1"
-base64 = "0.22"
-
-# Security
-secrecy = "0.10.3"
-dotenvy = "0.15.7"
-
-# Time handling
-chrono = { version = "0.4", features = ["serde"] }
-
-# USB control for LED ring (optional)
-rusb = { version = "0.9", optional = true }
-
-# Audio playback and capture
-cpal = "0.16.0"
-
-voice_activity_detector = "0.2.0"
-ort-sys = "=2.0.0-rc.9"
-
-# Audio file I/O for recording and testing
-num-traits = "0.2.19"
-tokio-util = "0.7.15"
-regex = "1.11.1"
-
-# Added from the code block
-once_cell = "1.19"
-
-rubato = "0.16.2"
-dasp_sample = "0.11"
-dasp_frame = "0.11"
-
-[dev-dependencies]
-serial_test = "2.0.0"
-tempfile = "3.10"
-test-log = "0.2.15"
-env_logger = "0.11.2"
-
-[[bin]]
-name = "agent-edge"
-path = "src/main.rs"
-
-[profile.test]
-test-threads = 1
+env_logger = "0.10"
+clap = { version = "4.0", features = ["derive"] }
+dotenvy = "0.15"

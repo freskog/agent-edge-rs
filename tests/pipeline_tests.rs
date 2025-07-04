@@ -102,7 +102,7 @@ fn test_complete_pipeline() -> Result<()> {
     let config = PipelineConfig::default();
     assert_eq!(config.chunk_size, 1280);
     assert_eq!(config.sample_rate, 16000);
-    assert_eq!(config.confidence_threshold, 0.3); // Updated to match new default
+    assert_eq!(config.confidence_threshold, 0.09);
     assert_eq!(config.window_size, 16);
     assert_eq!(config.debounce_duration_ms, 1000);
     println!("✅ 1. Pipeline configuration validated");

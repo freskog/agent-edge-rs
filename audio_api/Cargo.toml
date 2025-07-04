@@ -1,0 +1,22 @@
+[package]
+name = "audio_api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Audio input/output interface for agent-edge-rs"
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+thiserror = "2.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+cpal = "0.16.0"
+rubato = "0.16.2"
