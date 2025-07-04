@@ -41,7 +41,7 @@ impl Default for AudioCaptureConfig {
         Self {
             device_id: None,
             channel: 0,
-            sample_rate: 16000, // 16kHz for speech
+            sample_rate: 16000, // 16kHz for audio processing
             channels: 1,        // Mono
             buffer_size: 1280,  // 80ms at 16kHz
         }

@@ -15,11 +15,12 @@ pub mod models;
 pub mod speech_producer;
 pub mod stt;
 pub mod tts;
+pub mod types;
 pub mod user_instruction;
 
-// Re-export key types for convenience
-pub use audio_api::error::{EdgeError, Result};
-pub use stt::{FireworksSTT, STTConfig};
+// Re-export common types
+pub use error::{AgentError as EdgeError, Result as EdgeResult};
+pub use types::*;
 
 /// Represents a chunk of audio data captured from the microphone.
 ///

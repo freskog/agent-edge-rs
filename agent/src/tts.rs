@@ -3,7 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use once_cell::sync::OnceCell;
 use serde_json::json;
 
-use audio_api::{AudioError, AudioSink};
+use crate::types::{AudioSink, AudioSinkConfig, StubAudioSink};
+use crate::{EdgeError, EdgeResult};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::select;
@@ -23,7 +24,7 @@ pub enum TTSError {
     Connection(String),
 
     #[error("Audio error: {0}")]
-    Audio(#[from] AudioError),
+    Audio(#[from] EdgeError),
 
     #[error("Session cancelled")]
     Cancelled,
@@ -178,7 +179,7 @@ impl ElevenLabsTTS {
                 // Check for cancellation
                 _ = cancel.cancelled() => {
                     log::debug!("TTS: Synthesis cancelled");
-                    self.sink.stop().await?;
+                    self.sink.stop();
                     return Err(TTSError::Cancelled);
                 }
 
@@ -191,11 +192,11 @@ impl ElevenLabsTTS {
                             log::debug!("TTS: Received chunk {} ({} bytes, total: {} bytes)",
                                       chunks_received, audio_data.len(), total_audio_bytes);
 
-                            match self.sink.write(audio_data.as_slice()).await {
+                            match self.sink.write(audio_data.as_slice()) {
                                 Ok(_) => log::debug!("TTS: Successfully wrote chunk {} to sink", chunks_received),
                                 Err(e) => {
                                     log::error!("TTS: Failed to write audio chunk {} to sink: {}", chunks_received, e);
-                                    return Err(e.into());
+                                    return Err(TTSError::Audio(EdgeError::WriteError(e.to_string())));
                                 }
                             }
                         }
@@ -214,16 +215,16 @@ impl ElevenLabsTTS {
                                     if let Some(audio_b64) = json.get("audio").and_then(|a| a.as_str()) {
                                         chunks_received += 1;
                                         let audio_data = general_purpose::STANDARD.decode(audio_b64)
-                                            .map_err(|e| TTSError::Audio(AudioError::Base64DecodeError(e.to_string())))?;
+                                            .map_err(|e| TTSError::Audio(EdgeError::Base64DecodeError(e.to_string())))?;
                                         total_audio_bytes += audio_data.len();
                                         log::debug!("TTS: Decoded base64 chunk {} ({} bytes, total: {} bytes)",
                                                   chunks_received, audio_data.len(), total_audio_bytes);
 
-                                        match self.sink.write(&audio_data).await {
+                                        match self.sink.write(&audio_data) {
                                             Ok(_) => log::debug!("TTS: Successfully wrote decoded chunk {} to sink", chunks_received),
                                             Err(e) => {
                                                 log::error!("TTS: Failed to write decoded chunk {} to sink: {}", chunks_received, e);
-                                                return Err(e.into());
+                                                return Err(TTSError::Audio(EdgeError::WriteError(e.to_string())));
                                             }
                                         }
                                     }
@@ -282,13 +283,12 @@ impl ElevenLabsTTS {
         }
 
         let response_text = response.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&response_text).map_err(|e| {
-            TTSError::Audio(AudioError::InvalidJson(format!("Invalid JSON: {}", e)))
-        })?;
+        let json: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| TTSError::Audio(EdgeError::InvalidJson(format!("Invalid JSON: {}", e))))?;
 
         let voices_array = json["voices"]
             .as_array()
-            .ok_or_else(|| TTSError::Audio(AudioError::MissingField("voices".to_string())))?;
+            .ok_or_else(|| TTSError::Audio(EdgeError::MissingField("voices".to_string())))?;
 
         let mut voices = Vec::new();
 
@@ -330,7 +330,7 @@ impl ElevenLabsTTS {
     pub fn mp3_to_samples(&self, _mp3_data: &[u8]) -> Result<(Vec<f32>, u32), TTSError> {
         // This is a placeholder implementation
         // In a real implementation, you would use an MP3 decoder
-        Err(TTSError::Audio(AudioError::Mp3DecodingNotImplemented))
+        Err(TTSError::Audio(EdgeError::Mp3DecodingNotImplemented))
     }
 
     /// Save audio to file
@@ -338,7 +338,7 @@ impl ElevenLabsTTS {
         use tokio::fs;
 
         fs::write(filename, audio_data).await.map_err(|e| {
-            TTSError::Audio(AudioError::FailedToSaveAudio(format!(
+            TTSError::Audio(EdgeError::FailedToSaveAudio(format!(
                 "Failed to save audio: {}",
                 e
             )))
@@ -396,7 +396,8 @@ impl Voice {
 mod tests {
     use super::*;
     use crate::config::ApiConfig;
-    use audio_api::{AudioSink, CpalConfig, CpalSink};
+    use crate::types::{AudioSink, AudioSinkConfig, StubAudioSink};
+    use crate::{EdgeError, EdgeResult};
     use std::sync::Arc;
 
     fn get_api_key_or_skip() -> String {
@@ -413,7 +414,7 @@ mod tests {
     async fn test_tts_synthesis() {
         let api_key = get_api_key_or_skip();
         let config = TTSConfig::default();
-        let sink = match CpalSink::new(CpalConfig::default()) {
+        let sink = match StubAudioSink::new(AudioSinkConfig::default()) {
             Ok(sink) => Arc::new(sink) as Arc<dyn AudioSink>,
             Err(e) => {
                 log::warn!(
@@ -434,7 +435,7 @@ mod tests {
     async fn test_tts_cancellation() {
         let api_key = get_api_key_or_skip();
         let config = TTSConfig::default();
-        let sink = match CpalSink::new(CpalConfig::default()) {
+        let sink = match StubAudioSink::new(AudioSinkConfig::default()) {
             Ok(sink) => Arc::new(sink) as Arc<dyn AudioSink>,
             Err(e) => {
                 log::warn!(
@@ -466,8 +467,8 @@ mod tests {
         assert!(matches!(result, Err(TTSError::Cancelled)));
 
         // Verify sink is stopped by trying to write to it
-        let write_result = sink.write(&[0, 0]).await;
-        assert!(matches!(write_result, Err(AudioError::WriteError(_))));
+        let write_result = sink.write(&[0, 0]);
+        assert!(matches!(write_result, Err(EdgeError::WriteError(_))));
     }
 }
 
@@ -722,7 +723,7 @@ impl ElevenLabsStreamingTTS {
         if let Some(audio_b64) = response.get("audio").and_then(|a| a.as_str()) {
             // Decode base64 audio data
             let audio_data = general_purpose::STANDARD.decode(audio_b64).map_err(|e| {
-                TTSError::Audio(AudioError::Base64DecodeError(format!(
+                TTSError::Audio(EdgeError::Base64DecodeError(format!(
                     "Base64 decode error: {}",
                     e
                 )))

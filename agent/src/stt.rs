@@ -1,5 +1,3 @@
-use audio_api::events::SpeechEvent;
-use audio_api::SpeechChunk;
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use log::{info, warn};
 use serde::Deserialize;
@@ -13,6 +11,9 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
+
+use crate::types::{AudioChunk, AudioEvent, AudioSink, AudioSinkConfig, StubAudioSink};
+use crate::{EdgeError, EdgeResult};
 
 const MAX_CHUNKS_PER_BATCH: usize = 12; // Maximum number of chunks to collect in one batch
 
@@ -147,7 +148,7 @@ impl FireworksSTT {
     /// Returns (chunks, should_send_checkpoint, last_chunk_time)
     async fn collect_audio_chunks(
         &self,
-        speech_receiver: &mut broadcast::Receiver<SpeechChunk>,
+        speech_receiver: &mut broadcast::Receiver<AudioChunk>,
     ) -> (Vec<Vec<u8>>, bool, Option<Instant>) {
         let mut pcm_chunks = Vec::new();
         let mut should_send_checkpoint = false;
@@ -158,13 +159,13 @@ impl FireworksSTT {
             match speech_receiver.try_recv() {
                 Ok(chunk) => {
                     last_chunk_time = Some(chunk.timestamp);
-                    match chunk.speech_event {
-                        SpeechEvent::StartedSpeaking | SpeechEvent::Speaking => {
-                            if let Some(pcm_data) = self.samples_to_pcm(&chunk.samples_f32) {
+                    match chunk.audio_event {
+                        AudioEvent::StartedAudio | AudioEvent::Audio => {
+                            if let Some(pcm_data) = self.samples_to_pcm(&chunk.samples) {
                                 pcm_chunks.push(pcm_data);
                             }
                         }
-                        SpeechEvent::StoppedSpeaking => {
+                        AudioEvent::StoppedAudio => {
                             should_send_checkpoint = true;
                             break;
                         }
@@ -189,8 +190,8 @@ impl FireworksSTT {
     /// This allows us to include recent audio chunks that were captured during wakeword detection
     pub async fn transcribe_stream_with_context(
         self: Arc<Self>,
-        mut speech_receiver: broadcast::Receiver<SpeechChunk>,
-        context_chunks: Vec<SpeechChunk>,
+        mut speech_receiver: broadcast::Receiver<AudioChunk>,
+        context_chunks: Vec<AudioChunk>,
     ) -> Result<String, STTError> {
         let start_time = Instant::now();
         let stats = Arc::new(Mutex::new(TranscriptionStats::new()));
@@ -252,7 +253,7 @@ impl FireworksSTT {
             if !context_chunks.is_empty() {
                 let mut context_buffer = Vec::new();
                 for chunk in context_chunks {
-                    if let Some(pcm_data) = self_clone.samples_to_pcm(&chunk.samples_f32) {
+                    if let Some(pcm_data) = self_clone.samples_to_pcm(&chunk.samples) {
                         context_buffer.extend(pcm_data);
                     }
                 }
@@ -495,7 +496,7 @@ impl FireworksSTT {
     /// This method waits for speech events and only processes audio during active speech periods
     pub async fn transcribe_stream_with_events(
         self: Arc<Self>,
-        mut events_receiver: broadcast::Receiver<SpeechEvent>,
+        mut events_receiver: broadcast::Receiver<AudioEvent>,
     ) -> Result<String, STTError> {
         let start_time = Instant::now();
         let stats = Arc::new(Mutex::new(TranscriptionStats::new()));
@@ -567,16 +568,16 @@ impl FireworksSTT {
                 match events_receiver.recv().await {
                     Ok(event) => {
                         match event {
-                            SpeechEvent::StartedSpeaking => {
+                            AudioEvent::StartedAudio => {
                                 if !in_speech {
-                                    log::info!("STT: Speech started - beginning transcription");
+                                    log::info!("STT: Audio started - beginning transcription");
                                     in_speech = true;
                                 }
                             }
-                            SpeechEvent::Speaking => {
-                                // Continue speech - no action needed
+                            AudioEvent::Audio => {
+                                // Continue audio - no action needed
                             }
-                            SpeechEvent::StoppedSpeaking => {
+                            AudioEvent::StoppedAudio => {
                                 if in_speech {
                                     log::info!("STT: Speech stopped - sending final checkpoint");
                                     let final_checkpoint = json!({"checkpoint_id": "final"});
@@ -730,16 +731,13 @@ impl FireworksSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio_api::AudioChunk;
-    use audio_api::{AudioSink, CpalConfig, CpalSink};
+    use crate::types::AudioChunk;
+    use crate::types::{AudioSink, AudioSinkConfig, StubAudioSink};
     use std::time::Instant;
 
     // Helper function to create a test audio chunk
     fn create_test_chunk() -> AudioChunk {
-        AudioChunk {
-            samples: vec![0i16; 1280],
-            timestamp: Instant::now(),
-        }
+        AudioChunk::new([0.0f32; 1280], Instant::now(), AudioEvent::Audio)
     }
 
     #[test]

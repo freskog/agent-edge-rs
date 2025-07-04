@@ -1,9 +1,9 @@
+use crate::types::{AudioCaptureConfig, AudioChunk, AudioHub, StubAudioHub};
 use crate::{
     config::load_config,
     stt::{FireworksSTT, STTConfig},
 };
-use audio_api::error::{EdgeError, Result as EdgeResult};
-use audio_api::{SpeechChunk, SpeechHub};
+use crate::{EdgeError, EdgeResult};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,13 +64,13 @@ impl Default for Config {
 pub struct UserInstructionDetector {
     pipeline: DetectionPipeline,
     stt: Arc<FireworksSTT>,
-    speech_hub: Arc<SpeechHub>,
-    recent_chunks: VecDeque<SpeechChunk>, // Buffer for handling wakeword-to-STT transition
+    speech_hub: Arc<StubAudioHub>,
+    recent_chunks: VecDeque<AudioChunk>, // Buffer for handling wakeword-to-STT transition
 }
 
 impl UserInstructionDetector {
     /// Create a new detector with the given configuration
-    pub fn new(config: Config, speech_hub: Arc<SpeechHub>) -> EdgeResult<Self> {
+    pub fn new(config: Config, speech_hub: Arc<StubAudioHub>) -> EdgeResult<Self> {
         // Load API configuration
         let api_config = load_config().map_err(|e| EdgeError::Unknown(e.to_string()))?;
 
@@ -86,7 +86,7 @@ impl UserInstructionDetector {
     }
 
     /// Process a chunk for wakeword detection
-    fn check_wakeword(&mut self, chunk: &SpeechChunk) -> EdgeResult<Option<f32>> {
+    fn check_wakeword(&mut self, chunk: &AudioChunk) -> EdgeResult<Option<f32>> {
         // Update recent chunks buffer
         self.recent_chunks.push_back(chunk.clone());
         if self.recent_chunks.len() > 5 {
@@ -94,7 +94,7 @@ impl UserInstructionDetector {
         }
 
         let start_time = std::time::Instant::now();
-        match self.pipeline.process_audio_chunk(&chunk.samples_f32) {
+        match self.pipeline.process_audio_chunk(&chunk.samples) {
             Ok(detection) => {
                 let processing_time = start_time.elapsed();
                 if processing_time.as_millis() > 10 {
@@ -134,9 +134,9 @@ impl UserInstructionDetector {
         const MAX_CHUNKS_BEFORE_RESET: usize = 100; // ~8 seconds of audio
 
         // Get fresh receivers for this instruction cycle
-        let mut speech_rx = self.speech_hub.subscribe_audio(); // Raw audio for wake word detection
-                                                               // let stt_events_rx = self.speech_hub.subscribe_events(); // Speech events for STT
-                                                               // TODO: Implement event-based STT subscription when available
+        let mut speech_rx = self.speech_hub.subscribe(); // Raw audio for wake word detection
+                                                         // let stt_events_rx = self.speech_hub.subscribe_events(); // Speech events for STT
+                                                         // TODO: Implement event-based STT subscription when available
 
         log::info!("👂 Ready for wakeword - say 'Hey Mycroft'");
 
@@ -274,14 +274,14 @@ impl UserInstructionDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio_api::AudioCaptureConfig;
+    use crate::types::AudioCaptureConfig;
     use std::env;
     use std::sync::Arc;
 
     // Helper function to check environment requirements
     fn check_test_requirements() -> (bool, bool) {
         let has_api_key = env::var("FIREWORKS_API_KEY").is_ok();
-        let has_audio = SpeechHub::new(AudioCaptureConfig::default()).is_ok();
+        let has_audio = StubAudioHub::new(AudioCaptureConfig::default()).is_ok();
         (has_api_key, has_audio)
     }
 
@@ -318,7 +318,7 @@ mod tests {
         }
 
         // Create speech hub
-        let speech_hub = Arc::new(SpeechHub::new(AudioCaptureConfig::default()).unwrap());
+        let speech_hub = Arc::new(StubAudioHub::new(AudioCaptureConfig::default()).unwrap());
 
         // Create detector
         let config = Config::default();
@@ -340,7 +340,7 @@ mod tests {
         }
 
         // Test just the audio components without API dependency
-        let speech_hub_result = SpeechHub::new(AudioCaptureConfig::default());
+        let speech_hub_result = StubAudioHub::new(AudioCaptureConfig::default());
         assert!(speech_hub_result.is_ok());
         println!("✅ Audio device is available and working");
     }

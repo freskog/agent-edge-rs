@@ -1,7 +1,7 @@
-use audio_api::EdgeError;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait};
 use std::env;
+use std::iter;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -11,10 +11,9 @@ use agent::config;
 use agent::llm::integration::LLMIntegration;
 use agent::stt::STTConfig;
 use agent::tts::{ElevenLabsTTS, TTSConfig};
+use agent::types::StubAudioHub;
 use agent::user_instruction::{Config as UserInstructionConfig, UserInstructionDetector};
-use audio_api::AudioSink;
-use audio_api::CpalConfig;
-use audio_api::CpalSink;
+use agent::{AudioSink, AudioSinkConfig, EdgeError, StubAudioSink};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -29,7 +28,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), EdgeError> {
+async fn main() -> anyhow::Result<()> {
     // Initialize logging
     env_logger::init();
     log::info!("🚀 Initializing agent-edge-rs");
@@ -40,24 +39,30 @@ async fn main() -> Result<(), EdgeError> {
     if args.list_devices {
         let host = cpal::default_host();
         println!("\nAvailable output devices:");
-        for device in host
-            .output_devices()
-            .map_err(|e| audio_api::error::DevicesErrorWrapper(e))?
-        {
-            let name = device
-                .name()
-                .map_err(|e| audio_api::error::DeviceNameErrorWrapper(e))?;
-            println!("  - {}", name);
+        match host.output_devices() {
+            Ok(devices) => {
+                for device in devices {
+                    let name = device.name().unwrap_or_else(|e| format!("<error: {}>", e));
+                    println!("  - {}", name);
+                }
+            }
+            Err(e) => {
+                println!("<error: {}>", e);
+                return Ok(());
+            }
         }
         println!("\nAvailable input devices:");
-        for device in host
-            .input_devices()
-            .map_err(|e| audio_api::error::DevicesErrorWrapper(e))?
-        {
-            let name = device
-                .name()
-                .map_err(|e| audio_api::error::DeviceNameErrorWrapper(e))?;
-            println!("  - {}", name);
+        match host.input_devices() {
+            Ok(devices) => {
+                for device in devices {
+                    let name = device.name().unwrap_or_else(|e| format!("<error: {}>", e));
+                    println!("  - {}", name);
+                }
+            }
+            Err(e) => {
+                println!("<error: {}>", e);
+                return Ok(());
+            }
         }
         return Ok(());
     }
@@ -80,9 +85,10 @@ async fn main() -> Result<(), EdgeError> {
     }
 
     // Create speech hub for audio processing
-    let speech_hub = Arc::new(audio_api::speech_producer::SpeechHub::new(
-        audio_api::audio_capture::AudioCaptureConfig::default(),
-    )?);
+    let speech_hub = Arc::new(
+        StubAudioHub::new(agent::types::AudioCaptureConfig::default())
+            .map_err(|e| anyhow::anyhow!(e))?,
+    );
     log::info!("🎤 Speech hub initialized");
     log::debug!("🔧 Speech hub created successfully");
 
@@ -114,8 +120,8 @@ async fn main() -> Result<(), EdgeError> {
     // Initialize TTS
     log::debug!("🔧 Creating audio sink");
     let audio_sink = Arc::new(
-        CpalSink::new(CpalConfig {
-            device_name: args.output_device,
+        StubAudioSink::new(AudioSinkConfig {
+            device_id: args.output_device,
             ..Default::default()
         })
         .map_err(|e| EdgeError::Audio(format!("Audio sink failed: {}", e)))?,

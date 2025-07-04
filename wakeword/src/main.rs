@@ -1,4 +1,3 @@
-use audio_api::{load_env, WakewordConfig};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -18,10 +17,14 @@ struct Args {
     device: Option<String>,
 }
 
+fn load_env() {
+    // TODO: Implement local env loading or use dotenv directly
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load environment variables
-    load_env()?;
+    load_env();
 
     // Initialize logging
     env_logger::init();
