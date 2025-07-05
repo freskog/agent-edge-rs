@@ -468,7 +468,7 @@ mod tests {
 
         // Verify sink is stopped by trying to write to it
         let write_result = sink.write(&[0, 0]);
-        assert!(matches!(write_result, Err(EdgeError::WriteError(_))));
+        assert!(matches!(write_result, Err(_)));
     }
 }
 

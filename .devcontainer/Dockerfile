@@ -35,6 +35,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     man-db \
     locales \
     ca-certificates \
+    protobuf-compiler \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 

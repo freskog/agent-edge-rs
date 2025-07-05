@@ -162,8 +162,10 @@ impl AudioCapture {
         T: Sample + SizedSample + Send + Sync + 'static,
         f32: FromSample<T>,
     {
-        let mut sample_buffer = [0.0f32; CHUNK_SIZE];
-        let mut sample_count = 0;
+        // Use Arc<Mutex> to share state between callbacks
+        use std::sync::{Arc, Mutex};
+
+        let buffer_state = Arc::new(Mutex::new(([0.0f32; CHUNK_SIZE], 0usize)));
 
         device
             .build_input_stream(
@@ -174,20 +176,28 @@ impl AudioCapture {
                         if let Some(sample) = frame.get(channel as usize) {
                             let value = f32::from_sample(*sample);
 
-                            // Add sample to buffer
-                            if sample_count < CHUNK_SIZE {
-                                sample_buffer[sample_count] = value;
-                                sample_count += 1;
-                            }
+                            // Update buffer state
+                            if let Ok(mut state) = buffer_state.lock() {
+                                let (ref mut sample_buffer, ref mut sample_count) = *state;
 
-                            // If we have enough samples, send a chunk
-                            if sample_count >= CHUNK_SIZE {
-                                let chunk = sample_buffer;
-                                sample_buffer = [0.0f32; CHUNK_SIZE];
-                                sample_count = 0;
+                                // Add sample to buffer
+                                if *sample_count < CHUNK_SIZE {
+                                    sample_buffer[*sample_count] = value;
+                                    *sample_count += 1;
+                                }
 
-                                // Send chunk (ignore errors - receiver might be gone)
-                                let _ = sender.send(chunk);
+                                // If we have enough samples, send a chunk
+                                if *sample_count >= CHUNK_SIZE {
+                                    let chunk = *sample_buffer;
+                                    *sample_buffer = [0.0f32; CHUNK_SIZE];
+                                    *sample_count = 0;
+
+                                    // Try to send chunk non-blocking
+                                    if let Err(_) = sender.try_send(chunk) {
+                                        // Channel is full or closed, drop the chunk
+                                        log::debug!("Audio capture: dropped chunk (channel full)");
+                                    }
+                                }
                             }
                         }
                     }
