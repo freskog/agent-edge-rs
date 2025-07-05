@@ -1,3 +1,4 @@
+use audio_api::audio_sink::CpalConfig;
 use audio_api::tonic::service::{run_server, run_server_unix, AudioServiceImpl};
 use clap::Parser;
 use log::{info, warn};
@@ -24,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
 
-    let service = AudioServiceImpl::new();
+    let service = AudioServiceImpl::new_with_config(CpalConfig::default())?;
 
     if args.unix {
         info!(

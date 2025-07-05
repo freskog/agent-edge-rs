@@ -10,10 +10,13 @@ async fn test_cpal_config() {
     assert!(config.device_name.is_none());
 
     let custom_config = CpalConfig {
-        buffer_size_ms: 30000,
-        low_buffer_warning: 10,
-        high_buffer_warning: 90,
-        device_name: Some("test_device".to_string()),
+        buffer_size_ms: 500,
+        max_buffer_size_ms: 5000,
+        buffer_growth_ms: 1000,
+        low_buffer_warning: 20,
+        high_buffer_warning: 80,
+        backpressure_threshold: 90,
+        device_name: None,
     };
 
     assert_eq!(custom_config.buffer_size_ms, 30000);

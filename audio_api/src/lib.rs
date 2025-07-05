@@ -1,3 +1,4 @@
+pub mod audio_converter;
 pub mod audio_sink;
 pub mod audio_source;
 pub mod error;

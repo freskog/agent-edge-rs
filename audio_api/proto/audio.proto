@@ -21,11 +21,39 @@ message SubscribeRequest {
     // Empty for now - could add options later
 }
 
-// Audio chunk with exactly 1280 f32 samples at 16kHz mono
-// Format: 16kHz sample rate, 1 channel (mono), 1280 samples per chunk (80ms)
+// Audio format information
+message AudioFormat {
+    uint32 sample_rate = 1;      // Sample rate in Hz (e.g., 16000, 44100, 48000)
+    uint32 channels = 2;         // Number of channels (1 for mono, 2 for stereo)
+    SampleFormat sample_format = 3; // Sample format
+}
+
+// Sample format enumeration
+enum SampleFormat {
+    UNKNOWN = 0;
+    I16 = 1;     // 16-bit signed integer
+    I24 = 2;     // 24-bit signed integer
+    I32 = 3;     // 32-bit signed integer
+    F32 = 4;     // 32-bit float
+    F64 = 5;     // 64-bit float
+}
+
+// Audio chunk with format metadata (first chunk) or just samples (subsequent chunks)
 message AudioChunk {
-    repeated float samples = 1;  // Exactly 1280 samples
-    uint64 timestamp_ms = 2;     // Timestamp in milliseconds since epoch
+    // Audio samples in various formats - choose the most appropriate for your data
+    oneof samples {
+        bytes float_samples = 1;     // 32-bit float samples (-1.0 to 1.0) as bytes
+        bytes int16_samples = 2;     // 16-bit signed integer samples (little-endian)
+        bytes int24_samples = 3;     // 24-bit signed integer samples (little-endian)
+        bytes int32_samples = 4;     // 32-bit signed integer samples (little-endian)
+        bytes float64_samples = 5;   // 64-bit float samples (little-endian)
+    }
+    
+    uint64 timestamp_ms = 6;     // Timestamp in milliseconds since epoch
+    
+    // Format metadata - only present in the first chunk of a stream
+    // Subsequent chunks will not have this field set
+    AudioFormat format = 7;
 }
 
 // Play audio request with stream ID

@@ -1,10 +1,11 @@
 [workspace]
+resolver = "2"
 members = ["agent", "wakeword", "audio_api"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Fredrik Skogberg <freskog@gmail.com>"]
 description = "Agent Edge RS - Split into wakeword, agent, and audio-interface binaries"
 license = "MIT"
 
