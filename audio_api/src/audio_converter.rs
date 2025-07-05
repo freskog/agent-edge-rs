@@ -1,4 +1,4 @@
-use crate::tonic::service::audio::{AudioFormat, SampleFormat};
+use crate::tonic::service::audio::AudioFormat;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };

@@ -4,12 +4,12 @@ use cpal::{
     BuildStreamError, DeviceNameError, DevicesError, PlayStreamError, SupportedStreamConfigsError,
 };
 use log::error;
-use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+// Rubato imports removed as they're not used in this implementation
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
 
 #[derive(Error, Debug, Clone)]
@@ -84,6 +84,9 @@ pub trait AudioSink: Send + Sync {
 
     /// Stop audio playback and clear any buffered data
     async fn stop(&self) -> Result<(), AudioError>;
+
+    /// Abort audio playback immediately and clear all buffers
+    async fn abort(&self) -> Result<(), AudioError>;
 
     /// Get the audio format that this sink expects
     fn get_format(&self) -> AudioFormat;
@@ -213,6 +216,7 @@ enum AudioCommand {
     PlayAudio(Vec<f32>),
     EndOfStream, // Signal that no more audio will be sent
     Stop,
+    Abort, // Immediate abort with buffer clearing
 }
 
 struct AudioState {
@@ -331,7 +335,7 @@ impl CpalSink {
         let output_channels = stream_config.channels;
 
         // Convert CPAL sample format to gRPC SampleFormat
-        let sample_format = match supported_config.sample_format() {
+        let _sample_format = match supported_config.sample_format() {
             cpal::SampleFormat::I16 => SampleFormat::I16,
             cpal::SampleFormat::F32 => SampleFormat::F32,
             cpal::SampleFormat::I24 => SampleFormat::I24,
@@ -371,9 +375,8 @@ impl CpalSink {
         };
 
         // Create and start the stream in a separate thread to avoid Send/Sync issues
-        let (stream_ready_tx, stream_ready_rx) =
-            std::sync::mpsc::channel::<Result<(), AudioError>>();
-        let stream_thread = thread::spawn(move || -> Result<(), AudioError> {
+        let (stream_ready_tx, stream_ready_rx) = mpsc::channel::<Result<(), AudioError>>();
+        let _stream_thread = thread::spawn(move || -> Result<(), AudioError> {
             let stream_result = device.build_output_stream(
                 &stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -516,6 +519,18 @@ impl CpalSink {
                         stats_for_thread.update_buffer_size(0);
                         break;
                     }
+                    AudioCommand::Abort => {
+                        log::info!("AudioSink: Received Abort command, clearing queue immediately");
+                        {
+                            let mut samples_queue = samples_queue.lock().unwrap();
+                            samples_queue.clear();
+                        }
+                        stats_for_thread.update_buffer_size(0);
+                        stats_for_thread
+                            .end_of_stream_signaled
+                            .store(false, Ordering::Release);
+                        break;
+                    }
                 }
             }
             log::debug!("AudioSink: Audio processing thread stopped");
@@ -549,7 +564,7 @@ impl Drop for CpalSink {
 
         // Don't block the async runtime - just drop the thread handle
         // The audio thread will see the stop flag and exit on its own
-        if let Some(thread) = self.audio_thread.take() {
+        if let Some(_thread) = self.audio_thread.take() {
             // Drop the thread handle - the thread will be cleaned up when the process exits
             log::debug!("AudioSink: Audio thread handle dropped");
         }
@@ -711,6 +726,19 @@ impl AudioSink for CpalSink {
         self.audio_sender
             .try_send(AudioCommand::Stop)
             .map_err(|_| AudioError::StopError("Failed to send stop command".to_string()))?;
+        Ok(())
+    }
+
+    async fn abort(&self) -> Result<(), AudioError> {
+        log::info!("AudioSink: Aborting audio playback immediately");
+        // Mark as stopped and send abort command to clear buffers immediately
+        self.is_stopped.store(true, Ordering::Release);
+        self.audio_sender
+            .try_send(AudioCommand::Abort)
+            .map_err(|_| {
+                AudioError::StopError("Abort failed: Failed to send abort command".to_string())
+            })?;
+        log::info!("AudioSink: Audio playback abort command sent");
         Ok(())
     }
 

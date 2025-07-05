@@ -1,11 +1,17 @@
 use crate::audio_converter::AudioConverter;
 use crate::audio_sink::{AudioError, AudioSink, CpalConfig, CpalSink};
+use crate::audio_source::{AudioCaptureConfig, CHUNK_SIZE};
 use futures::StreamExt;
 use log::{debug, error, info, warn};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tonic::transport::Server;
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Request, Response, Status};
+use uuid::Uuid;
 
 use audio::audio_service_server::{AudioService, AudioServiceServer};
 use audio::{
@@ -81,6 +87,295 @@ fn extract_f32_samples(chunk: &AudioChunk) -> Result<Vec<f32>, Status> {
     }
 }
 
+/// Subscriber information for audio capture
+#[derive(Debug)]
+struct AudioSubscriber {
+    sender: mpsc::Sender<Result<AudioChunk, Status>>,
+}
+
+/// Audio capture service that manages multiple subscribers
+/// This service doesn't hold the actual AudioCapture to avoid Send/Sync issues
+pub struct AudioCaptureService {
+    subscribers: Arc<RwLock<HashMap<String, AudioSubscriber>>>,
+    audio_sender: Option<mpsc::Sender<[f32; CHUNK_SIZE]>>,
+    capture_sample_rate: u32,
+    target_sample_rate: u32,
+}
+
+impl AudioCaptureService {
+    pub fn new(config: AudioCaptureConfig) -> Result<Self, AudioError> {
+        // We'll create the actual audio capture in a separate thread to avoid Send/Sync issues
+        let (audio_tx, audio_rx) = mpsc::channel(100);
+
+        // Detect the actual device sample rate
+        let actual_sample_rate = Self::detect_device_sample_rate(&config)?;
+        info!(
+            "🎤 Detected device sample rate: {}Hz (config requested: {}Hz)",
+            actual_sample_rate, config.sample_rate
+        );
+
+        let service = Self {
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
+            audio_sender: Some(audio_tx),
+            capture_sample_rate: actual_sample_rate,
+            target_sample_rate: 16000, // Always output at 16kHz
+        };
+
+        // Start the audio distribution task
+        service.start_audio_distribution(audio_rx);
+
+        // Try to start audio capture in a separate thread
+        service.start_audio_capture(config.clone());
+
+        Ok(service)
+    }
+
+    fn detect_device_sample_rate(config: &AudioCaptureConfig) -> Result<u32, AudioError> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+
+        let host = cpal::default_host();
+        let device = if let Some(id) = &config.device_id {
+            host.devices()
+                .map_err(|e| AudioError::DeviceError(e.to_string()))?
+                .find(|d| d.name().map(|n| n == *id).unwrap_or(false))
+                .ok_or_else(|| AudioError::DeviceError(format!("Device not found: {}", id)))?
+        } else {
+            host.default_input_device()
+                .ok_or_else(|| AudioError::DeviceError("No default input device found".into()))?
+        };
+
+        // First, try to find if the requested sample rate is supported
+        let requested_rate = config.sample_rate;
+        let supported_configs = device
+            .supported_input_configs()
+            .map_err(|e| AudioError::DeviceError(e.to_string()))?;
+
+        for supported_config in supported_configs {
+            let min_rate = supported_config.min_sample_rate().0;
+            let max_rate = supported_config.max_sample_rate().0;
+
+            if requested_rate >= min_rate && requested_rate <= max_rate {
+                info!(
+                    "🎤 Device supports requested sample rate: {}Hz",
+                    requested_rate
+                );
+                return Ok(requested_rate);
+            }
+        }
+
+        // If requested rate is not supported, fall back to default
+        let default_config = device
+            .default_input_config()
+            .map_err(|e| AudioError::DeviceError(e.to_string()))?;
+
+        let default_rate = default_config.sample_rate().0;
+        info!(
+            "🎤 Requested rate {}Hz not supported, using device default: {}Hz",
+            requested_rate, default_rate
+        );
+
+        Ok(default_rate)
+    }
+
+    fn start_audio_capture(&self, mut config: AudioCaptureConfig) {
+        if let Some(sender) = &self.audio_sender {
+            let sender_clone = sender.clone();
+            let actual_sample_rate = self.capture_sample_rate;
+
+            // Update config to use the actual detected sample rate
+            config.sample_rate = actual_sample_rate;
+
+            // Spawn a blocking task for audio capture since CPAL isn't async-friendly
+            std::thread::spawn(move || {
+                use crate::audio_source::AudioCapture;
+
+                // We don't need a sync channel for this implementation
+
+                // Try to create audio capture
+                let _capture = match AudioCapture::new(config.clone(), sender_clone) {
+                    Ok(capture) => {
+                        info!("🎤 Audio capture initialized successfully");
+                        Some(capture)
+                    }
+                    Err(e) => {
+                        warn!("🎤 Audio capture initialization failed: {} - service will run without capture", e);
+                        None
+                    }
+                };
+
+                // Keep the thread alive to maintain the audio capture
+                // In a real implementation, you'd want a proper shutdown mechanism
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+        }
+    }
+
+    fn start_audio_distribution(&self, mut capture_receiver: mpsc::Receiver<[f32; CHUNK_SIZE]>) {
+        let subscribers = Arc::clone(&self.subscribers);
+        let capture_rate = self.capture_sample_rate;
+        let target_rate = self.target_sample_rate;
+
+        tokio::spawn(async move {
+            info!(
+                "🎤 Audio distribution task started ({}Hz -> {}Hz)",
+                capture_rate, target_rate
+            );
+
+            // Create resampler if needed
+            let mut resampler = if capture_rate != target_rate {
+                let ratio = target_rate as f64 / capture_rate as f64;
+                info!("🎤 Creating resampler with ratio: {:.3}", ratio);
+
+                let params = SincInterpolationParameters {
+                    sinc_len: 256,
+                    f_cutoff: 0.95,
+                    interpolation: SincInterpolationType::Linear,
+                    oversampling_factor: 256,
+                    window: WindowFunction::BlackmanHarris2,
+                };
+
+                match SincFixedIn::<f32>::new(
+                    ratio, 2.0, // max_resample_ratio_relative
+                    params, CHUNK_SIZE, 1, // channels
+                ) {
+                    Ok(resampler) => Some(resampler),
+                    Err(e) => {
+                        error!("Failed to create resampler: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut sample_buffer = Vec::new();
+
+            loop {
+                // Get the next audio chunk
+                let chunk = match capture_receiver.recv().await {
+                    Some(samples) => samples,
+                    None => {
+                        info!("🎤 Audio capture stream ended");
+                        break;
+                    }
+                };
+
+                // Resample if needed
+                let resampled_samples = if let Some(ref mut resampler) = resampler {
+                    // Convert chunk to Vec for resampler
+                    let input_samples = vec![chunk.to_vec()];
+
+                    match resampler.process(&input_samples, None) {
+                        Ok(output) => {
+                            if !output.is_empty() && !output[0].is_empty() {
+                                output[0].clone()
+                            } else {
+                                continue; // Skip empty output
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Resampling error: {}", e);
+                            continue;
+                        }
+                    }
+                } else {
+                    chunk.to_vec()
+                };
+
+                // Buffer samples until we have exactly CHUNK_SIZE
+                sample_buffer.extend_from_slice(&resampled_samples);
+
+                while sample_buffer.len() >= CHUNK_SIZE {
+                    // Extract exactly CHUNK_SIZE samples
+                    let output_chunk: [f32; CHUNK_SIZE] =
+                        sample_buffer[0..CHUNK_SIZE].try_into().unwrap();
+                    sample_buffer.drain(0..CHUNK_SIZE);
+
+                    // Convert to gRPC AudioChunk format
+                    let audio_chunk = AudioChunk {
+                        samples: Some(audio::audio_chunk::Samples::FloatSamples(
+                            output_chunk.iter().flat_map(|&f| f.to_le_bytes()).collect(),
+                        )),
+                        timestamp_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64,
+                        format: Some(AudioFormat {
+                            sample_rate: target_rate,
+                            channels: 1,
+                            sample_format: audio::SampleFormat::F32 as i32,
+                        }),
+                    };
+
+                    // Send to all subscribers
+                    let mut subscribers_to_remove = Vec::new();
+                    {
+                        let subscribers_read = subscribers.read().await;
+                        for (id, subscriber) in subscribers_read.iter() {
+                            if let Err(_) = subscriber.sender.try_send(Ok(audio_chunk.clone())) {
+                                debug!(
+                                    "🎤 Subscriber {} channel full or closed, marking for removal",
+                                    id
+                                );
+                                subscribers_to_remove.push(id.clone());
+                            }
+                        }
+                    }
+
+                    // Remove disconnected subscribers
+                    if !subscribers_to_remove.is_empty() {
+                        let mut subscribers_write = subscribers.write().await;
+                        for id in subscribers_to_remove {
+                            subscribers_write.remove(&id);
+                            debug!("🎤 Removed disconnected subscriber: {}", id);
+                        }
+                    }
+
+                    // Log subscriber count periodically
+                    if rand::random::<u8>() < 10 {
+                        // ~4% chance per chunk
+                        let count = subscribers.read().await.len();
+                        if count > 0 {
+                            debug!("🎤 Broadcasting to {} subscribers", count);
+                        }
+                    }
+                }
+            }
+
+            info!("🎤 Audio distribution task ended");
+        });
+    }
+
+    pub async fn add_subscriber(
+        &self,
+        id: String,
+        sender: mpsc::Sender<Result<AudioChunk, Status>>,
+    ) {
+        let subscriber = AudioSubscriber { sender };
+        self.subscribers
+            .write()
+            .await
+            .insert(id.clone(), subscriber);
+        info!("🎤 Added audio subscriber: {}", id);
+    }
+
+    pub async fn remove_subscriber(&self, id: &str) {
+        if self.subscribers.write().await.remove(id).is_some() {
+            info!("🎤 Removed audio subscriber: {}", id);
+        }
+    }
+
+    pub async fn subscriber_count(&self) -> usize {
+        self.subscribers.read().await.len()
+    }
+}
+
+// Make AudioCaptureService Send + Sync by not holding the AudioCapture directly
+unsafe impl Send for AudioCaptureService {}
+unsafe impl Sync for AudioCaptureService {}
+
 /// Active audio stream information
 struct ActiveStream {
     stream_id: String,
@@ -92,6 +387,8 @@ struct ActiveStream {
 pub struct AudioServiceImpl {
     audio_sink: Arc<dyn AudioSink>,
     target_format: AudioFormat,
+    capture_service: Arc<AudioCaptureService>,
+    active_streams: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>, // stream_id -> abort_sender
 }
 
 impl AudioServiceImpl {
@@ -102,9 +399,14 @@ impl AudioServiceImpl {
             target_format.sample_rate, target_format.channels, target_format.sample_format
         );
 
+        // Create capture service with default config
+        let capture_service = Arc::new(AudioCaptureService::new(AudioCaptureConfig::default())?);
+
         Ok(Self {
             audio_sink,
             target_format,
+            capture_service,
+            active_streams: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -116,9 +418,36 @@ impl AudioServiceImpl {
             target_format.sample_rate, target_format.channels, target_format.sample_format
         );
 
+        // Create capture service with default config
+        let capture_service = Arc::new(AudioCaptureService::new(AudioCaptureConfig::default())?);
+
         Ok(Self {
             audio_sink,
             target_format,
+            capture_service,
+            active_streams: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    pub fn new_with_capture_config(
+        config: CpalConfig,
+        capture_config: AudioCaptureConfig,
+    ) -> Result<Self, AudioError> {
+        let audio_sink = Arc::new(CpalSink::new(config)?);
+        let target_format = audio_sink.get_format();
+        info!(
+            "🔊 Audio sink created with target format: {}Hz, {}ch, {}",
+            target_format.sample_rate, target_format.channels, target_format.sample_format
+        );
+
+        // Create capture service with provided config
+        let capture_service = Arc::new(AudioCaptureService::new(capture_config)?);
+
+        Ok(Self {
+            audio_sink,
+            target_format,
+            capture_service,
+            active_streams: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -130,19 +459,46 @@ impl AudioServiceImpl {
         let mut current_stream_id = None;
         let mut converter: Option<AudioConverter> = None;
         let mut chunks_played = 0;
+        let (abort_tx, mut abort_rx) = mpsc::channel::<()>(1);
 
         info!("🔊 Starting playback stream processing");
 
-        while let Some(request) = stream.next().await {
-            debug!("🔊 Received request from stream");
-            let request = request?;
+        loop {
+            tokio::select! {
+                // Check for abort signal
+                _ = abort_rx.recv() => {
+                    info!("🛑 Received abort signal for stream: {:?}", current_stream_id);
+                    // Clean up the stream from active streams
+                    if let Some(ref stream_id) = current_stream_id {
+                        let mut active_streams = self.active_streams.write().await;
+                        active_streams.remove(stream_id);
+                    }
+                    return Err(Status::aborted("Stream aborted by user request"));
+                }
 
-            match request.data {
+                // Process stream data
+                request_result = stream.next() => {
+                    let request = match request_result {
+                        Some(Ok(req)) => req,
+                        Some(Err(e)) => return Err(e),
+                        None => break, // Stream ended
+                    };
+
+                    debug!("🔊 Received request from stream");
+
+                    match request.data {
                 Some(play_audio_request::Data::Chunk(chunk)) => {
                     // Initialize stream if this is the first chunk
                     if current_stream_id.is_none() {
                         current_stream_id = Some(request.stream_id.clone());
                         info!("🔊 Initializing playback stream: {}", request.stream_id);
+
+                        // Register the stream for abort functionality
+                        {
+                            let mut active_streams = self.active_streams.write().await;
+                            active_streams.insert(request.stream_id.clone(), abort_tx.clone());
+                        }
+                        info!("🔊 Stream registered for abort functionality: {}", request.stream_id);
 
                         // Extract format from first chunk
                         let input_format = chunk.format.as_ref().ok_or_else(|| {
@@ -262,6 +618,8 @@ impl AudioServiceImpl {
                     return Err(Status::invalid_argument("Missing data in PlayAudioRequest"));
                 }
             }
+                }
+            }
         }
 
         // Signal that no more audio will be sent
@@ -277,6 +635,13 @@ impl AudioServiceImpl {
             error!("Failed to wait for audio completion: {}", e);
             Status::internal(format!("Failed to wait for audio completion: {}", e))
         })?;
+
+        // Clean up the stream from active streams
+        if let Some(ref stream_id) = current_stream_id {
+            let mut active_streams = self.active_streams.write().await;
+            active_streams.remove(stream_id);
+            info!("🔊 Stream cleaned up from active streams: {}", stream_id);
+        }
 
         info!("🔊 Playback completed: {} chunks played", chunks_played);
         Ok(PlayResponse {
@@ -298,10 +663,35 @@ impl AudioService for AudioServiceImpl {
         &self,
         _request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeAudioStream>, Status> {
-        // Audio capture functionality removed - focusing on playback only
-        Err(Status::unimplemented(
-            "Audio capture not implemented in this version",
-        ))
+        // Create a unique subscriber ID
+        let subscriber_id = Uuid::new_v4().to_string();
+
+        // Create a channel for this subscriber
+        let (tx, rx) = mpsc::channel(100);
+
+        // Add this subscriber to the capture service
+        self.capture_service
+            .add_subscriber(subscriber_id.clone(), tx)
+            .await;
+
+        info!("🎤 New audio subscriber: {}", subscriber_id);
+
+        // Convert the receiver into a stream
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+        // Create a stream that removes the subscriber when dropped
+        let capture_service = Arc::clone(&self.capture_service);
+        let stream_with_cleanup = async_stream::stream! {
+            tokio::pin!(stream);
+            while let Some(item) = stream.next().await {
+                yield item;
+            }
+            // Clean up when stream ends
+            capture_service.remove_subscriber(&subscriber_id).await;
+            info!("🎤 Audio subscriber stream ended: {}", subscriber_id);
+        };
+
+        Ok(Response::new(Box::pin(stream_with_cleanup)))
     }
 
     async fn play_audio(
@@ -340,11 +730,41 @@ impl AudioService for AudioServiceImpl {
         let stream_id = request.into_inner().stream_id;
         info!("🛑 Aborting audio playback: {}", stream_id);
 
-        // Stream management removed - streams are handled per-request now
-        Ok(Response::new(AbortResponse {
-            success: true,
-            message: format!("Stream {} aborted successfully", stream_id),
-        }))
+        // Check if the stream exists and send abort signal
+        let abort_sent = {
+            let active_streams = self.active_streams.read().await;
+            if let Some(abort_sender) = active_streams.get(&stream_id) {
+                match abort_sender.try_send(()) {
+                    Ok(_) => {
+                        info!("🛑 Abort signal sent to stream: {}", stream_id);
+                        true
+                    }
+                    Err(_) => {
+                        warn!("🛑 Failed to send abort signal to stream: {}", stream_id);
+                        false
+                    }
+                }
+            } else {
+                warn!("🛑 Stream not found for abort: {}", stream_id);
+                false
+            }
+        };
+
+        // Also abort the audio sink to clear any buffered audio immediately
+        if let Err(e) = self.audio_sink.abort().await {
+            error!("🛑 Failed to abort audio sink: {}", e);
+        }
+
+        let (success, message) = if abort_sent {
+            (true, format!("Stream {} aborted successfully", stream_id))
+        } else {
+            (
+                false,
+                format!("Stream {} not found or already completed", stream_id),
+            )
+        };
+
+        Ok(Response::new(AbortResponse { success, message }))
     }
 }
 

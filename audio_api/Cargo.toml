@@ -29,6 +29,7 @@ async-stream = "0.3"
 hound = "3.5"
 tower = { version = "0.4", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+rand = "0.8"
 
 [features]
 audio_available = []

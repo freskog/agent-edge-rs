@@ -192,10 +192,9 @@ impl AudioCapture {
                                     *sample_buffer = [0.0f32; CHUNK_SIZE];
                                     *sample_count = 0;
 
-                                    // Try to send chunk non-blocking
+                                    // Use try_send since we're in a sync callback
                                     if let Err(_) = sender.try_send(chunk) {
-                                        // Channel is full or closed, drop the chunk
-                                        log::debug!("Audio capture: dropped chunk (channel full)");
+                                        log::debug!("Audio capture: failed to send chunk (channel full or closed)");
                                     }
                                 }
                             }
@@ -219,19 +218,21 @@ impl AudioCapture {
         let mut result = Vec::new();
         for device in devices {
             if let Ok(name) = device.name() {
-                let config = device
-                    .default_input_config()
-                    .map_err(|e| AudioCaptureError::Config(e.to_string()))?;
-
-                result.push(AudioDeviceInfo {
-                    name: name.clone(),
-                    id: name.clone(),
-                    is_default: default_device
-                        .as_ref()
-                        .map(|d| d.name().unwrap_or_default())
-                        == Some(name),
-                    channel_count: u32::from(config.channels()),
-                });
+                // Only try to get input config if the device supports input
+                if let Ok(config) = device.default_input_config() {
+                    result.push(AudioDeviceInfo {
+                        name: name.clone(),
+                        id: name.clone(),
+                        is_default: default_device
+                            .as_ref()
+                            .map(|d| d.name().unwrap_or_default())
+                            == Some(name),
+                        channel_count: u32::from(config.channels()),
+                    });
+                } else {
+                    // Device doesn't support input, skip it
+                    log::debug!("Device '{}' does not support input streams, skipping", name);
+                }
             }
         }
 
