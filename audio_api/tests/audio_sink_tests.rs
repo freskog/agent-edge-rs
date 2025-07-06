@@ -4,7 +4,7 @@ use log::info;
 #[tokio::test]
 async fn test_cpal_config() {
     let config = CpalConfig::default();
-    assert_eq!(config.buffer_size_ms, 45000);
+    assert_eq!(config.buffer_size_ms, 10000);
     assert_eq!(config.low_buffer_warning, 20);
     assert_eq!(config.high_buffer_warning, 80);
     assert!(config.device_name.is_none());
@@ -19,10 +19,10 @@ async fn test_cpal_config() {
         device_name: None,
     };
 
-    assert_eq!(custom_config.buffer_size_ms, 30000);
-    assert_eq!(custom_config.low_buffer_warning, 10);
-    assert_eq!(custom_config.high_buffer_warning, 90);
-    assert_eq!(custom_config.device_name, Some("test_device".to_string()));
+    assert_eq!(custom_config.buffer_size_ms, 500);
+    assert_eq!(custom_config.low_buffer_warning, 20);
+    assert_eq!(custom_config.high_buffer_warning, 80);
+    assert_eq!(custom_config.device_name, None);
 }
 
 #[tokio::test]

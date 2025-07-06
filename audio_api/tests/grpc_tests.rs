@@ -1,16 +1,15 @@
-use audio::audio_service_client::AudioServiceClient;
-use audio::audio_service_server::AudioServiceServer;
-use audio::{
-    play_audio_request, AbortRequest, AudioChunk, EndStreamRequest, PlayAudioRequest,
-    SubscribeRequest,
-};
 use audio_api::audio_sink::CpalConfig;
-use audio_api::audio_source::AudioCaptureConfig;
-use audio_api::tonic::service::{audio, AudioServiceImpl};
+use audio_api::tonic::service::AudioServiceImpl;
 use audio_api::types::AUDIO_CHUNK_SIZE;
 use futures::StreamExt;
 use hound::WavReader;
 use log::{debug, info};
+use service_protos::audio_service_client::AudioServiceClient;
+use service_protos::audio_service_server::AudioServiceServer;
+use service_protos::{
+    play_audio_request, AbortRequest, AudioChunk, EndStreamRequest, PlayAudioRequest,
+    SubscribeRequest,
+};
 use std::convert::TryFrom;
 use std::io::BufReader;
 use std::time::Duration;
@@ -23,11 +22,11 @@ use uuid::Uuid;
 /// Helper function to get the number of samples from an AudioChunk
 fn get_sample_count(chunk: &AudioChunk) -> usize {
     match &chunk.samples {
-        Some(audio::audio_chunk::Samples::FloatSamples(bytes)) => bytes.len() / 4,
-        Some(audio::audio_chunk::Samples::Int16Samples(bytes)) => bytes.len() / 2,
-        Some(audio::audio_chunk::Samples::Int32Samples(bytes)) => bytes.len() / 4,
-        Some(audio::audio_chunk::Samples::Float64Samples(bytes)) => bytes.len() / 8,
-        Some(audio::audio_chunk::Samples::Int24Samples(bytes)) => bytes.len() / 3,
+        Some(service_protos::audio_chunk::Samples::FloatSamples(bytes)) => bytes.len() / 4,
+        Some(service_protos::audio_chunk::Samples::Int16Samples(bytes)) => bytes.len() / 2,
+        Some(service_protos::audio_chunk::Samples::Int32Samples(bytes)) => bytes.len() / 4,
+        Some(service_protos::audio_chunk::Samples::Float64Samples(bytes)) => bytes.len() / 8,
+        Some(service_protos::audio_chunk::Samples::Int24Samples(bytes)) => bytes.len() / 3,
         None => 0,
     }
 }
@@ -114,7 +113,7 @@ fn load_wav_as_grpc_chunks(file_path: &str) -> Result<Vec<AudioChunk>, Box<dyn s
         }
 
         let mut chunk = AudioChunk {
-            samples: Some(audio::audio_chunk::Samples::Int16Samples(bytes)),
+            samples: Some(service_protos::audio_chunk::Samples::Int16Samples(bytes)),
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -124,10 +123,10 @@ fn load_wav_as_grpc_chunks(file_path: &str) -> Result<Vec<AudioChunk>, Box<dyn s
 
         // Add format metadata to the first chunk only
         if chunk_idx == 0 {
-            chunk.format = Some(audio::AudioFormat {
+            chunk.format = Some(service_protos::AudioFormat {
                 sample_rate: spec.sample_rate,
                 channels: spec.channels as u32,
-                sample_format: audio::SampleFormat::I16 as i32, // WAV files are typically I16
+                sample_format: service_protos::SampleFormat::I16 as i32, // WAV files are typically I16
             });
         }
 
@@ -513,7 +512,7 @@ async fn test_grpc_alphabet_recording_simulation() {
                 for &sample in &chunk_vec {
                     bytes.extend_from_slice(&sample.to_le_bytes());
                 }
-                Some(audio::audio_chunk::Samples::FloatSamples(bytes))
+                Some(service_protos::audio_chunk::Samples::FloatSamples(bytes))
             },
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -524,10 +523,10 @@ async fn test_grpc_alphabet_recording_simulation() {
 
         // Add format metadata to the first chunk only
         if chunk_idx == 0 {
-            chunk.format = Some(audio::AudioFormat {
+            chunk.format = Some(service_protos::AudioFormat {
                 sample_rate: sample_rate,
-                channels: 1,                                    // Mono synthetic audio
-                sample_format: audio::SampleFormat::F32 as i32, // F32 synthetic audio
+                channels: 1, // Mono synthetic audio
+                sample_format: service_protos::SampleFormat::F32 as i32, // F32 synthetic audio
             });
         }
 
@@ -1131,7 +1130,7 @@ async fn test_subscribe_audio_with_simulated_data() {
             assert_eq!(format.channels, 1, "Expected mono audio");
             assert_eq!(
                 format.sample_format,
-                audio::SampleFormat::F32 as i32,
+                service_protos::SampleFormat::F32 as i32,
                 "Expected F32 format"
             );
 
@@ -1227,7 +1226,7 @@ async fn test_concurrent_subscriber_management() {
                             assert_eq!(format.channels, 1, "Subscriber {} expected mono audio", i);
                             assert_eq!(
                                 format.sample_format,
-                                audio::SampleFormat::F32 as i32,
+                                service_protos::SampleFormat::F32 as i32,
                                 "Subscriber {} expected F32 format",
                                 i
                             );
@@ -1352,12 +1351,12 @@ async fn test_audio_sample_validation() {
                 assert_eq!(format.channels, 1, "Expected mono audio");
                 assert_eq!(
                     format.sample_format,
-                    audio::SampleFormat::F32 as i32,
+                    service_protos::SampleFormat::F32 as i32,
                     "Expected F32 format"
                 );
 
                 // Validate sample data
-                if let Some(audio::audio_chunk::Samples::FloatSamples(sample_bytes)) =
+                if let Some(service_protos::audio_chunk::Samples::FloatSamples(sample_bytes)) =
                     &chunk.samples
                 {
                     assert!(!sample_bytes.is_empty(), "Sample data should not be empty");
@@ -1506,7 +1505,7 @@ async fn test_echo_3_second_recording() {
                 total_samples += sample_count;
 
                 // Count non-zero samples to detect speech
-                if let Some(audio::audio_chunk::Samples::FloatSamples(sample_bytes)) =
+                if let Some(service_protos::audio_chunk::Samples::FloatSamples(sample_bytes)) =
                     &chunk.samples
                 {
                     for chunk_bytes in sample_bytes.chunks(4) {

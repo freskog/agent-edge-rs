@@ -7,6 +7,7 @@ description = "Audio input/output interface for agent-edge-rs"
 license.workspace = true
 
 [dependencies]
+service-protos = { path = "../service-protos" }
 tokio = { version = "1.0", features = ["full"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -35,5 +36,4 @@ rand = "0.8"
 audio_available = []
 
 [build-dependencies]
-tonic-build = "0.13.1"
 cpal = "0.16.0"

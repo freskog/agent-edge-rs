@@ -1,7 +1,7 @@
 use cpal::traits::HostTrait;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tonic_build::compile_protos("proto/audio.proto")?;
+    // Protobuf generation is now handled by service-protos crate
 
     // Check if CPAL can find any audio devices
     let host = cpal::default_host();

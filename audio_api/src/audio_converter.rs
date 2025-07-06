@@ -1,7 +1,7 @@
-use crate::tonic::service::audio::AudioFormat;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
+use service_protos::AudioFormat;
 use thiserror::Error;
 
 /// Errors that can occur during audio format conversion

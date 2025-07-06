@@ -51,8 +51,11 @@ fn test_model_initialization() {
             match prediction {
                 Ok(results) => {
                     println!("Prediction results: {:?}", results);
-                    // Should have entries for each model
-                    assert!(!results.is_empty(), "Should have prediction results");
+                    // Should be empty when no models are loaded
+                    assert!(
+                        results.is_empty(),
+                        "Should have empty results when no models loaded"
+                    );
                 }
                 Err(e) => println!("Expected error (no model files): {}", e),
             }

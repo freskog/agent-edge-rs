@@ -3,15 +3,94 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-check-cfg=cfg(xnnpack)");
 
-    // Always link pthread on Unix systems
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    if target_os != "windows" {
-        println!("cargo:rustc-link-lib=pthread");
-    }
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
-    // Generate stub implementations to handle weak symbols
-    generate_stubs();
+    // Only do custom stuff on Linux aarch64 - everywhere else let tflitec handle everything
+    if target_os == "linux" && target_arch == "aarch64" {
+        println!("cargo:warning=🔍 Linux aarch64 detected - applying custom XNNPACK configuration");
+
+        // Always link pthread on Unix systems
+        if target_os != "windows" {
+            println!("cargo:rustc-link-lib=pthread");
+        }
+
+        // Link our custom XNNPACK libraries if available
+        let has_custom_libs = link_custom_xnnpack_libraries();
+
+        // Only generate stub implementations if we don't have real libraries
+        if !has_custom_libs {
+            println!("cargo:warning=🔄 Generating weak stubs as fallback");
+            generate_stubs();
+        }
+    } else {
+        println!(
+            "cargo:warning=🔍 Platform {} {} - using tflitec defaults (no custom configuration)",
+            target_os, target_arch
+        );
+        // Do absolutely nothing - let tflitec handle everything normally
+    }
+}
+
+fn link_custom_xnnpack_libraries() -> bool {
+    let lib_dir = "libs/linux-aarch64";
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let full_lib_path = PathBuf::from(&manifest_dir).join(lib_dir);
+
+    if full_lib_path.exists() {
+        println!(
+            "cargo:warning=📂 Custom XNNPACK library directory found: {}",
+            full_lib_path.display()
+        );
+
+        // Add library search path for our custom libraries
+        println!("cargo:rustc-link-search=native={}", full_lib_path.display());
+
+        // Add rpath for runtime linking
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            full_lib_path.display()
+        );
+
+        // Link our custom XNNPACK libraries if they exist
+        let mut linked_libs = Vec::new();
+
+        if full_lib_path.join("libcpuinfo.so").exists() {
+            println!("cargo:rustc-link-lib=cpuinfo");
+            println!("cargo:warning=🔗 Linking custom libcpuinfo.so");
+            linked_libs.push("libcpuinfo.so");
+        }
+
+        if full_lib_path.join("libpthreadpool.so").exists() {
+            println!("cargo:rustc-link-lib=pthreadpool");
+            println!("cargo:warning=🔗 Linking custom libpthreadpool.so");
+            linked_libs.push("libpthreadpool.so");
+        }
+
+        // Link custom TensorFlow Lite if available (overrides tflitec's version)
+        if full_lib_path.join("libtensorflowlite_c.so").exists() {
+            println!("cargo:rustc-link-lib=tensorflowlite_c");
+            println!("cargo:warning=🔗 Linking custom libtensorflowlite_c.so");
+            linked_libs.push("libtensorflowlite_c.so");
+        }
+
+        if !linked_libs.is_empty() {
+            println!("cargo:rustc-cfg=xnnpack");
+            println!(
+                "cargo:warning=🚀 Custom XNNPACK libraries linked: {}",
+                linked_libs.join(", ")
+            );
+            true
+        } else {
+            println!("cargo:warning=⚠️  No custom XNNPACK libraries found - using tflitec default");
+            false
+        }
+    } else {
+        println!("cargo:warning=⚠️  Custom XNNPACK library directory not found: {} - using tflitec default", full_lib_path.display());
+        false
+    }
 }
 
 fn generate_stubs() {

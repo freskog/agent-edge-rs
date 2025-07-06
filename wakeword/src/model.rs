@@ -3,23 +3,18 @@
 //! This module provides the main Model class that matches the Python implementation,
 //! including proper prediction buffer management and simplified prediction interface.
 
+use std::collections::{HashMap, VecDeque};
+use tflitec::interpreter::Interpreter;
+use tflitec::model::Model as TfliteModel;
+
 use crate::error::{OpenWakeWordError, Result};
 use crate::utils::AudioFeatures;
 use crate::{get_model_class_mappings, FEATURE_MODELS, MODELS};
-use std::collections::{HashMap, VecDeque};
-use tflitec::interpreter::Options;
-use tflitec::{interpreter::Interpreter, model::Model as TfliteModel};
 
-/// Model prediction results type
+/// Type alias for prediction results
 pub type PredictionResult = HashMap<String, f32>;
 
-/// Main OpenWakeWord Model class
-///
-/// Matches the Python Model class interface with:
-/// - Shared audio preprocessor (AudioFeatures)
-/// - Multiple wake word models
-/// - Prediction buffers with maxlen=30
-/// - Simple predict() interface
+/// Main model struct that holds all wake word models and shared preprocessor
 pub struct Model {
     // Model storage
     models: HashMap<String, Interpreter<'static>>,
@@ -46,71 +41,57 @@ impl Model {
     /// # Arguments
     /// * `wakeword_models` - List of model names or paths to load
     /// * `class_mapping_dicts` - Optional class mappings for multi-class models
-    /// * `vad_threshold` - Voice activity detection threshold (0 to disable)
+    /// * `vad_threshold` - Voice activity detection threshold
     /// * `custom_verifier_threshold` - Custom verifier threshold
     ///
     /// # Returns
-    /// * `Result<Model>` - New Model instance
+    /// * `Result<Model>` - The created model instance
     pub fn new(
         wakeword_models: Vec<String>,
         class_mapping_dicts: Vec<HashMap<String, String>>,
         vad_threshold: f32,
         custom_verifier_threshold: f32,
     ) -> Result<Self> {
-        // Get model paths - if empty, load all pre-trained models
+        let model_paths = MODELS;
         let mut model_names = Vec::new();
         let mut resolved_paths = Vec::new();
 
-        if wakeword_models.is_empty() {
-            // Load all pre-trained models
-            for (name, path) in MODELS {
-                model_names.push(name.to_string());
-                resolved_paths.push(path.to_string());
-            }
-        } else {
-            // Resolve provided model names/paths
-            for model_path in wakeword_models {
-                if std::path::Path::new(&model_path).exists() {
-                    // Direct path provided
-                    let name = std::path::Path::new(&model_path)
+        // Resolve model names to paths
+        for model in wakeword_models {
+            if std::path::Path::new(&model).exists() {
+                // Direct path
+                resolved_paths.push(model.clone());
+                model_names.push(
+                    std::path::Path::new(&model)
                         .file_stem()
                         .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    model_names.push(name);
-                    resolved_paths.push(model_path);
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            } else {
+                // Look up by name
+                if let Some(path) = model_paths.iter().find(|(name, _)| *name == model) {
+                    resolved_paths.push(path.1.to_string());
+                    model_names.push(model);
                 } else {
-                    // Model name provided, find pre-trained path
-                    let matching_models: Vec<String> = MODELS
-                        .iter()
-                        .filter(|(name, _)| *name == &model_path)
-                        .map(|(_, path)| path.to_string())
-                        .collect();
-
-                    if matching_models.is_empty() {
-                        return Err(OpenWakeWordError::ModelLoadError(format!(
-                            "Could not find pretrained model for model name '{}'",
-                            model_path
-                        )));
-                    }
-
-                    model_names.push(model_path);
-                    resolved_paths.push(matching_models[0].clone());
+                    return Err(OpenWakeWordError::ModelLoadError(format!(
+                        "Model not found: {}",
+                        model
+                    )));
                 }
             }
         }
 
-        // Initialize models with TFLite
+        // Load models
         let mut models = HashMap::new();
         let mut model_inputs = HashMap::new();
         let mut model_outputs = HashMap::new();
-        let mut model_prediction_functions: HashMap<
-            String,
-            Box<dyn FnMut(&[f32]) -> Result<Vec<f32>>>,
-        > = HashMap::new();
 
         for (model_name, model_path) in model_names.iter().zip(resolved_paths.iter()) {
-            // Load TFLite model
+            log::debug!("Loading model: {} from {}", model_name, model_path);
+
+            // Load TFLite model (same pattern as utils.rs)
             let tflite_model = Box::leak(Box::new(TfliteModel::new(model_path).map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!(
                     "Failed to load model {}: {}",
@@ -118,15 +99,16 @@ impl Model {
                 ))
             })?));
 
-            let mut options = Options::default();
-            options.thread_count = 1;
-
-            let interpreter = Interpreter::new(tflite_model, Some(options)).map_err(|e| {
-                OpenWakeWordError::ModelLoadError(format!(
-                    "Failed to create interpreter for {}: {}",
-                    model_name, e
-                ))
-            })?;
+            // Use our XNNPACK-safe interpreter creation
+            let mut interpreter =
+                crate::xnnpack_fix::create_interpreter_with_xnnpack_safe(tflite_model, 1).map_err(
+                    |e| {
+                        OpenWakeWordError::ModelLoadError(format!(
+                            "Failed to create interpreter for {}: {}",
+                            model_name, e
+                        ))
+                    },
+                )?;
 
             interpreter.allocate_tensors().map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!(
@@ -135,7 +117,6 @@ impl Model {
                 ))
             })?;
 
-            // Get input/output shapes
             let input_tensor = interpreter.input(0).map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!(
                     "Failed to get input tensor for {}: {}",
@@ -150,8 +131,19 @@ impl Model {
                 ))
             })?;
 
-            let input_size = input_tensor.shape().dimensions().iter().product::<usize>();
-            let output_size = output_tensor.shape().dimensions().iter().product::<usize>();
+            // Python uses shape[1] for input_size (number of frames, not total features)
+            let input_size = input_tensor
+                .shape()
+                .dimensions()
+                .get(1)
+                .copied()
+                .unwrap_or(0) as usize;
+            let output_size = output_tensor
+                .shape()
+                .dimensions()
+                .get(1)
+                .copied()
+                .unwrap_or(0) as usize;
 
             models.insert(model_name.clone(), interpreter);
             model_inputs.insert(model_name.clone(), input_size);
@@ -196,11 +188,7 @@ impl Model {
         // Initialize prediction buffers (deque with maxlen=30)
         let mut prediction_buffer = HashMap::new();
         for model_name in model_names.iter() {
-            let mut deque = VecDeque::with_capacity(30);
-            // Add some initial values like Python
-            for _ in 0..5 {
-                deque.push_back(0.0);
-            }
+            let deque = VecDeque::with_capacity(30);
             prediction_buffer.insert(model_name.clone(), deque);
         }
 
@@ -221,10 +209,6 @@ impl Model {
         self.preprocessor.reset()?;
         for buffer in self.prediction_buffer.values_mut() {
             buffer.clear();
-            // Add initial values
-            for _ in 0..5 {
-                buffer.push_back(0.0);
-            }
         }
         Ok(())
     }
@@ -244,141 +228,121 @@ impl Model {
         threshold: Option<HashMap<String, f32>>,
         debounce_time: f32,
     ) -> Result<PredictionResult> {
-        // Get audio features (matches Python: n_prepared_samples = self.preprocessor(x))
-        let n_prepared_samples = self.preprocessor.__call__(x)?;
+        // Process audio in 1280-sample chunks like Python does
+        log::debug!("🔍 Starting prediction with {} audio samples", x.len());
 
-        let mut predictions = HashMap::new();
+        let chunk_size = 1280;
+        let mut final_predictions = HashMap::new();
 
-        // Get predictions from each model (matches Python logic)
+        // Initialize predictions for all models
         let model_names: Vec<String> = self.models.keys().cloned().collect();
+        for model_name in &model_names {
+            final_predictions.insert(model_name.clone(), 0.0);
+        }
 
-        for mdl in model_names {
-            let input_size = self.model_inputs[&mdl] / 96; // Convert to number of frames
-            let output_size = self.model_outputs[&mdl];
+        // Process each chunk
+        for (chunk_idx, chunk) in x.chunks(chunk_size).enumerate() {
+            let mut chunk_vec = chunk.to_vec();
 
-            // Run model to get predictions (matching Python logic)
-            let prediction = if n_prepared_samples > 1280 {
-                // Multiple chunks - process them
-                let mut group_predictions = Vec::new();
-                let n_chunks = n_prepared_samples / 1280;
+            // Pad chunk to 1280 samples if needed
+            while chunk_vec.len() < chunk_size {
+                chunk_vec.push(0);
+            }
 
-                for i in 0..n_chunks {
-                    let chunk_features = self
-                        .preprocessor
-                        .get_features(input_size, -(input_size as i32) - (i as i32));
+            log::debug!(
+                "🔍 Processing chunk {}: {} samples",
+                chunk_idx,
+                chunk_vec.len()
+            );
 
-                    let pred_result = Self::run_model_prediction_static(
-                        self.models.get_mut(&mdl).unwrap(),
-                        &chunk_features,
-                    )?;
-                    group_predictions.push(pred_result);
-                }
+            // Get audio features for this chunk
+            let n_prepared_samples = self.preprocessor.__call__(&chunk_vec)?;
+            log::debug!(
+                "🔍 Chunk {}: preprocessor returned {} prepared samples",
+                chunk_idx,
+                n_prepared_samples
+            );
 
-                // Take maximum prediction
-                group_predictions.iter().fold(0.0_f32, |a, &b| a.max(b))
-            } else if n_prepared_samples == 1280 {
-                // Single chunk - only predict if we have enough features
-                let features = self.preprocessor.get_features(input_size, -1);
+            // Process this chunk through each model
+            for mdl in &model_names {
+                let n_feature_frames = self.model_inputs[mdl];
 
-                // Debug: Print feature information (remove this later)
-                // println!(
-                //     "🔍 Debug - Model: {}, Input size: {}, Features len: {}, Expected total: {}",
-                //     mdl,
-                //     input_size,
-                //     features.len(),
-                //     self.model_inputs[&mdl]
-                // );
+                // For single chunk processing (1280 samples), we expect to get the right number of features
+                if n_prepared_samples == 1280 {
+                    let features = self.preprocessor.get_features(n_feature_frames, -1);
+                    log::debug!(
+                        "🔍 Chunk {}: Model {}: got {} features, expected {}",
+                        chunk_idx,
+                        mdl,
+                        features.len(),
+                        n_feature_frames * 96
+                    );
 
-                // For now, let's try with a lower threshold to see if the model works
-                // We should have at least 960 features (10 embeddings × 96) to get meaningful results
-                if features.len() >= 960 {
-                    // Pad features to the required size if necessary
-                    let mut padded_features = features.clone();
-                    while padded_features.len() < self.model_inputs[&mdl] {
-                        padded_features.push(0.0);
+                    // Calculate feature stats for comparison with Python
+                    if !features.is_empty() {
+                        let mean = features.iter().sum::<f32>() / features.len() as f32;
+                        let min = features.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                        let max = features.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                        log::debug!(
+                            "🔍 Chunk {}: Model {}: feature stats: mean={:.6}, min={:.6}, max={:.6}",
+                            chunk_idx, mdl, mean, min, max
+                        );
                     }
-                    // println!(
-                    //     "🔍 Running model with {} features (padded to {})",
-                    //     features.len(),
-                    //     padded_features.len()
-                    // );
 
-                    Self::run_model_prediction_static(
-                        self.models.get_mut(&mdl).unwrap(),
-                        &padded_features,
-                    )?
-                } else {
-                    // Not enough features yet - use previous prediction
-                    // println!("🔍 Not enough features yet, using previous prediction");
-                    if let Some(last_pred) =
-                        self.prediction_buffer.get(&mdl).and_then(|buf| buf.back())
-                    {
-                        *last_pred
+                    // Only predict if we have enough features (don't pad with zeros)
+                    if features.len() >= n_feature_frames * 96 {
+                        let prediction = Self::run_model_prediction_static(
+                            self.models.get_mut(mdl).unwrap(),
+                            &features,
+                        )?;
+
+                        log::debug!(
+                            "🔍 Chunk {}: Model {}: raw prediction = {}",
+                            chunk_idx,
+                            mdl,
+                            prediction
+                        );
+
+                        // Take maximum prediction across chunks
+                        let current_max = final_predictions.get(mdl).unwrap_or(&0.0);
+                        if prediction > *current_max {
+                            final_predictions.insert(mdl.clone(), prediction);
+                        }
                     } else {
-                        0.0
-                    }
-                }
-            } else {
-                // Not enough samples - use previous prediction or zero
-                if let Some(last_pred) = self.prediction_buffer.get(&mdl).and_then(|buf| buf.back())
-                {
-                    *last_pred
-                } else {
-                    0.0
-                }
-            };
-
-            // Handle multi-class outputs
-            if output_size == 1 {
-                predictions.insert(mdl.clone(), prediction);
-            } else {
-                // Multi-class model - use class mappings
-                if let Some(mapping) = self.class_mapping.get(&mdl) {
-                    for (int_label, cls) in mapping {
-                        if let Ok(idx) = int_label.parse::<usize>() {
-                            // Would need to handle multiple outputs properly here
-                            predictions.insert(cls.clone(), prediction);
-                        }
+                        log::debug!(
+                            "🔍 Chunk {}: Model {}: insufficient features, skipping",
+                            chunk_idx,
+                            mdl
+                        );
                     }
                 } else {
-                    predictions.insert(mdl.clone(), prediction);
-                }
-            }
-
-            // Zero predictions for first 5 frames during model initialization
-            let prediction_keys: Vec<String> = predictions.keys().cloned().collect();
-            for key in prediction_keys {
-                if let Some(buffer) = self.prediction_buffer.get(&key) {
-                    if buffer.len() < 5 {
-                        predictions.insert(key, 0.0);
-                    }
+                    log::debug!(
+                        "🔍 Chunk {}: Model {}: unexpected prepared samples: {}",
+                        chunk_idx,
+                        mdl,
+                        n_prepared_samples
+                    );
                 }
             }
         }
 
-        // Apply debounce logic if specified (simplified version)
-        if debounce_time > 0.0 {
-            if let Some(thresh) = threshold {
-                for (model_name, prediction) in predictions.iter_mut() {
-                    if let Some(model_threshold) = thresh.get(model_name) {
-                        if *prediction >= *model_threshold {
-                            let n_frames = (debounce_time * 16000.0 / n_prepared_samples as f32)
-                                .ceil() as usize;
-                            if let Some(buffer) = self.prediction_buffer.get(model_name) {
-                                let recent_predictions: Vec<f32> =
-                                    buffer.iter().rev().take(n_frames).cloned().collect();
-                                if recent_predictions.iter().any(|&p| p >= *model_threshold) {
-                                    *prediction = 0.0;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // FIXME: This logic was zeroing out initial predictions
+        // Zero predictions for first 5 frames during model initialization (matches Python)
+        // for (model_name, prediction) in final_predictions.iter_mut() {
+        //     if let Some(buffer) = self.prediction_buffer.get(model_name) {
+        //         if buffer.len() < 5 {
+        //             log::debug!(
+        //                 "🔍 Zeroing prediction for {} (buffer length: {})",
+        //                 model_name,
+        //                 buffer.len()
+        //             );
+        //             *prediction = 0.0;
+        //         }
+        //     }
+        // }
 
-        // Update prediction buffers (matching Python logic)
-        for (model_name, prediction) in &predictions {
+        // Update prediction buffers (matches Python)
+        for (model_name, prediction) in &final_predictions {
             if let Some(buffer) = self.prediction_buffer.get_mut(model_name) {
                 buffer.push_back(*prediction);
                 if buffer.len() > 30 {
@@ -387,7 +351,23 @@ impl Model {
             }
         }
 
-        Ok(predictions)
+        // Handle thresholds and debounce (simplified for now)
+        if let Some(threshold_map) = threshold {
+            for (model_name, prediction) in final_predictions.iter_mut() {
+                if let Some(&threshold_value) = threshold_map.get(model_name) {
+                    if *prediction < threshold_value {
+                        *prediction = 0.0;
+                    }
+                }
+            }
+        }
+
+        // Handle debounce time (simplified)
+        if debounce_time > 0.0 {
+            // TODO: Implement debounce logic similar to Python
+        }
+
+        Ok(final_predictions)
     }
 
     /// Get parent model name from label (for multi-class models)
@@ -422,11 +402,34 @@ impl Model {
             OpenWakeWordError::ProcessingError(format!("Failed to get input tensor: {}", e))
         })?;
         let expected_size = input_tensor.shape().dimensions().iter().product::<usize>();
-        // println!(
-        //     "🔍 Static prediction - Features provided: {}, Expected by model: {}",
-        //     features.len(),
-        //     expected_size
-        // );
+        log::debug!(
+            "🔍 Rust Stage 3 - Wakeword input: {} features, Expected by model: {}",
+            features.len(),
+            expected_size
+        );
+
+        if features.is_empty() {
+            return Err(OpenWakeWordError::ProcessingError(
+                "No features provided to model - feature extraction failed".to_string(),
+            ));
+        }
+
+        // Debug: print wakeword input stats
+        if !features.is_empty() {
+            let mean = features.iter().sum::<f32>() / features.len() as f32;
+            let min = features.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            let max = features.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            log::debug!(
+                "🔍 Rust Stage 3 - Wakeword input stats: mean={:.6}, min={:.6}, max={:.6}",
+                mean,
+                min,
+                max
+            );
+            log::debug!(
+                "🔍 Rust Stage 3 - First 5 values: {:?}",
+                &features[..features.len().min(5)]
+            );
+        }
 
         // Copy features to input tensor
         interpreter.copy(features, 0).map_err(|e| {
@@ -448,7 +451,16 @@ impl Model {
             return Ok(0.0);
         }
 
+        // Debug: print actual model output
+        log::debug!(
+            "🔍 Rust Stage 3 - Wakeword output: {} values: {:?}",
+            output_data.len(),
+            &output_data[..output_data.len().min(5)]
+        );
+
         // Return first output value
-        Ok(output_data[0])
+        let result = output_data[0];
+        log::debug!("🔍 Rust Stage 3 - Wakeword prediction: {}", result);
+        Ok(result)
     }
 }

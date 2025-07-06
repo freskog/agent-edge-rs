@@ -1,51 +1,52 @@
 [package]
 name = "wakeword"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-description = "OpenWakeWord detection library using TensorFlow Lite"
-license.workspace = true
-
-[lib]
-name = "wakeword"
-path = "src/lib.rs"
-
-[[bin]]
-name = "wakeword"
-path = "src/main.rs"
-
-[features]
-default = ["xnnpack", "xnnpack_qs8"]
-xnnpack = ["tflitec/xnnpack"]
-xnnpack_qs8 = ["tflitec/xnnpack_qs8"]
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-audio_api = { path = "../audio_api" }
-
-# TensorFlow Lite (with XNNPACK)
-tflitec = { version = "0.6.0", features = ["xnnpack", "xnnpack_qs8"] }
-
-# Core functionality
-anyhow = "1.0"
-async-trait = "0.1"
-clap = { version = "4.0", features = ["derive"] }
-cpal = "0.16"
-dotenvy = "0.15"
-env_logger = "0.10"
-hound = "3.5"
-libc = "0.2"
+service-protos = { path = "../service-protos" }
+# tflitec is configured per-target below
 log = "0.4"
-num-traits = "0.2"
-rand = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-strum = { version = "0.26", features = ["derive"] }
-thiserror = "2.0"
+env_logger = "0.10"
+clap = { version = "4.0", features = ["derive"] }
+tonic = "0.13"
+futures = "0.3"
+hyper-util = "0.1"
+prost = "0.13"
 tokio = { version = "1.0", features = ["full"] }
+hound = "3.5"
+thiserror = "1.0"
+rand = "0.8"
+tower = { version = "0.4", features = ["util"] }
+
+# Target-specific dependencies: XNNPACK automatically enabled on aarch64 Linux
+[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+tflitec = { version = "0.6.0", features = [
+    "xnnpack",
+    "xnnpack_qu8",
+    "xnnpack_qs8",
+] }
+
+# For all other targets: tflitec without XNNPACK (permanently disabled)
+[target.'cfg(not(all(target_arch = "aarch64", target_os = "linux")))'.dependencies]
+tflitec = "0.6.0"
+
+[features]
+# XNNPACK features only work on aarch64 Linux due to target-specific dependencies
+xnnpack = []
+xnnpack_qu8 = []
+xnnpack_qs8 = []
 
 [dev-dependencies]
-tempfile = "3.0"
-
+hound = "3.5"
 
 [build-dependencies]
 cc = "1.0"
+
+[profile.release]
+debug = true  # Enable debug symbols in release builds
+strip = false # Don't strip debug symbols
+
+[profile.dev]
+debug = true  # Ensure debug symbols in dev builds
+opt-level = 0 # No optimization for better debugging

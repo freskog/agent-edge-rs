@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["agent", "wakeword", "audio_api"]
+members = ["agent", "wakeword", "audio_api", "service-protos"]
 
 [workspace.package]
 version = "0.1.0"

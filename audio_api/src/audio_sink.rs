@@ -1,9 +1,9 @@
-use crate::tonic::service::audio::{AudioFormat, SampleFormat};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BuildStreamError, DeviceNameError, DevicesError, PlayStreamError, SupportedStreamConfigsError,
 };
 use log::error;
+use service_protos::{AudioFormat, SampleFormat};
 // Rubato imports removed as they're not used in this implementation
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
