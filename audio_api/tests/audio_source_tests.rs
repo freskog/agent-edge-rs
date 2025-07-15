@@ -2,33 +2,6 @@ use audio_api::audio_source::{AudioCapture, AudioCaptureConfig};
 use log::info;
 
 #[tokio::test]
-async fn test_list_devices() {
-    match AudioCapture::list_devices() {
-        Ok(devices) => {
-            info!("Found {} audio device(s):", devices.len());
-            for (i, device) in devices.iter().enumerate() {
-                let default_marker = if device.is_default { " (default)" } else { "" };
-                info!(
-                    "  {}. {} [{}]{} - {} channels",
-                    i + 1,
-                    device.name,
-                    device.id,
-                    default_marker,
-                    device.channel_count
-                );
-            }
-            // Test passes if we can list devices, even if none are found
-            assert!(true, "Device listing completed successfully");
-        }
-        Err(e) => {
-            info!("Failed to list devices: {}", e);
-            // Don't fail the test if no devices are present
-            // This is expected in CI environments without audio hardware
-        }
-    }
-}
-
-#[tokio::test]
 #[cfg_attr(not(feature = "audio_available"), ignore)]
 async fn test_audio_capture() {
     let config = AudioCaptureConfig::default();

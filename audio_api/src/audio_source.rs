@@ -247,44 +247,9 @@ where
         .map_err(|e| AudioCaptureError::Stream(e.to_string()))
 }
 
-impl AudioCapture {
-    pub fn list_devices() -> Result<Vec<AudioDeviceInfo>, AudioCaptureError> {
-        let host = cpal::default_host();
-        let devices = host
-            .devices()
-            .map_err(|e| AudioCaptureError::Device(e.to_string()))?;
-
-        let default_device = host.default_input_device();
-
-        let mut result = Vec::new();
-        for device in devices {
-            if let Ok(name) = device.name() {
-                // Only try to get input config if the device supports input
-                if let Ok(config) = device.default_input_config() {
-                    result.push(AudioDeviceInfo {
-                        name: name.clone(),
-                        id: name.clone(),
-                        is_default: default_device
-                            .as_ref()
-                            .map(|d| d.name().unwrap_or_default())
-                            == Some(name),
-                        channel_count: u32::from(config.channels()),
-                    });
-                } else {
-                    // Device doesn't support input, skip it
-                    log::debug!("Device '{}' does not support input streams, skipping", name);
-                }
-            }
-        }
-
-        Ok(result)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_audio_capture_creation() {

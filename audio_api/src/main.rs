@@ -1,5 +1,5 @@
 use audio_api::audio_sink::CpalConfig;
-use audio_api::audio_source::{AudioCapture, AudioCaptureConfig};
+use audio_api::audio_source::AudioCaptureConfig;
 use audio_api::tonic::service::{run_server, run_server_unix, AudioServiceImpl};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create service with custom configurations
-    let service = AudioServiceImpl::new_with_capture_config(sink_config, capture_config)?;
+    let service = AudioServiceImpl::with_configs(sink_config, capture_config)?;
 
     if args.unix {
         info!(

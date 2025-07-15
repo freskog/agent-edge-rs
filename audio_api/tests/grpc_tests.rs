@@ -50,7 +50,7 @@ async fn start_unix_server() -> Result<
     // Remove socket file if it exists
     let _ = std::fs::remove_file(&socket_path);
 
-    let service = AudioServiceImpl::new_with_config(CpalConfig::default())?;
+    let service = AudioServiceImpl::with_cpal_config(CpalConfig::default())?;
 
     // Create Unix listener
     let uds = tokio::net::UnixListener::bind(&socket_path)?;
@@ -143,8 +143,8 @@ fn cleanup_socket(socket_path: &str) {
 
 #[tokio::test]
 async fn test_service_creation() {
-    let _service =
-        AudioServiceImpl::new_with_config(CpalConfig::default()).expect("Failed to create service");
+    let _service = AudioServiceImpl::with_cpal_config(CpalConfig::default())
+        .expect("Failed to create service");
     // Test that service can be created successfully
     assert!(true, "Service created successfully");
 }
@@ -153,7 +153,7 @@ async fn test_service_creation() {
 async fn test_service_with_configs() {
     let playback_config = CpalConfig::default();
 
-    let _service = AudioServiceImpl::new_with_config(playback_config)
+    let _service = AudioServiceImpl::with_cpal_config(playback_config)
         .expect("Failed to create service with configs");
 
     // Test that service can be created with custom configs
@@ -164,8 +164,8 @@ async fn test_service_with_configs() {
 async fn test_service_methods_available() {
     // This test verifies that the service implements the required trait methods
     // without actually calling them (which would require a running server)
-    let _service: AudioServiceImpl =
-        AudioServiceImpl::new_with_config(CpalConfig::default()).expect("Failed to create service");
+    let _service: AudioServiceImpl = AudioServiceImpl::with_cpal_config(CpalConfig::default())
+        .expect("Failed to create service");
 
     // If this compiles, the service has the required methods
     assert!(true, "Service implements required trait methods");
@@ -960,7 +960,7 @@ async fn test_record_and_playback_scenario() {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
 
     // Send playback request
-    let playback_request = PlayAudioRequest {
+    let _playback_request = PlayAudioRequest {
         stream_id: stream_id.clone(),
         data: None, // Will be set in the stream
     };
