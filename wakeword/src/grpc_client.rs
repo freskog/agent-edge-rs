@@ -168,15 +168,53 @@ impl WakewordGrpcClient {
                     .collect::<Vec<i16>>()
             }
             Some(service_protos::audio_chunk::Samples::FloatSamples(bytes)) => {
-                // Convert bytes to f32, then to i16
-                bytes
+                // Convert bytes to f32, then to i16 (standard conversion, no scaling)
+                let mut max_f32 = 0.0f32;
+                let mut max_i16 = 0i16;
+                let mut f32_samples = Vec::new();
+
+                let samples: Vec<i16> = bytes
                     .chunks_exact(4)
-                    .map(|chunk| {
+                    .enumerate()
+                    .map(|(i, chunk)| {
                         let float_sample =
                             f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        (float_sample * i16::MAX as f32) as i16
+                        max_f32 = max_f32.max(float_sample.abs());
+
+                        // Store first few samples for detailed logging
+                        if i < 10 {
+                            f32_samples.push(float_sample);
+                        }
+
+                        // Standard F32 [-1,1] to i16 conversion
+                        let i16_sample = (float_sample * i16::MAX as f32) as i16;
+                        max_i16 = max_i16.max(i16_sample.abs());
+                        i16_sample
                     })
-                    .collect::<Vec<i16>>()
+                    .collect();
+
+                // Detailed audio debugging
+                debug!("🔍 Raw F32 samples (first 10): {:?}", f32_samples);
+                debug!("🔍 F32 max_abs={:.8}, i16 max_abs={}", max_f32, max_i16);
+
+                // Check if audio is essentially silent
+                if max_f32 < 0.001 {
+                    warn!(
+                        "⚠️  Audio appears to be very quiet or silent! F32 max = {:.8}",
+                        max_f32
+                    );
+                }
+
+                // Log actual audio levels to understand the scale
+                if max_f32 > 0.0 {
+                    debug!(
+                        "📊 Audio conversion: F32 max={:.6}, i16 max={}, ratio={:.1}",
+                        max_f32,
+                        max_i16,
+                        max_i16 as f32 / max_f32
+                    );
+                }
+                samples
             }
             Some(other) => {
                 debug!("Unsupported sample format: {:?}", other);
@@ -190,8 +228,17 @@ impl WakewordGrpcClient {
 
         debug!("📦 Received {} samples", samples.len());
 
+        // Show sample statistics for debugging
+        if !samples.is_empty() {
+            let max_sample = samples.iter().map(|&x| x.abs()).max().unwrap_or(0);
+            let avg_sample =
+                samples.iter().map(|&x| x.abs() as u32).sum::<u32>() / samples.len() as u32;
+            debug!("📊 Sample levels: max={}, avg={}", max_sample, avg_sample);
+        }
+
         // Add samples to buffer
         audio_buffer.extend_from_slice(&samples);
+        debug!("📊 Buffer now has {} samples", audio_buffer.len());
 
         // Process audio when we have enough samples (e.g., 1 second = 16000 samples)
         const DETECTION_WINDOW_SAMPLES: usize = 16000; // 1 second at 16kHz
@@ -204,9 +251,15 @@ impl WakewordGrpcClient {
                 .copied()
                 .collect::<Vec<i16>>();
 
+            info!(
+                "🔍 Running wake word detection on {} samples",
+                detection_samples.len()
+            );
+
             // Perform wake word detection
             match self.model.predict(&detection_samples, None, 1.0) {
                 Ok(predictions) => {
+                    info!("📊 Detection results: {:?}", predictions);
                     self.handle_predictions(predictions).await;
                 }
                 Err(e) => {
@@ -235,11 +288,11 @@ impl WakewordGrpcClient {
                 );
 
                 // TODO: Add metrics, webhooks, or other actions here
-            } else if confidence > 0.1 {
-                // Log lower confidence detections at debug level
-                debug!(
-                    "🔍 Low confidence detection: '{}' with confidence {:.3}",
-                    model_name, confidence
+            } else {
+                // Log all confidence scores at info level for debugging
+                info!(
+                    "🔍 Detection result: '{}' with confidence {:.3} (threshold: {:.3})",
+                    model_name, confidence, self.detection_threshold
                 );
             }
         }

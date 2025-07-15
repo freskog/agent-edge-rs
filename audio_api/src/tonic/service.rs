@@ -183,29 +183,36 @@ impl AudioCaptureService {
             // Update config to use the actual detected sample rate
             config.sample_rate = actual_sample_rate;
 
-            // Spawn a blocking task for audio capture since CPAL isn't async-friendly
-            std::thread::spawn(move || {
+            // Spawn a tokio task to handle audio capture with the new async interface
+            tokio::spawn(async move {
                 use crate::audio_source::AudioCapture;
+                use futures::StreamExt;
 
-                // We don't need a sync channel for this implementation
-
-                // Try to create audio capture
-                let _capture = match AudioCapture::new(config.clone(), sender_clone) {
+                // Create audio capture with new async interface
+                let capture = match AudioCapture::new(config).await {
                     Ok(capture) => {
                         info!("🎤 Audio capture initialized successfully");
-                        Some(capture)
+                        capture
                     }
                     Err(e) => {
                         warn!("🎤 Audio capture initialization failed: {} - service will run without capture", e);
-                        None
+                        return;
                     }
                 };
 
-                // Keep the thread alive to maintain the audio capture
-                // In a real implementation, you'd want a proper shutdown mechanism
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
+                // Process audio chunks using StreamExt combinators
+                capture
+                    .for_each(|chunk| {
+                        let sender = sender_clone.clone();
+                        async move {
+                            if sender.send(chunk).await.is_err() {
+                                info!("🎤 Audio capture receiver dropped, stopping capture");
+                            }
+                        }
+                    })
+                    .await;
+
+                info!("🎤 Audio capture task ended");
             });
         }
     }

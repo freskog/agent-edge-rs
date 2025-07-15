@@ -32,9 +32,8 @@ async fn test_list_devices() {
 #[cfg_attr(not(feature = "audio_available"), ignore)]
 async fn test_audio_capture() {
     let config = AudioCaptureConfig::default();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
 
-    let _audio_capture = match AudioCapture::new(config, tx) {
+    let mut audio_capture = match AudioCapture::new(config).await {
         Ok(capture) => capture,
         Err(e) => {
             info!("Audio device not available - skipping: {}", e);
@@ -49,7 +48,7 @@ async fn test_audio_capture() {
     loop {
         tokio::select! {
             _ = &mut timeout => break,
-            chunk = rx.recv() => {
+            chunk = audio_capture.next_chunk() => {
                 match chunk {
                     Some(_chunk) => {
                         chunk_count += 1;
@@ -57,7 +56,7 @@ async fn test_audio_capture() {
                             info!("Captured {} chunks", chunk_count);
                         }
                     }
-                    None => break, // Channel closed
+                    None => break, // Stream ended
                 }
             }
         }

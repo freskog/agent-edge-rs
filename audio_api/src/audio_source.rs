@@ -1,7 +1,12 @@
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, FromSample, Host, Sample, SampleFormat, SizedSample, Stream as CpalStream,
+    Device, FromSample, Sample, SampleFormat, SizedSample, Stream as CpalStream,
 };
+use futures::Stream;
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::HeapRb;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -52,16 +57,36 @@ pub struct AudioDeviceInfo {
 
 /// Simple audio capture that streams chunks directly
 pub struct AudioCapture {
-    _stream: CpalStream, // Keep stream alive
-    _host: Host,         // Keep host alive
+    receiver: tokio_mpsc::Receiver<[f32; CHUNK_SIZE]>,
 }
 
 impl AudioCapture {
-    /// Create a new audio capture that sends chunks via a channel
-    pub fn new(
+    /// Create a new audio capture with clean async interface
+    pub async fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
+        let (sender, receiver) = tokio_mpsc::channel(100);
+
+        // Spawn internal thread to manage CPAL resources
+        std::thread::spawn(move || {
+            if let Err(e) = Self::run_capture_thread(config, sender) {
+                log::error!("Audio capture thread failed: {}", e);
+            }
+        });
+
+        // Give the thread a moment to initialize
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        Ok(Self { receiver })
+    }
+
+    /// Get the next audio chunk
+    pub async fn next_chunk(&mut self) -> Option<[f32; CHUNK_SIZE]> {
+        self.receiver.recv().await
+    }
+    /// Internal function that runs in the CPAL thread
+    fn run_capture_thread(
         config: AudioCaptureConfig,
         sender: tokio_mpsc::Sender<[f32; CHUNK_SIZE]>,
-    ) -> Result<Self, AudioCaptureError> {
+    ) -> Result<(), AudioCaptureError> {
         let host = cpal::default_host();
         log::info!("🎤 Initializing audio capture with host: {:?}", host.id());
 
@@ -109,7 +134,7 @@ impl AudioCapture {
 
         // Build the stream with the appropriate sample format
         let stream = match supported_config.sample_format() {
-            SampleFormat::I16 => Self::create_input_stream::<i16>(
+            SampleFormat::I16 => create_input_stream::<i16>(
                 &device,
                 &stream_config,
                 channel,
@@ -117,7 +142,7 @@ impl AudioCapture {
                 sender,
                 err_fn,
             )?,
-            SampleFormat::U16 => Self::create_input_stream::<u16>(
+            SampleFormat::U16 => create_input_stream::<u16>(
                 &device,
                 &stream_config,
                 channel,
@@ -125,7 +150,7 @@ impl AudioCapture {
                 sender,
                 err_fn,
             )?,
-            SampleFormat::F32 => Self::create_input_stream::<f32>(
+            SampleFormat::F32 => create_input_stream::<f32>(
                 &device,
                 &stream_config,
                 channel,
@@ -144,69 +169,85 @@ impl AudioCapture {
             .play()
             .map_err(|e| AudioCaptureError::Stream(e.to_string()))?;
 
-        Ok(Self {
-            _stream: stream,
-            _host: host,
-        })
+        // Keep the stream and host alive by holding them in this thread
+        let _stream = stream;
+        let _host = host;
+
+        // Keep the thread alive to maintain the audio capture
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
+}
 
-    fn create_input_stream<T>(
-        device: &Device,
-        config: &cpal::StreamConfig,
-        channel: u32,
-        channels: usize,
-        sender: tokio_mpsc::Sender<[f32; CHUNK_SIZE]>,
-        err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
-    ) -> Result<CpalStream, AudioCaptureError>
-    where
-        T: Sample + SizedSample + Send + Sync + 'static,
-        f32: FromSample<T>,
-    {
-        // Use Arc<Mutex> to share state between callbacks
-        use std::sync::{Arc, Mutex};
+impl Stream for AudioCapture {
+    type Item = [f32; CHUNK_SIZE];
 
-        let buffer_state = Arc::new(Mutex::new(([0.0f32; CHUNK_SIZE], 0usize)));
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
 
-        device
-            .build_input_stream(
-                config,
-                move |data: &[T], _: &cpal::InputCallbackInfo| {
-                    // Extract the specified channel and convert to f32
-                    for frame in data.chunks(channels) {
-                        if let Some(sample) = frame.get(channel as usize) {
-                            let value = f32::from_sample(*sample);
+fn create_input_stream<T>(
+    device: &Device,
+    config: &cpal::StreamConfig,
+    channel: u32,
+    channels: usize,
+    sender: tokio_mpsc::Sender<[f32; CHUNK_SIZE]>,
+    err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
+) -> Result<CpalStream, AudioCaptureError>
+where
+    T: Sample + SizedSample + Send + Sync + 'static,
+    f32: FromSample<T>,
+{
+    let rb = HeapRb::<[f32; CHUNK_SIZE]>::new(16);
 
-                            // Update buffer state
-                            if let Ok(mut state) = buffer_state.lock() {
-                                let (ref mut sample_buffer, ref mut sample_count) = *state;
+    let (mut prod, mut cons) = rb.split();
 
-                                // Add sample to buffer
-                                if *sample_count < CHUNK_SIZE {
-                                    sample_buffer[*sample_count] = value;
-                                    *sample_count += 1;
-                                }
+    // Spawn a thread with its own runtime for the ringbuffer reader
+    // This bridges the sync CPAL world with the async tokio world
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            loop {
+                if let Some(chunk) = cons.try_pop() {
+                    if sender.send(chunk).await.is_err() {
+                        break;
+                    }
+                } else {
+                    // No data available, sleep briefly to avoid busy-waiting
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+    });
 
-                                // If we have enough samples, send a chunk
-                                if *sample_count >= CHUNK_SIZE {
-                                    let chunk = *sample_buffer;
-                                    *sample_buffer = [0.0f32; CHUNK_SIZE];
-                                    *sample_count = 0;
+    let mut buf = [0.0; CHUNK_SIZE];
+    let mut i = 0;
 
-                                    // Use try_send since we're in a sync callback
-                                    if let Err(_) = sender.try_send(chunk) {
-                                        log::debug!("Audio capture: failed to send chunk (channel full or closed)");
-                                    }
-                                }
-                            }
+    device
+        .build_input_stream(
+            config,
+            move |data: &[T], _| {
+                for frame in data.chunks(channels) {
+                    if let Some(s) = frame.get(channel as usize) {
+                        buf[i] = f32::from_sample(*s);
+                        i += 1;
+                        if i == CHUNK_SIZE {
+                            let _ = prod.try_push(buf);
+                            buf = [0.0; CHUNK_SIZE];
+                            i = 0;
                         }
                     }
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| AudioCaptureError::Stream(e.to_string()))
-    }
+                }
+            },
+            err_fn,
+            None,
+        )
+        .map_err(|e| AudioCaptureError::Stream(e.to_string()))
+}
 
+impl AudioCapture {
     pub fn list_devices() -> Result<Vec<AudioDeviceInfo>, AudioCaptureError> {
         let host = cpal::default_host();
         let devices = host
@@ -247,9 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_audio_capture_creation() {
-        let (tx, _rx) = mpsc::channel(100);
-
-        match AudioCapture::new(AudioCaptureConfig::default(), tx) {
+        match AudioCapture::new(AudioCaptureConfig::default()).await {
             Ok(_capture) => {
                 // Successfully created
             }

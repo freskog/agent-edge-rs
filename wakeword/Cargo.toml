@@ -39,6 +39,9 @@ xnnpack_qs8 = []
 
 [dev-dependencies]
 hound = "3.5"
+audio_api = { path = "../audio_api" }
+tokio-stream = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
 
 [build-dependencies]
 cc = "1.0"
