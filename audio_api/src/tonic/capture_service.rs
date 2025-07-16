@@ -1,5 +1,6 @@
-use crate::audio_converter::AudioConverter;
 use crate::audio_source::{AudioCaptureConfig, CHUNK_SIZE};
+use crate::platform::AudioPlatform;
+use crate::platform_converter::{create_capture_converter, PlatformConverter};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,34 +21,32 @@ pub struct AudioSubscriber {
 pub struct AudioCaptureService {
     subscribers: Arc<RwLock<HashMap<String, AudioSubscriber>>>,
     audio_sender: Option<mpsc::Sender<[f32; CHUNK_SIZE]>>,
-    capture_sample_rate: u32,
-    target_sample_rate: u32,
+    platform: AudioPlatform,
 }
 
 impl AudioCaptureService {
-    pub fn new(config: AudioCaptureConfig) -> Result<Self, AudioError> {
+    pub fn new(platform: AudioPlatform, config: AudioCaptureConfig) -> Result<Self, AudioError> {
         // We'll create the actual audio capture in a separate thread to avoid Send/Sync issues
         let (audio_tx, audio_rx) = mpsc::channel(100);
 
-        // Detect the actual device sample rate
-        let actual_sample_rate = Self::detect_device_sample_rate(&config)?;
+        // Get platform configuration
+        let platform_config = platform.capture_config();
         info!(
-            "🎤 Detected device sample rate: {}Hz (config requested: {}Hz)",
-            actual_sample_rate, config.sample_rate
+            "🎤 Platform capture setup: {} ({})",
+            platform_config.description, platform_config.preferred_format
         );
 
         let service = Self {
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             audio_sender: Some(audio_tx),
-            capture_sample_rate: actual_sample_rate,
-            target_sample_rate: 16000, // Always output at 16kHz
+            platform,
         };
 
         // Start the audio distribution task
         service.start_audio_distribution(audio_rx);
 
-        // Try to start audio capture in a separate thread
-        service.start_audio_capture(config.clone());
+        // Start audio capture in a separate thread
+        service.start_audio_capture(config);
 
         Ok(service)
     }
@@ -102,7 +101,15 @@ impl AudioCaptureService {
     fn start_audio_capture(&self, mut config: AudioCaptureConfig) {
         if let Some(sender) = &self.audio_sender {
             let sender_clone = sender.clone();
-            let actual_sample_rate = self.capture_sample_rate;
+
+            // Detect actual device sample rate
+            let actual_sample_rate = match Self::detect_device_sample_rate(&config) {
+                Ok(rate) => rate,
+                Err(e) => {
+                    error!("Failed to detect device sample rate: {}", e);
+                    return;
+                }
+            };
 
             // Update config to use the actual detected sample rate
             config.sample_rate = actual_sample_rate;
@@ -143,33 +150,31 @@ impl AudioCaptureService {
 
     fn start_audio_distribution(&self, mut capture_receiver: mpsc::Receiver<[f32; CHUNK_SIZE]>) {
         let subscribers = Arc::clone(&self.subscribers);
-        let capture_rate = self.capture_sample_rate;
-        let target_rate = self.target_sample_rate;
+        let platform = self.platform;
 
         tokio::spawn(async move {
             info!(
-                "🎤 Audio distribution task started ({}Hz -> {}Hz)",
-                capture_rate, target_rate
+                "🎤 Audio distribution task started for platform: {}",
+                platform
             );
 
-            // Create audio converter for resampling and format conversion
-            let input_format = AudioFormat {
-                sample_rate: capture_rate,
-                channels: 1,
-                sample_format: audio::SampleFormat::F32 as i32,
-            };
-            let target_format = AudioFormat {
-                sample_rate: target_rate,
-                channels: 1,
-                sample_format: audio::SampleFormat::F32 as i32,
-            };
+            // Create platform converter for capture (device rate -> STT format)
+            // For now, assume device runs at platform's preferred rate
+            let platform_config = platform.capture_config();
+            let mut converter =
+                match create_capture_converter(platform, platform_config.preferred_sample_rate) {
+                    Ok(conv) => conv,
+                    Err(e) => {
+                        error!("Failed to create platform converter: {}", e);
+                        return;
+                    }
+                };
 
-            let mut converter = match AudioConverter::new(&input_format, &target_format) {
-                Ok(conv) => conv,
-                Err(e) => {
-                    error!("Failed to create audio converter: {}", e);
-                    return;
-                }
+            // Target format for STT/Wakeword (always 16kHz i16 mono)
+            let target_format = AudioFormat {
+                sample_rate: 16000,
+                channels: 1,
+                sample_format: audio::SampleFormat::I16 as i32,
             };
 
             loop {
@@ -182,13 +187,13 @@ impl AudioCaptureService {
                     }
                 };
 
-                // Convert samples using AudioConverter (handles resampling)
+                // Convert samples using PlatformConverter
                 match converter.convert(&chunk) {
                     Ok(converted_bytes) => {
                         if !converted_bytes.is_empty() {
-                            // Create AudioChunk from converted bytes
+                            // Create AudioChunk from converted bytes (i16 format)
                             let audio_chunk = AudioChunk {
-                                samples: Some(audio::audio_chunk::Samples::FloatSamples(
+                                samples: Some(audio::audio_chunk::Samples::Int16Samples(
                                     converted_bytes,
                                 )),
                                 timestamp_ms: std::time::SystemTime::now()

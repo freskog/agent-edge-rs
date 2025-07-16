@@ -334,13 +334,10 @@ impl CpalSink {
         let output_sample_rate = stream_config.sample_rate.0;
         let output_channels = stream_config.channels;
 
-        // Convert CPAL sample format to gRPC SampleFormat
+        // Convert CPAL sample format to gRPC SampleFormat (simplified to only i16/f32)
         let _sample_format = match supported_config.sample_format() {
             cpal::SampleFormat::I16 => SampleFormat::I16,
             cpal::SampleFormat::F32 => SampleFormat::F32,
-            cpal::SampleFormat::I24 => SampleFormat::I24,
-            cpal::SampleFormat::I32 => SampleFormat::I32,
-            cpal::SampleFormat::F64 => SampleFormat::F64,
             _ => {
                 log::warn!("Unsupported CPAL sample format, defaulting to F32");
                 SampleFormat::F32
@@ -578,17 +575,14 @@ impl AudioSink for CpalSink {
             return Err(AudioError::WriteError("Audio sink is stopped".to_string()));
         }
 
-        // Convert bytes to f32 samples based on expected format
+        // Convert bytes to f32 samples based on expected format (only i16 and f32 supported)
         let expected_format = self.get_format();
         let samples_per_byte = match expected_format.sample_format {
             1 => 2, // I16: 2 bytes per sample
-            2 => 3, // I24: 3 bytes per sample
-            3 => 4, // I32: 4 bytes per sample
             4 => 4, // F32: 4 bytes per sample
-            5 => 8, // F64: 8 bytes per sample
             _ => {
                 return Err(AudioError::WriteError(
-                    "Unsupported sample format".to_string(),
+                    "Unsupported sample format - only I16 and F32 are supported".to_string(),
                 ))
             }
         };
@@ -607,25 +601,35 @@ impl AudioSink for CpalSink {
             expected_format.channels,
             match expected_format.sample_format {
                 1 => "I16",
-                2 => "I24",
-                3 => "I32",
                 4 => "F32",
-                5 => "F64",
                 _ => "Unknown",
             }
         );
 
-        // Convert to f32 samples (assuming F32 format for now)
-        let samples: Vec<f32> = if expected_format.sample_format == 4 {
-            // F32 format
-            audio_data
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect()
-        } else {
-            return Err(AudioError::WriteError(
-                "Only F32 sample format currently supported".to_string(),
-            ));
+        // Convert to f32 samples based on format
+        let samples: Vec<f32> = match expected_format.sample_format {
+            1 => {
+                // I16 format: convert to f32
+                audio_data
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        let i16_sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        i16_sample as f32 / 32768.0 // Scale to [-1.0, 1.0]
+                    })
+                    .collect()
+            }
+            4 => {
+                // F32 format: direct conversion
+                audio_data
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect()
+            }
+            _ => {
+                return Err(AudioError::WriteError(
+                    "Unsupported sample format".to_string(),
+                ));
+            }
         };
 
         log::debug!(

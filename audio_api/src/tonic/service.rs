@@ -1,7 +1,8 @@
 use super::capture_service::AudioCaptureService;
-use crate::audio_converter::AudioConverter;
 use crate::audio_sink::{AudioError, AudioSink, CpalConfig, CpalSink};
 use crate::audio_source::AudioCaptureConfig;
+use crate::platform::AudioPlatform;
+use crate::platform_converter::{create_playback_converter, PlatformConverter};
 use futures::StreamExt;
 use log::{debug, error, info};
 
@@ -22,7 +23,7 @@ use service_protos::audio;
 
 /// Helper function to extract f32 samples from AudioChunk
 fn extract_f32_samples(chunk: &AudioChunk) -> Result<Vec<f32>, Status> {
-    // Convert bytes to f32 samples based on format
+    // Convert bytes to f32 samples based on format (only i16 and f32 supported)
     match &chunk.samples {
         Some(audio::audio_chunk::Samples::FloatSamples(bytes)) => {
             if bytes.len() % 4 != 0 {
@@ -42,37 +43,13 @@ fn extract_f32_samples(chunk: &AudioChunk) -> Result<Vec<f32>, Status> {
             let mut samples = Vec::with_capacity(bytes.len() / 2);
             for chunk in bytes.chunks(2) {
                 let i16_sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                // Convert i16 to f32: scale from [-32768, 32767] to [-1.0, 1.0]
                 let f32_sample = i16_sample as f32 / 32768.0;
                 samples.push(f32_sample);
             }
             Ok(samples)
         }
-        Some(audio::audio_chunk::Samples::Int32Samples(bytes)) => {
-            if bytes.len() % 4 != 0 {
-                return Err(Status::invalid_argument("Invalid i32 sample data length"));
-            }
-            let mut samples = Vec::with_capacity(bytes.len() / 4);
-            for chunk in bytes.chunks(4) {
-                let i32_sample = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let f32_sample = i32_sample as f32 / 2147483648.0;
-                samples.push(f32_sample);
-            }
-            Ok(samples)
-        }
-        Some(audio::audio_chunk::Samples::Float64Samples(bytes)) => {
-            if bytes.len() % 8 != 0 {
-                return Err(Status::invalid_argument("Invalid f64 sample data length"));
-            }
-            let mut samples = Vec::with_capacity(bytes.len() / 8);
-            for chunk in bytes.chunks(8) {
-                let f64_sample = f64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ]);
-                samples.push(f64_sample as f32);
-            }
-            Ok(samples)
-        }
-        _ => unreachable!(), // Already handled above
+        None => Err(Status::invalid_argument("Missing audio sample data")),
     }
 }
 
@@ -81,6 +58,7 @@ pub struct AudioServiceImpl {
     audio_sink: Arc<dyn AudioSink>,
     target_format: AudioFormat,
     capture_service: Arc<AudioCaptureService>,
+    platform: AudioPlatform,
 }
 
 impl AudioServiceImpl {
@@ -92,12 +70,17 @@ impl AudioServiceImpl {
             target_format.sample_rate, target_format.channels, target_format.sample_format
         );
 
-        let capture_service = Arc::new(AudioCaptureService::new(AudioCaptureConfig::default())?);
+        // Use default platform (RaspberryPi) for now - this should be passed from main
+        let capture_service = Arc::new(AudioCaptureService::new(
+            AudioPlatform::RaspberryPi,
+            AudioCaptureConfig::default(),
+        )?);
 
         Ok(Self {
             audio_sink,
             target_format,
             capture_service,
+            platform: AudioPlatform::RaspberryPi, // Initialize platform
         })
     }
 
@@ -119,12 +102,43 @@ impl AudioServiceImpl {
             target_format.sample_rate, target_format.channels, target_format.sample_format
         );
 
-        let capture_service = Arc::new(AudioCaptureService::new(capture_config)?);
+        // Use default platform (RaspberryPi) for now - this should be passed from main
+        let capture_service = Arc::new(AudioCaptureService::new(
+            AudioPlatform::RaspberryPi,
+            capture_config,
+        )?);
 
         Ok(Self {
             audio_sink,
             target_format,
             capture_service,
+            platform: AudioPlatform::RaspberryPi, // Initialize platform
+        })
+    }
+
+    /// Create a new AudioServiceImpl with platform-specific configurations
+    pub fn with_platform_configs(
+        platform: AudioPlatform,
+        audio_config: CpalConfig,
+        capture_config: AudioCaptureConfig,
+    ) -> Result<Self, AudioError> {
+        let audio_sink = Arc::new(CpalSink::new(audio_config)?);
+        let target_format = audio_sink.get_format();
+        info!(
+            "🔊 Audio sink created with target format: {}Hz, {}ch, {} (platform: {})",
+            target_format.sample_rate,
+            target_format.channels,
+            target_format.sample_format,
+            platform
+        );
+
+        let capture_service = Arc::new(AudioCaptureService::new(platform, capture_config)?);
+
+        Ok(Self {
+            audio_sink,
+            target_format,
+            capture_service,
+            platform: platform, // Set the platform
         })
     }
 
@@ -133,7 +147,7 @@ impl AudioServiceImpl {
         &self,
         mut stream: tonic::Streaming<PlayAudioRequest>,
     ) -> Result<PlayResponse, Status> {
-        let mut converter: Option<AudioConverter> = None;
+        let mut converter: Option<PlatformConverter> = None;
         let mut chunks_played = 0;
 
         info!("🔊 Starting playback stream processing");
@@ -152,11 +166,29 @@ impl AudioServiceImpl {
                             Status::invalid_argument("First chunk must include format metadata")
                         })?;
 
-                        let conv = AudioConverter::new(input_format, &self.target_format).map_err(
-                            |e| Status::invalid_argument(format!("Audio format error: {e}")),
-                        )?;
+                        // Create platform-specific converter for playback
+                        // Input: whatever format the client sends (TTS data)
+                        // Output: platform's playback format (DAC)
+                        let platform_playback = self.platform.playback_config();
+                        let tts_format = self.platform.tts_format();
+
+                        // For simplicity, assume TTS input matches our standard TTS format
+                        let conv = PlatformConverter::new(
+                            self.platform,
+                            tts_format.sample_rate,
+                            platform_playback.sample_rate,
+                            tts_format.format,
+                            platform_playback.format,
+                        )
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("Platform converter error: {e}"))
+                        })?;
+
                         converter = Some(conv);
-                        info!("🔊 Playback stream initialized successfully");
+                        info!(
+                            "🔊 Playback stream initialized successfully for platform: {}",
+                            self.platform
+                        );
                     }
 
                     // Extract f32 samples from the chunk
@@ -185,12 +217,65 @@ impl AudioServiceImpl {
                         );
 
                         if !processed.is_empty() {
+                            // Apply mono->stereo conversion if needed (TTS is mono, hardware expects stereo)
+                            let platform_config = self.platform.playback_config();
+                            let final_bytes = if platform_config.channels == 2 {
+                                // Convert mono samples to stereo samples, then back to bytes
+                                use crate::platform_converter::mono_to_stereo;
+
+                                // Convert bytes back to samples for stereo conversion
+                                let mono_samples: Vec<f32> = match platform_config.format {
+                                    crate::platform::PlatformSampleFormat::F32 => processed
+                                        .chunks_exact(4)
+                                        .map(|chunk| {
+                                            f32::from_le_bytes([
+                                                chunk[0], chunk[1], chunk[2], chunk[3],
+                                            ])
+                                        })
+                                        .collect(),
+                                    crate::platform::PlatformSampleFormat::I16 => processed
+                                        .chunks_exact(2)
+                                        .map(|chunk| {
+                                            let i16_sample =
+                                                i16::from_le_bytes([chunk[0], chunk[1]]);
+                                            i16_sample as f32 / 32768.0
+                                        })
+                                        .collect(),
+                                };
+
+                                let stereo_samples = mono_to_stereo(&mono_samples);
+
+                                // Convert stereo samples back to bytes
+                                match platform_config.format {
+                                    crate::platform::PlatformSampleFormat::F32 => {
+                                        let mut bytes =
+                                            Vec::with_capacity(stereo_samples.len() * 4);
+                                        for &sample in &stereo_samples {
+                                            bytes.extend_from_slice(&sample.to_le_bytes());
+                                        }
+                                        bytes
+                                    }
+                                    crate::platform::PlatformSampleFormat::I16 => {
+                                        let mut bytes =
+                                            Vec::with_capacity(stereo_samples.len() * 2);
+                                        for &sample in &stereo_samples {
+                                            let clamped = sample.clamp(-1.0, 1.0);
+                                            let i16_sample = (clamped * 32767.0) as i16;
+                                            bytes.extend_from_slice(&i16_sample.to_le_bytes());
+                                        }
+                                        bytes
+                                    }
+                                }
+                            } else {
+                                processed // Mono output, use as-is
+                            };
+
                             // Write to audio sink with simple retry logic
                             let mut retries = 0;
                             const MAX_RETRIES: u32 = 3;
 
                             loop {
-                                match self.audio_sink.write(&processed).await {
+                                match self.audio_sink.write(&final_bytes).await {
                                     Ok(_) => break,
                                     Err(AudioError::BufferFull) if retries < MAX_RETRIES => {
                                         retries += 1;
@@ -228,7 +313,57 @@ impl AudioServiceImpl {
                         debug!("🔊 Flush processed {} bytes", processed.len());
 
                         if !processed.is_empty() {
-                            self.audio_sink.write(&processed).await.map_err(|e| {
+                            // Apply same mono->stereo conversion as regular processing
+                            let platform_config = self.platform.playback_config();
+                            let final_bytes = if platform_config.channels == 2 {
+                                use crate::platform_converter::mono_to_stereo;
+
+                                let mono_samples: Vec<f32> = match platform_config.format {
+                                    crate::platform::PlatformSampleFormat::F32 => processed
+                                        .chunks_exact(4)
+                                        .map(|chunk| {
+                                            f32::from_le_bytes([
+                                                chunk[0], chunk[1], chunk[2], chunk[3],
+                                            ])
+                                        })
+                                        .collect(),
+                                    crate::platform::PlatformSampleFormat::I16 => processed
+                                        .chunks_exact(2)
+                                        .map(|chunk| {
+                                            let i16_sample =
+                                                i16::from_le_bytes([chunk[0], chunk[1]]);
+                                            i16_sample as f32 / 32768.0
+                                        })
+                                        .collect(),
+                                };
+
+                                let stereo_samples = mono_to_stereo(&mono_samples);
+
+                                match platform_config.format {
+                                    crate::platform::PlatformSampleFormat::F32 => {
+                                        let mut bytes =
+                                            Vec::with_capacity(stereo_samples.len() * 4);
+                                        for &sample in &stereo_samples {
+                                            bytes.extend_from_slice(&sample.to_le_bytes());
+                                        }
+                                        bytes
+                                    }
+                                    crate::platform::PlatformSampleFormat::I16 => {
+                                        let mut bytes =
+                                            Vec::with_capacity(stereo_samples.len() * 2);
+                                        for &sample in &stereo_samples {
+                                            let clamped = sample.clamp(-1.0, 1.0);
+                                            let i16_sample = (clamped * 32767.0) as i16;
+                                            bytes.extend_from_slice(&i16_sample.to_le_bytes());
+                                        }
+                                        bytes
+                                    }
+                                }
+                            } else {
+                                processed
+                            };
+
+                            self.audio_sink.write(&final_bytes).await.map_err(|e| {
                                 error!("Playback error: {}", e);
                                 Status::internal(format!("Playback error: {}", e))
                             })?;

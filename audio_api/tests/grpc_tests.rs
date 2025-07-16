@@ -24,9 +24,6 @@ fn get_sample_count(chunk: &AudioChunk) -> usize {
     match &chunk.samples {
         Some(service_protos::audio_chunk::Samples::FloatSamples(bytes)) => bytes.len() / 4,
         Some(service_protos::audio_chunk::Samples::Int16Samples(bytes)) => bytes.len() / 2,
-        Some(service_protos::audio_chunk::Samples::Int32Samples(bytes)) => bytes.len() / 4,
-        Some(service_protos::audio_chunk::Samples::Float64Samples(bytes)) => bytes.len() / 8,
-        Some(service_protos::audio_chunk::Samples::Int24Samples(bytes)) => bytes.len() / 3,
         None => 0,
     }
 }

@@ -1,6 +1,7 @@
 use audio_api::audio_sink::CpalConfig;
 use audio_api::audio_source::AudioCaptureConfig;
 use audio_api::tonic::service::{run_server, run_server_unix, AudioServiceImpl};
+use audio_api::AudioPlatform;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait};
 use log::{info, warn};
@@ -53,6 +54,10 @@ struct Args {
     #[arg(long, default_value = "0")]
     input_channel: u32,
 
+    /// Target audio platform (raspberry-pi or macos)
+    #[arg(long, value_enum, default_value = "raspberry-pi")]
+    platform: AudioPlatform,
+
     /// Show detailed device information
     #[arg(long)]
     verbose_devices: bool,
@@ -69,21 +74,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Create audio sink configuration
+    // Log platform information
+    let platform_capture = args.platform.capture_config();
+    let platform_playback = args.platform.playback_config();
+
+    info!("🎯 Target platform: {}", args.platform);
+    info!(
+        "🎤 Platform capture: {} ({})",
+        platform_capture.description, platform_capture.preferred_format
+    );
+    info!(
+        "🔊 Platform playback: {} ({})",
+        platform_playback.description, platform_playback.format
+    );
+
+    // Create audio sink configuration based on platform
     let sink_config = CpalConfig {
         device_name: args.output_device.clone(),
+        // Platform-specific defaults will be applied in CpalSink based on platform
         ..Default::default()
     };
 
-    // Create audio capture configuration
+    // Create audio capture configuration based on platform
     let capture_config = AudioCaptureConfig {
         device_id: args.input_device.clone(),
         channel: args.input_channel,
-        ..Default::default()
+        // Use platform-preferred sample rate if not overridden
+        sample_rate: platform_capture.preferred_sample_rate,
+        channels: 1, // Always mono for STT/Wakeword
     };
 
-    // Create service with custom configurations
-    let service = AudioServiceImpl::with_configs(sink_config, capture_config)?;
+    // Create service with platform-aware configurations
+    let service =
+        AudioServiceImpl::with_platform_configs(args.platform, sink_config, capture_config)?;
 
     if args.unix {
         info!(

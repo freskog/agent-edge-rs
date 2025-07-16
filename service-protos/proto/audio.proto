@@ -31,22 +31,16 @@ message AudioFormat {
 // Sample format enumeration
 enum SampleFormat {
     UNKNOWN = 0;
-    I16 = 1;     // 16-bit signed integer
-    I24 = 2;     // 24-bit signed integer
-    I32 = 3;     // 32-bit signed integer
-    F32 = 4;     // 32-bit float
-    F64 = 5;     // 64-bit float
+    I16 = 1;     // 16-bit signed integer (primary format for STT/TTS/Wakeword)
+    F32 = 4;     // 32-bit float (for macOS compatibility)
 }
 
 // Audio chunk with format metadata (first chunk) or just samples (subsequent chunks)
 message AudioChunk {
-    // Audio samples in various formats - choose the most appropriate for your data
+    // Audio samples in simplified formats (only i16 and f32 supported)
     oneof samples {
         bytes float_samples = 1;     // 32-bit float samples (-1.0 to 1.0) as bytes
         bytes int16_samples = 2;     // 16-bit signed integer samples (little-endian)
-        bytes int24_samples = 3;     // 24-bit signed integer samples (little-endian)
-        bytes int32_samples = 4;     // 32-bit signed integer samples (little-endian)
-        bytes float64_samples = 5;   // 64-bit float samples (little-endian)
     }
     
     uint64 timestamp_ms = 6;     // Timestamp in milliseconds since epoch
