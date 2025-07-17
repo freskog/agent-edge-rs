@@ -42,7 +42,10 @@ impl AudioServiceImpl {
 
     /// Create a new AudioServiceImpl with CPAL configuration
     pub fn with_cpal_config(config: CpalConfig) -> Result<Self, AudioError> {
-        let audio_sink = Arc::new(AudioSink::new(config)?);
+        let audio_sink = Arc::new(AudioSink::new_with_platform(
+            config,
+            AudioPlatform::RaspberryPi,
+        )?);
         Self::new(audio_sink)
     }
 
@@ -51,7 +54,10 @@ impl AudioServiceImpl {
         audio_config: CpalConfig,
         capture_config: AudioCaptureConfig,
     ) -> Result<Self, AudioError> {
-        let audio_sink = Arc::new(AudioSink::new(audio_config)?);
+        let audio_sink = Arc::new(AudioSink::new_with_platform(
+            audio_config,
+            AudioPlatform::RaspberryPi,
+        )?);
         info!("🔊 Audio sink created for streaming s16le playback");
 
         // Use default platform (RaspberryPi) for now - this should be passed from main
@@ -72,7 +78,7 @@ impl AudioServiceImpl {
         audio_config: CpalConfig,
         capture_config: AudioCaptureConfig,
     ) -> Result<Self, AudioError> {
-        let audio_sink = Arc::new(AudioSink::new(audio_config)?);
+        let audio_sink = Arc::new(AudioSink::new_with_platform(audio_config, platform)?);
         info!(
             "🔊 Audio sink created for streaming s16le playback (platform: {})",
             platform

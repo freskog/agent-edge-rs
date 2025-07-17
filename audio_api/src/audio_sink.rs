@@ -1,3 +1,4 @@
+use crate::platform::AudioPlatform;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BuildStreamError, DeviceNameError, DevicesError, PlayStreamError, SupportedStreamConfigsError,
@@ -75,11 +76,19 @@ pub struct AudioSink {
 
 impl AudioSink {
     pub fn new(config: CpalConfig) -> Result<Self, AudioError> {
+        // Use RaspberryPi as default platform for backward compatibility
+        Self::new_with_platform(config, AudioPlatform::RaspberryPi)
+    }
+
+    pub fn new_with_platform(
+        config: CpalConfig,
+        platform: AudioPlatform,
+    ) -> Result<Self, AudioError> {
         let (command_tx, command_rx) = mpsc::channel();
 
         // Start CPAL thread
         std::thread::spawn(move || {
-            if let Err(e) = Self::run_cpal_thread(command_rx, config) {
+            if let Err(e) = Self::run_cpal_thread(command_rx, config, platform) {
                 log::error!("CPAL thread failed: {}", e);
             }
         });
@@ -119,6 +128,7 @@ impl AudioSink {
     fn run_cpal_thread(
         command_rx: mpsc::Receiver<AudioCommand>,
         config: CpalConfig,
+        platform: AudioPlatform,
     ) -> Result<(), AudioError> {
         let host = cpal::default_host();
 
@@ -194,6 +204,7 @@ impl AudioSink {
                                 &s16le_data,
                                 output_sample_rate,
                                 output_channels,
+                                platform,
                             )?;
 
                             // Write to ringbuffer (non-blocking)
@@ -233,8 +244,9 @@ impl AudioSink {
 
     fn convert_s16le_to_platform_f32(
         s16le_data: &[u8],
-        _target_sample_rate: u32,
+        target_sample_rate: u32,
         target_channels: u16,
+        platform: AudioPlatform,
     ) -> Result<Vec<f32>, AudioError> {
         if s16le_data.len() % 2 != 0 {
             return Err(AudioError::WriteError(
@@ -251,6 +263,17 @@ impl AudioSink {
             })
             .collect();
 
+        // TTS produces s16le @ 44.1kHz natively, so no resampling needed
+        // Just verify the input rate matches expected playback rate
+        let expected_input_rate = platform.playback_config().sample_rate; // 44.1kHz
+        if target_sample_rate != expected_input_rate {
+            log::warn!(
+                "⚠️  Hardware sample rate ({}Hz) doesn't match TTS output rate ({}Hz)",
+                target_sample_rate,
+                expected_input_rate
+            );
+        }
+
         // Handle mono to stereo conversion if needed
         if target_channels == 2 && !f32_samples.is_empty() {
             // Duplicate mono samples for stereo
@@ -262,9 +285,6 @@ impl AudioSink {
             f32_samples = stereo_samples;
         }
 
-        // TODO: Add resampling if target_sample_rate != 16000
-        // For now, assume input is already at correct sample rate
-
         Ok(f32_samples)
     }
 }
@@ -272,6 +292,106 @@ impl AudioSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_s16le_to_f32_conversion() {
+        // Test s16le to f32 conversion without resampling
+        let mut s16le_data = Vec::new();
+
+        // Generate test data: max positive, zero, max negative
+        let test_values = [i16::MAX, 0, i16::MIN];
+        for &val in &test_values {
+            s16le_data.extend_from_slice(&val.to_le_bytes());
+        }
+
+        // Convert to f32
+        let f32_samples: Vec<f32> = s16le_data
+            .chunks_exact(2)
+            .map(|chunk| {
+                let i16_sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                i16_sample as f32 / 32768.0
+            })
+            .collect();
+
+        // Verify conversion
+        assert_eq!(f32_samples.len(), 3);
+        assert!((f32_samples[0] - 1.0).abs() < 0.001); // Max positive -> ~1.0
+        assert!((f32_samples[1] - 0.0).abs() < 0.001); // Zero -> 0.0
+        assert!((f32_samples[2] - (-1.0)).abs() < 0.001); // Max negative -> ~-1.0
+
+        println!("✅ s16le to f32 conversion test passed");
+        println!(
+            "   {} -> {} -> {}",
+            i16::MAX,
+            i16::MAX as f32 / 32768.0,
+            f32_samples[0]
+        );
+        println!("   {} -> {} -> {}", 0, 0.0, f32_samples[1]);
+        println!(
+            "   {} -> {} -> {}",
+            i16::MIN,
+            i16::MIN as f32 / 32768.0,
+            f32_samples[2]
+        );
+    }
+
+    #[test]
+    fn test_convert_s16le_to_platform_f32() {
+        // Create test s16le data (44.1kHz mono - TTS output format)
+        let sample_rate = 44100;
+        let target_channels = 2; // stereo
+        let platform = AudioPlatform::RaspberryPi;
+
+        // Generate 1000 samples of s16le data
+        let mut s16le_data = Vec::new();
+        for i in 0..1000 {
+            let sample = (i as f32 / 1000.0 * 2.0 * std::f32::consts::PI).sin();
+            let i16_sample = (sample * 32767.0) as i16;
+            s16le_data.extend_from_slice(&i16_sample.to_le_bytes());
+        }
+
+        let result = AudioSink::convert_s16le_to_platform_f32(
+            &s16le_data,
+            sample_rate,
+            target_channels,
+            platform,
+        );
+
+        match result {
+            Ok(f32_samples) => {
+                // Should convert to stereo (no resampling needed)
+                let expected_stereo_output = 1000 * 2; // 1000 mono samples -> 2000 stereo samples
+
+                println!("✅ Platform conversion test passed:");
+                println!(
+                    "   Input: {} bytes s16le ({}Hz mono)",
+                    s16le_data.len(),
+                    sample_rate
+                );
+                println!(
+                    "   Output: {} f32 samples ({}Hz stereo)",
+                    f32_samples.len(),
+                    sample_rate
+                );
+                println!("   Expected stereo samples: {}", expected_stereo_output);
+
+                assert_eq!(f32_samples.len(), expected_stereo_output);
+
+                // Verify samples are in valid range
+                for (i, &sample) in f32_samples.iter().enumerate() {
+                    assert!(
+                        sample >= -1.0 && sample <= 1.0,
+                        "Sample {} out of range: {}",
+                        i,
+                        sample
+                    );
+                }
+            }
+            Err(e) => {
+                panic!("Platform conversion failed: {}", e);
+            }
+        }
+    }
 
     #[tokio::test]
     #[cfg(feature = "audio_available")]
