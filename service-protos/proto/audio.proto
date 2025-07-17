@@ -21,40 +21,18 @@ message SubscribeRequest {
     // Empty for now - could add options later
 }
 
-// Audio format information
-message AudioFormat {
-    uint32 sample_rate = 1;      // Sample rate in Hz (e.g., 16000, 44100, 48000)
-    uint32 channels = 2;         // Number of channels (1 for mono, 2 for stereo)
-    SampleFormat sample_format = 3; // Sample format
-}
-
-// Sample format enumeration
-enum SampleFormat {
-    UNKNOWN = 0;
-    I16 = 1;     // 16-bit signed integer (primary format for STT/TTS/Wakeword)
-    F32 = 4;     // 32-bit float (for macOS compatibility)
-}
-
-// Audio chunk with format metadata (first chunk) or just samples (subsequent chunks)
+// Audio chunk with s16le samples (16-bit signed little-endian, mono, 16kHz)
+// This is the standard format for STT/TTS/Wakeword processing
 message AudioChunk {
-    // Audio samples in simplified formats (only i16 and f32 supported)
-    oneof samples {
-        bytes float_samples = 1;     // 32-bit float samples (-1.0 to 1.0) as bytes
-        bytes int16_samples = 2;     // 16-bit signed integer samples (little-endian)
-    }
-    
-    uint64 timestamp_ms = 6;     // Timestamp in milliseconds since epoch
-    
-    // Format metadata - only present in the first chunk of a stream
-    // Subsequent chunks will not have this field set
-    AudioFormat format = 7;
+    bytes samples = 1;           // Always s16le format (16-bit signed little-endian)
+    uint64 timestamp_ms = 2;     // Timestamp in milliseconds since epoch
 }
 
 // Play audio request with stream ID
 message PlayAudioRequest {
     string stream_id = 1;        // Unique stream identifier
     oneof data {
-        AudioChunk chunk = 2;    // Audio chunk data
+        AudioChunk chunk = 2;    // Audio chunk data (always s16le format)
         bool end_stream = 3;     // Signal end of stream
     }
 }

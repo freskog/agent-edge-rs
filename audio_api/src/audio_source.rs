@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 
-pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size that works with Silero
+pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size that works with Silero (in samples)
 
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
@@ -55,13 +55,15 @@ pub struct AudioDeviceInfo {
     pub channel_count: u32,
 }
 
-/// Simple audio capture that streams chunks directly
+/// Simple audio capture that streams s16le chunks directly
+/// Handles platform conversion transparently (hardware format -> s16le)
 pub struct AudioCapture {
-    receiver: tokio_mpsc::Receiver<[f32; CHUNK_SIZE]>,
+    receiver: tokio_mpsc::Receiver<Vec<u8>>,
 }
 
 impl AudioCapture {
     /// Create a new audio capture with clean async interface
+    /// Emits s16le bytes directly for compatibility with audio processing
     pub async fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
         let (sender, receiver) = tokio_mpsc::channel(100);
 
@@ -78,14 +80,15 @@ impl AudioCapture {
         Ok(Self { receiver })
     }
 
-    /// Get the next audio chunk
-    pub async fn next_chunk(&mut self) -> Option<[f32; CHUNK_SIZE]> {
+    /// Get the next audio chunk as s16le bytes
+    pub async fn next_chunk(&mut self) -> Option<Vec<u8>> {
         self.receiver.recv().await
     }
+
     /// Internal function that runs in the CPAL thread
     fn run_capture_thread(
         config: AudioCaptureConfig,
-        sender: tokio_mpsc::Sender<[f32; CHUNK_SIZE]>,
+        sender: tokio_mpsc::Sender<Vec<u8>>,
     ) -> Result<(), AudioCaptureError> {
         let host = cpal::default_host();
         log::info!("🎤 Initializing audio capture with host: {:?}", host.id());
@@ -123,7 +126,7 @@ impl AudioCapture {
 
         // Log the format being used
         log::info!(
-            "🎤 Audio capture configured: {} channels @ {}Hz (format: {:?})",
+            "🎤 Audio capture configured: {} channels @ {}Hz (format: {:?}) -> s16le output",
             stream_config.channels,
             stream_config.sample_rate.0,
             supported_config.sample_format()
@@ -181,7 +184,7 @@ impl AudioCapture {
 }
 
 impl Stream for AudioCapture {
-    type Item = [f32; CHUNK_SIZE];
+    type Item = Vec<u8>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)
@@ -193,14 +196,14 @@ fn create_input_stream<T>(
     config: &cpal::StreamConfig,
     channel: u32,
     channels: usize,
-    sender: tokio_mpsc::Sender<[f32; CHUNK_SIZE]>,
+    sender: tokio_mpsc::Sender<Vec<u8>>,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
 ) -> Result<CpalStream, AudioCaptureError>
 where
     T: Sample + SizedSample + Send + Sync + 'static,
     f32: FromSample<T>,
 {
-    let rb = HeapRb::<[f32; CHUNK_SIZE]>::new(16);
+    let rb = HeapRb::<Vec<u8>>::new(16);
 
     let (mut prod, mut cons) = rb.split();
 
@@ -210,8 +213,8 @@ where
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             loop {
-                if let Some(chunk) = cons.try_pop() {
-                    if sender.send(chunk).await.is_err() {
+                if let Some(s16le_chunk) = cons.try_pop() {
+                    if sender.send(s16le_chunk).await.is_err() {
                         break;
                     }
                 } else {
@@ -222,7 +225,7 @@ where
         });
     });
 
-    let mut buf = [0.0; CHUNK_SIZE];
+    let mut f32_buffer = [0.0f32; CHUNK_SIZE];
     let mut i = 0;
 
     device
@@ -231,11 +234,13 @@ where
             move |data: &[T], _| {
                 for frame in data.chunks(channels) {
                     if let Some(s) = frame.get(channel as usize) {
-                        buf[i] = f32::from_sample(*s);
+                        f32_buffer[i] = f32::from_sample(*s);
                         i += 1;
                         if i == CHUNK_SIZE {
-                            let _ = prod.try_push(buf);
-                            buf = [0.0; CHUNK_SIZE];
+                            // Convert f32 chunk to s16le bytes
+                            let s16le_bytes = f32_chunk_to_s16le_bytes(&f32_buffer);
+                            let _ = prod.try_push(s16le_bytes);
+                            f32_buffer = [0.0f32; CHUNK_SIZE];
                             i = 0;
                         }
                     }
@@ -245,6 +250,20 @@ where
             None,
         )
         .map_err(|e| AudioCaptureError::Stream(e.to_string()))
+}
+
+/// Convert f32 sample chunk to s16le bytes (platform conversion)
+fn f32_chunk_to_s16le_bytes(f32_samples: &[f32; CHUNK_SIZE]) -> Vec<u8> {
+    let mut s16le_bytes = Vec::with_capacity(CHUNK_SIZE * 2);
+
+    for &sample in f32_samples {
+        // Clamp to [-1.0, 1.0] and convert to i16
+        let clamped = sample.clamp(-1.0, 1.0);
+        let i16_sample = (clamped * 32767.0) as i16;
+        s16le_bytes.extend_from_slice(&i16_sample.to_le_bytes());
+    }
+
+    s16le_bytes
 }
 
 #[cfg(test)]
