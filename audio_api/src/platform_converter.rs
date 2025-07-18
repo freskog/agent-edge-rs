@@ -1,4 +1,4 @@
-use crate::platform::{AudioFormatSpec, AudioPlatform, PlatformSampleFormat};
+use crate::platform::{AudioPlatform, PlatformSampleFormat};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };

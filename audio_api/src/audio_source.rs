@@ -2,15 +2,28 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, FromSample, Sample, SampleFormat, SizedSample, Stream as CpalStream,
 };
-use futures::Stream;
-use ringbuf::traits::{Consumer, Producer, Split};
-use ringbuf::HeapRb;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use crossbeam::channel::{bounded, Receiver, Sender};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc as tokio_mpsc;
 
-pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size that works with Silero (in samples)
+pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size (in samples)
+
+// Build-time platform detection
+#[cfg(target_os = "macos")]
+const PLATFORM: Platform = Platform::MacOS;
+#[cfg(target_os = "linux")]
+const PLATFORM: Platform = Platform::RaspberryPi;
+
+#[derive(Debug, Clone, Copy)]
+enum Platform {
+    MacOS,
+    RaspberryPi,
+}
 
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
@@ -22,6 +35,8 @@ pub enum AudioCaptureError {
     Stream(String),
     #[error("Configuration error: {0}")]
     Config(String),
+    #[error("Resampling error: {0}")]
+    Resampling(String),
 }
 
 /// Audio capture configuration
@@ -29,10 +44,8 @@ pub enum AudioCaptureError {
 pub struct AudioCaptureConfig {
     /// Device ID to capture from (None = default device)
     pub device_id: Option<String>,
-    /// Channel to capture (0-based index)
+    /// Channel to capture (0-based index) - we always use channel 0
     pub channel: u32,
-    pub sample_rate: u32,
-    pub channels: u16,
 }
 
 impl Default for AudioCaptureConfig {
@@ -40,8 +53,6 @@ impl Default for AudioCaptureConfig {
         Self {
             device_id: None,
             channel: 0,
-            sample_rate: 16000, // 16kHz for audio processing
-            channels: 1,        // Mono
         }
     }
 }
@@ -55,40 +66,51 @@ pub struct AudioDeviceInfo {
     pub channel_count: u32,
 }
 
-/// Simple audio capture that streams s16le chunks directly
-/// Handles platform conversion transparently (hardware format -> s16le)
+/// Sync audio capture that outputs mono 16kHz s16le chunks
+/// Handles platform-specific resampling automatically
 pub struct AudioCapture {
-    receiver: tokio_mpsc::Receiver<Vec<u8>>,
+    receiver: Receiver<Vec<u8>>,
+    _handle: thread::JoinHandle<()>,
 }
 
 impl AudioCapture {
-    /// Create a new audio capture with clean async interface
-    /// Emits s16le bytes directly for compatibility with audio processing
-    pub async fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
-        let (sender, receiver) = tokio_mpsc::channel(100);
+    /// Create a new audio capture
+    /// Output is always mono 16kHz s16le regardless of hardware
+    pub fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
+        let (sender, receiver) = bounded(100);
 
-        // Spawn internal thread to manage CPAL resources
-        std::thread::spawn(move || {
+        // Spawn thread to manage CPAL resources
+        let handle = thread::spawn(move || {
             if let Err(e) = Self::run_capture_thread(config, sender) {
                 log::error!("Audio capture thread failed: {}", e);
             }
         });
 
         // Give the thread a moment to initialize
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        thread::sleep(Duration::from_millis(50));
 
-        Ok(Self { receiver })
+        Ok(Self {
+            receiver,
+            _handle: handle,
+        })
     }
 
-    /// Get the next audio chunk as s16le bytes
-    pub async fn next_chunk(&mut self) -> Option<Vec<u8>> {
-        self.receiver.recv().await
+    /// Get the next audio chunk as s16le bytes (blocking)
+    /// Returns None if the capture stream has ended
+    pub fn next_chunk(&self) -> Option<Vec<u8>> {
+        self.receiver.recv().ok()
+    }
+
+    /// Try to get the next audio chunk without blocking
+    /// Returns None if no chunk is available or stream has ended
+    pub fn try_next_chunk(&self) -> Option<Vec<u8>> {
+        self.receiver.try_recv().ok()
     }
 
     /// Internal function that runs in the CPAL thread
     fn run_capture_thread(
         config: AudioCaptureConfig,
-        sender: tokio_mpsc::Sender<Vec<u8>>,
+        sender: Sender<Vec<u8>>,
     ) -> Result<(), AudioCaptureError> {
         let host = cpal::default_host();
         log::info!("🎤 Initializing audio capture with host: {:?}", host.id());
@@ -120,45 +142,68 @@ impl AudioCapture {
         }
 
         let stream_config = supported_config.config();
+        let hardware_sample_rate = stream_config.sample_rate.0;
+        let channels = stream_config.channels as usize;
+
+        log::info!(
+            "🎤 Hardware: {}Hz, {} channels, {:?} → Output: 16kHz mono s16le",
+            hardware_sample_rate,
+            channels,
+            supported_config.sample_format()
+        );
+
+        // Create resampler if needed (macOS will need this)
+        let resampler = if hardware_sample_rate != 16000 {
+            let ratio = 16000.0 / hardware_sample_rate as f64;
+            let params = SincInterpolationParameters {
+                sinc_len: 32,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 128,
+                window: WindowFunction::BlackmanHarris2,
+            };
+
+            let resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, CHUNK_SIZE, 1)
+                .map_err(|e| AudioCaptureError::Resampling(e.to_string()))?;
+            
+            log::info!("🔄 Created resampler: {}Hz → 16kHz (ratio: {:.3})", hardware_sample_rate, ratio);
+            Some(Arc::new(Mutex::new(resampler)))
+        } else {
+            log::info!("🔄 No resampling needed (hardware is 16kHz)");
+            None
+        };
+
         let err_fn = move |err| {
             log::error!("Audio stream error: {}", err);
         };
 
-        // Log the format being used
-        log::info!(
-            "🎤 Audio capture configured: {} channels @ {}Hz (format: {:?}) -> s16le output",
-            stream_config.channels,
-            stream_config.sample_rate.0,
-            supported_config.sample_format()
-        );
-
-        let channel = config.channel;
-        let channels = stream_config.channels as usize;
-
         // Build the stream with the appropriate sample format
         let stream = match supported_config.sample_format() {
-            SampleFormat::I16 => create_input_stream::<i16>(
+            SampleFormat::I16 => Self::create_input_stream::<i16>(
                 &device,
                 &stream_config,
-                channel,
+                config.channel,
                 channels,
                 sender,
+                resampler,
                 err_fn,
             )?,
-            SampleFormat::U16 => create_input_stream::<u16>(
+            SampleFormat::U16 => Self::create_input_stream::<u16>(
                 &device,
                 &stream_config,
-                channel,
+                config.channel,
                 channels,
                 sender,
+                resampler,
                 err_fn,
             )?,
-            SampleFormat::F32 => create_input_stream::<f32>(
+            SampleFormat::F32 => Self::create_input_stream::<f32>(
                 &device,
                 &stream_config,
-                channel,
+                config.channel,
                 channels,
                 sender,
+                resampler,
                 err_fn,
             )?,
             _ => {
@@ -178,110 +223,120 @@ impl AudioCapture {
 
         // Keep the thread alive to maintain the audio capture
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         }
     }
-}
 
-impl Stream for AudioCapture {
-    type Item = Vec<u8>;
+    fn create_input_stream<T>(
+        device: &Device,
+        config: &cpal::StreamConfig,
+        channel: u32,
+        channels: usize,
+        sender: Sender<Vec<u8>>,
+        resampler: Option<Arc<Mutex<SincFixedIn<f32>>>>,
+        err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
+    ) -> Result<CpalStream, AudioCaptureError>
+    where
+        T: Sample + SizedSample + Send + Sync + 'static,
+        f32: FromSample<T>,
+    {
+        let mut f32_buffer = Vec::new();
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
-    }
-}
-
-fn create_input_stream<T>(
-    device: &Device,
-    config: &cpal::StreamConfig,
-    channel: u32,
-    channels: usize,
-    sender: tokio_mpsc::Sender<Vec<u8>>,
-    err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
-) -> Result<CpalStream, AudioCaptureError>
-where
-    T: Sample + SizedSample + Send + Sync + 'static,
-    f32: FromSample<T>,
-{
-    let rb = HeapRb::<Vec<u8>>::new(16);
-
-    let (mut prod, mut cons) = rb.split();
-
-    // Spawn a thread with its own runtime for the ringbuffer reader
-    // This bridges the sync CPAL world with the async tokio world
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            loop {
-                if let Some(s16le_chunk) = cons.try_pop() {
-                    if sender.send(s16le_chunk).await.is_err() {
-                        break;
-                    }
-                } else {
-                    // No data available, sleep briefly to avoid busy-waiting
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }
-            }
-        });
-    });
-
-    let mut f32_buffer = [0.0f32; CHUNK_SIZE];
-    let mut i = 0;
-
-    device
-        .build_input_stream(
-            config,
-            move |data: &[T], _| {
-                for frame in data.chunks(channels) {
-                    if let Some(s) = frame.get(channel as usize) {
-                        f32_buffer[i] = f32::from_sample(*s);
-                        i += 1;
-                        if i == CHUNK_SIZE {
-                            // Convert f32 chunk to s16le bytes
-                            let s16le_bytes = f32_chunk_to_s16le_bytes(&f32_buffer);
-                            let _ = prod.try_push(s16le_bytes);
-                            f32_buffer = [0.0f32; CHUNK_SIZE];
-                            i = 0;
+        device
+            .build_input_stream(
+                config,
+                move |data: &[T], _| {
+                    // Extract channel 0 and convert to f32
+                    for frame in data.chunks(channels) {
+                        if let Some(s) = frame.get(channel as usize) {
+                            f32_buffer.push(f32::from_sample(*s));
                         }
                     }
-                }
-            },
-            err_fn,
-            None,
-        )
-        .map_err(|e| AudioCaptureError::Stream(e.to_string()))
-}
 
-/// Convert f32 sample chunk to s16le bytes (platform conversion)
-fn f32_chunk_to_s16le_bytes(f32_samples: &[f32; CHUNK_SIZE]) -> Vec<u8> {
-    let mut s16le_bytes = Vec::with_capacity(CHUNK_SIZE * 2);
+                    // Process complete chunks
+                    while f32_buffer.len() >= CHUNK_SIZE {
+                        let chunk: Vec<f32> = f32_buffer.drain(..CHUNK_SIZE).collect();
+                        
+                        // Apply resampling if needed
+                        let output_samples = if let Some(ref resampler) = resampler {
+                            match resampler.lock() {
+                                Ok(mut r) => {
+                                    match r.process(&[chunk], None) {
+                                        Ok(output_channels) => output_channels[0].clone(),
+                                        Err(e) => {
+                                            log::error!("Resampling error: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    log::error!("Failed to lock resampler");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            chunk
+                        };
 
-    for &sample in f32_samples {
-        // Clamp to [-1.0, 1.0] and convert to i16
-        let clamped = sample.clamp(-1.0, 1.0);
-        let i16_sample = (clamped * 32767.0) as i16;
-        s16le_bytes.extend_from_slice(&i16_sample.to_le_bytes());
+                        // Convert to s16le bytes
+                        let s16le_bytes = Self::f32_to_s16le_bytes(&output_samples);
+                        
+                        // Send to receiver (non-blocking)
+                        if sender.try_send(s16le_bytes).is_err() {
+                            // Channel is full or closed, drop the chunk
+                            break;
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            )
+            .map_err(|e| AudioCaptureError::Stream(e.to_string()))
     }
 
-    s16le_bytes
-}
+    /// Convert f32 samples to s16le bytes
+    fn f32_to_s16le_bytes(f32_samples: &[f32]) -> Vec<u8> {
+        let mut s16le_bytes = Vec::with_capacity(f32_samples.len() * 2);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_audio_capture_creation() {
-        match AudioCapture::new(AudioCaptureConfig::default()).await {
-            Ok(_capture) => {
-                // Successfully created
-            }
-            Err(e) => {
-                println!(
-                    "Audio device not available in test environment - this is expected: {}",
-                    e
-                );
-            }
+        for &sample in f32_samples {
+            // Clamp to [-1.0, 1.0] and convert to i16
+            let clamped = sample.clamp(-1.0, 1.0);
+            let i16_sample = (clamped * 32767.0) as i16;
+            s16le_bytes.extend_from_slice(&i16_sample.to_le_bytes());
         }
+
+        s16le_bytes
+    }
+
+    /// List available audio devices
+    pub fn list_devices() -> Result<Vec<AudioDeviceInfo>, AudioCaptureError> {
+        let host = cpal::default_host();
+        let devices = host
+            .input_devices()
+            .map_err(|e| AudioCaptureError::Device(e.to_string()))?;
+
+        let default_device = host.default_input_device();
+        let default_name = default_device
+            .and_then(|d| d.name().ok());
+
+        let mut device_infos = Vec::new();
+        for device in devices {
+            let name = device
+                .name()
+                .map_err(|e| AudioCaptureError::Device(e.to_string()))?;
+            
+            let config = device
+                .default_input_config()
+                .map_err(|e| AudioCaptureError::Config(e.to_string()))?;
+
+            device_infos.push(AudioDeviceInfo {
+                id: name.clone(),
+                name: name.clone(),
+                is_default: default_name.as_ref() == Some(&name),
+                channel_count: config.channels() as u32,
+            });
+        }
+
+        Ok(device_infos)
     }
 }

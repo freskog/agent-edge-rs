@@ -7,31 +7,16 @@ description = "Audio input/output interface for agent-edge-rs"
 license.workspace = true
 
 [dependencies]
-service-protos = { path = "../service-protos" }
-tokio = { version = "1.0", features = ["full"] }
-serde.workspace = true
-serde_json.workspace = true
+cpal = "0.16.0"
+thiserror = "2.0"
 log.workspace = true
 env_logger.workspace = true
 clap.workspace = true
-thiserror = "2.0"
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-cpal = "0.16.0"
+serde.workspace = true
+serde_json.workspace = true
+crossbeam = "0.8"
 rubato = "0.16.2"
-dasp = "0.11"
-tonic = { version = "0.13.1", features = ["transport"] }
-prost = "0.13"
-tokio-stream = { version = "0.1", features = ["net"] }
-uuid = { version = "1.0", features = ["v4"] }
-futures = "0.3"
-tokio-util = { version = "0.7", features = ["compat"] }
-async-stream = "0.3"
-hound = "3.5"
-tower = { version = "0.4", features = ["util"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-rand = "0.8"
-ringbuf = "0.4"
+ctrlc = "3.4"
 
 [features]
 audio_available = []

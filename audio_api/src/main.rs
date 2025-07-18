@@ -1,43 +1,37 @@
-use audio_api::audio_sink::CpalConfig;
-use audio_api::audio_source::AudioCaptureConfig;
-use audio_api::platform::AudioPlatform;
-use audio_api::tonic::service::{run_server, run_server_unix, AudioServiceImpl};
+use audio_api::audio_sink::{AudioSink, AudioSinkConfig};
+use audio_api::audio_source::{AudioCapture, AudioCaptureConfig};
+use audio_api::tcp_server::{AudioServer, ServerConfig};
 use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait};
+// Audio device listing functionality is now in the audio modules
 use log::{info, warn};
-use std::net::SocketAddr;
 
 #[derive(Parser)]
 #[command(name = "audio_api")]
 #[command(about = "Audio API server for real-time audio capture and playback")]
 #[command(long_about = "
-Audio API server that provides gRPC services for real-time audio capture and playback.
+Audio API server that provides TCP services for real-time audio capture and playback.
 
 EXAMPLES:
   # List available audio devices
   audio_api --list-devices
   
   # Start server with specific devices
+  audio_api --input-device \"ReSpeaker 4 Mic Array\" --output-device \"Built-in Audio\"
+  
+  # Bind to different address/port
+  audio_api --bind \"0.0.0.0:8080\"
+  
+  # For ReSpeaker 4-mic array, use channel 0
   audio_api --input-device \"ReSpeaker 4 Mic Array\" --input-channel 0
-  
-  # Use Unix socket for better performance
-  audio_api --unix --input-device \"USB Audio\" --output-device \"Built-in Audio\"
-  
-  # For ReSpeaker 4-mic array, use channel 0-5 (or 0-3 depending on firmware)
-  audio_api --unix --input-device \"ReSpeaker 4 Mic Array\" --input-channel 1
 ")]
 struct Args {
-    /// Use Unix domain socket instead of TCP
-    #[arg(long, default_value = "false")]
-    unix: bool,
-
-    /// Socket path for Unix domain socket (default: /tmp/audio_api.sock)
-    #[arg(long, default_value = "/tmp/audio_api.sock")]
-    socket_path: String,
-
-    /// TCP address and port (default: 127.0.0.1:50051)
+    /// TCP bind address and port
     #[arg(long, default_value = "127.0.0.1:50051")]
-    tcp_addr: String,
+    bind: String,
+
+    /// Maximum number of concurrent connections
+    #[arg(long, default_value = "5")]
+    max_connections: usize,
 
     /// List available audio devices and exit
     #[arg(long)]
@@ -55,17 +49,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     input_channel: u32,
 
-    /// Target audio platform (raspberry-pi or macos)
-    #[arg(long, value_enum, default_value = "raspberry-pi")]
-    platform: AudioPlatform,
-
     /// Show detailed device information
     #[arg(long)]
     verbose_devices: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
 
@@ -76,196 +65,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Log platform information
-    let platform_capture = args.platform.capture_config();
-    let platform_playback = args.platform.playback_config();
+    info!("🎯 Starting audio API server");
+    info!("🔊 Input: mono 16kHz s16le (hardware auto-detected)");
+    info!("🔊 Output: mono 44.1kHz s16le → stereo hardware format");
 
-    info!("🎯 Target platform: {}", args.platform);
-    info!(
-        "🎤 Platform capture: {} ({})",
-        platform_capture.description, platform_capture.preferred_format
-    );
-    info!(
-        "🔊 Platform playback: {} ({})",
-        platform_playback.description, platform_playback.format
-    );
-
-    // Create audio sink configuration based on platform
-    let sink_config = CpalConfig {
-        device_name: args.output_device.clone(),
-        // Platform-specific defaults will be applied in CpalSink based on platform
-        ..Default::default()
+    // Create server configuration
+    let server_config = ServerConfig {
+        bind_address: args.bind.clone(),
+        max_connections: args.max_connections,
+        audio_sink_config: AudioSinkConfig {
+            device_name: args.output_device.clone(),
+        },
+        audio_capture_config: AudioCaptureConfig {
+            device_id: args.input_device.clone(),
+            channel: args.input_channel,
+        },
     };
 
-    // Create audio capture configuration based on platform
-    let capture_config = AudioCaptureConfig {
-        device_id: args.input_device.clone(),
-        channel: args.input_channel,
-        // Use platform-preferred sample rate if not overridden
-        sample_rate: platform_capture.preferred_sample_rate,
-        channels: 1, // Always mono for STT/Wakeword
-    };
-
-    // Create service with platform-aware configurations
-    let service =
-        AudioServiceImpl::with_platform_configs(args.platform, sink_config, capture_config)?;
-
-    if args.unix {
-        info!(
-            "🎵 Starting audio service on Unix domain socket: {}",
-            args.socket_path
-        );
-        if let Some(ref input_dev) = args.input_device {
-            info!(
-                "🎤 Using input device: {} (channel {})",
-                input_dev, args.input_channel
-            );
-        }
-        if let Some(ref output_dev) = args.output_device {
-            info!("🔊 Using output device: {}", output_dev);
-        }
-        run_server_unix(&args.socket_path, service).await?;
+    // Log configuration
+    info!("🎵 Starting audio service on TCP: {}", args.bind);
+    info!("🔗 Max connections: {}", args.max_connections);
+    if let Some(ref input_dev) = args.input_device {
+        info!("🎤 Using input device: {} (channel {})", input_dev, args.input_channel);
     } else {
-        let addr: std::net::SocketAddr = args.tcp_addr.parse()?;
-        info!("🎵 Starting audio service on TCP: {}", addr);
-        if let Some(ref input_dev) = args.input_device {
-            info!(
-                "🎤 Using input device: {} (channel {})",
-                input_dev, args.input_channel
-            );
-        }
-        if let Some(ref output_dev) = args.output_device {
-            info!("🔊 Using output device: {}", output_dev);
-        }
-        warn!("💡 Tip: Use --unix for better performance with Unix domain sockets");
-        run_server(addr, service).await?;
+        info!("🎤 Using default input device (channel {})", args.input_channel);
     }
+    if let Some(ref output_dev) = args.output_device {
+        info!("🔊 Using output device: {}", output_dev);
+    } else {
+        info!("🔊 Using default output device");
+    }
+
+    // Create and run the server
+    let server = AudioServer::new(server_config)?;
+    server.run()?;
 
     Ok(())
 }
 
+/// List available audio devices
 fn list_audio_devices(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let host = cpal::default_host();
-
-    println!("🎤 Available Input Devices:");
-    println!("==========================");
-
-    // List input devices using CPAL directly for better compatibility
-    match host.input_devices() {
+    
+    println!("🎤 Available input devices:");
+    match AudioCapture::list_devices() {
         Ok(devices) => {
-            let default_input = host.default_input_device();
-            let mut device_count = 0;
-
-            for device in devices {
-                if let Ok(name) = device.name() {
-                    // Only list devices that actually support input
-                    if let Ok(config) = device.default_input_config() {
-                        device_count += 1;
-                        let is_default = default_input
-                            .as_ref()
-                            .map(|d| d.name().unwrap_or_default() == name)
-                            .unwrap_or(false);
-                        let default_marker = if is_default { " (default)" } else { "" };
-
-                        println!(
-                            "  {}. {}{} - {} channels",
-                            device_count,
-                            name,
-                            default_marker,
-                            config.channels()
-                        );
-
-                        if verbose {
-                            println!("     Format: {:?}", config.sample_format());
-                            println!("     Sample rate: {}Hz", config.sample_rate().0);
-                            println!("     Channels: {}", config.channels());
-
-                            if let Ok(configs) = device.supported_input_configs() {
-                                println!("     Supported configs:");
-                                for config in configs {
-                                    println!(
-                                        "       {:?}, {} channels, {}-{} Hz",
-                                        config.sample_format(),
-                                        config.channels(),
-                                        config.min_sample_rate().0,
-                                        config.max_sample_rate().0
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if device_count == 0 {
+            if devices.is_empty() {
                 println!("  No input devices found");
-            }
-        }
-        Err(e) => {
-            println!("  Error listing input devices: {}", e);
-        }
-    }
-
-    println!("\n🔊 Available Output Devices:");
-    println!("============================");
-
-    // List output devices
-    match host.output_devices() {
-        Ok(devices) => {
-            let default_output = host.default_output_device();
-            let mut device_count = 0;
-
-            for device in devices {
-                device_count += 1;
-                let name = device.name().unwrap_or_else(|e| format!("<error: {}>", e));
-                let is_default = default_output
-                    .as_ref()
-                    .map(|d| d.name().unwrap_or_default() == name)
-                    .unwrap_or(false);
-                let default_marker = if is_default { " (default)" } else { "" };
-
-                println!("  {}. {}{}", device_count, name, default_marker);
-
-                if verbose {
-                    if let Ok(config) = device.default_output_config() {
-                        println!("     Format: {:?}", config.sample_format());
-                        println!("     Sample rate: {}Hz", config.sample_rate().0);
-                        println!("     Channels: {}", config.channels());
-                    }
-                    if let Ok(configs) = device.supported_output_configs() {
-                        println!("     Supported configs:");
-                        for config in configs {
-                            println!(
-                                "       {:?}, {}-{} channels, {}-{} Hz",
-                                config.sample_format(),
-                                config.channels(),
-                                config.channels(),
-                                config.min_sample_rate().0,
-                                config.max_sample_rate().0
-                            );
-                        }
+            } else {
+                for device in devices {
+                    let default_marker = if device.is_default { " (default)" } else { "" };
+                    if verbose {
+                        println!("  - {} [{}ch]{}", device.name, device.channel_count, default_marker);
+                    } else {
+                        println!("  - {}{}", device.name, default_marker);
                     }
                 }
             }
-
-            if device_count == 0 {
-                println!("  No output devices found");
-            }
         }
         Err(e) => {
-            println!("  Error listing output devices: {}", e);
+            warn!("Failed to list input devices: {}", e);
         }
     }
 
-    println!("\n💡 Usage Examples:");
-    println!("=================");
+    println!("\n🔊 Available output devices:");
+    match AudioSink::list_devices() {
+        Ok(devices) => {
+            if devices.is_empty() {
+                println!("  No output devices found");
+            } else {
+                for device in devices {
+                    let default_marker = if device.is_default { " (default)" } else { "" };
+                    if verbose {
+                        println!("  - {} [{}ch]{}", device.name, device.channel_count, default_marker);
+                    } else {
+                        println!("  - {}{}", device.name, default_marker);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to list output devices: {}", e);
+        }
+    }
+
+    if !verbose {
+        println!("\n💡 Use --verbose-devices for detailed information");
+    }
+
+    println!("\n📖 Usage examples:");
     println!("  # List devices:");
     println!("  audio_api --list-devices");
     println!("  audio_api --list-devices --verbose-devices");
     println!("\n  # Use specific devices:");
     println!("  audio_api --input-device \"ReSpeaker 4 Mic Array\" --input-channel 0");
     println!("  audio_api --output-device \"Built-in Audio\" --input-device \"USB Audio\"");
-    println!("\n  # Use Unix socket (recommended):");
-    println!("  audio_api --unix --input-device \"ReSpeaker 4 Mic Array\" --input-channel 1");
+    println!("\n  # Custom bind address:");
+    println!("  audio_api --bind \"0.0.0.0:8080\" --max-connections 10");
 
     Ok(())
 }
