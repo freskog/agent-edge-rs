@@ -1,6 +1,6 @@
-use audio_api::audio_sink::{AudioSink, AudioSinkConfig};
-use audio_api::audio_source::{AudioCapture, AudioCaptureConfig};
-use audio_api::tcp_server::{AudioServer, ServerConfig};
+use audio::audio_sink::{AudioSink, AudioSinkConfig};
+use audio::audio_source::{AudioCapture, AudioCaptureConfig};
+use audio::tcp_server::{AudioServer, ServerConfig};
 use clap::Parser;
 // Audio device listing functionality is now in the audio modules
 use log::{info, warn};
@@ -86,9 +86,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🎵 Starting audio service on TCP: {}", args.bind);
     info!("🔗 Max connections: {}", args.max_connections);
     if let Some(ref input_dev) = args.input_device {
-        info!("🎤 Using input device: {} (channel {})", input_dev, args.input_channel);
+        info!(
+            "🎤 Using input device: {} (channel {})",
+            input_dev, args.input_channel
+        );
     } else {
-        info!("🎤 Using default input device (channel {})", args.input_channel);
+        info!(
+            "🎤 Using default input device (channel {})",
+            args.input_channel
+        );
     }
     if let Some(ref output_dev) = args.output_device {
         info!("🔊 Using output device: {}", output_dev);
@@ -105,7 +111,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// List available audio devices
 fn list_audio_devices(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    
     println!("🎤 Available input devices:");
     match AudioCapture::list_devices() {
         Ok(devices) => {
@@ -115,7 +120,10 @@ fn list_audio_devices(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
                 for device in devices {
                     let default_marker = if device.is_default { " (default)" } else { "" };
                     if verbose {
-                        println!("  - {} [{}ch]{}", device.name, device.channel_count, default_marker);
+                        println!(
+                            "  - {} [{}ch]{}",
+                            device.name, device.channel_count, default_marker
+                        );
                     } else {
                         println!("  - {}{}", device.name, default_marker);
                     }
@@ -136,7 +144,10 @@ fn list_audio_devices(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
                 for device in devices {
                     let default_marker = if device.is_default { " (default)" } else { "" };
                     if verbose {
-                        println!("  - {} [{}ch]{}", device.name, device.channel_count, default_marker);
+                        println!(
+                            "  - {} [{}ch]{}",
+                            device.name, device.channel_count, default_marker
+                        );
                     } else {
                         println!("  - {}{}", device.name, default_marker);
                     }

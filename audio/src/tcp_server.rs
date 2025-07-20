@@ -1,6 +1,6 @@
 use crate::audio_sink::{AudioSink, AudioSinkConfig};
 use crate::audio_source::{AudioCapture, AudioCaptureConfig};
-use crate::tcp_protocol::{Connection, Message, ProtocolError};
+use audio_protocol::{Connection, Message, ProtocolError};
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -339,6 +339,27 @@ impl AudioServer {
                 Ok(true)
             }
 
+            Message::UnsubscribeAudio => {
+                log::info!("🎤 {} unsubscribed from audio capture", client_id);
+
+                // Remove this client from subscribers
+                {
+                    let mut subscribers = capture_subscribers.lock().unwrap();
+                    subscribers.remove(client_id);
+                }
+
+                // Clear the audio receiver for this client
+                *audio_rx = None;
+
+                let response = Message::UnsubscribeResponse {
+                    success: true,
+                    message: "Successfully unsubscribed from audio capture".to_string(),
+                };
+                conn.write_message(&response)?;
+
+                Ok(true)
+            }
+
             Message::PlayAudio {
                 stream_id,
                 audio_data,
@@ -429,6 +450,7 @@ impl AudioServer {
 
             // These are server-to-client messages, shouldn't be received by server
             Message::AudioChunk { .. }
+            | Message::UnsubscribeResponse { .. }
             | Message::PlayResponse { .. }
             | Message::EndStreamResponse { .. }
             | Message::AbortResponse { .. }
@@ -459,9 +481,18 @@ impl AudioServer {
             };
 
             if !has_subscribers {
-                // No subscribers, stop the thread
+                // No subscribers, stop the thread and clear audio capture to avoid buffer persistence
                 forwarding_thread_running.store(false, Ordering::SeqCst);
-                log::info!("🎤 No more subscribers, stopping forwarding thread");
+
+                // Clear the AudioCapture instance to ensure fresh buffers for next subscriber
+                {
+                    let mut capture_guard = audio_capture.lock().unwrap();
+                    *capture_guard = None;
+                }
+
+                log::info!(
+                    "🎤 No more subscribers, stopping forwarding thread and clearing audio capture"
+                );
                 break;
             }
 

@@ -4,20 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-service-protos = { path = "../service-protos" }
+audio_protocol = { path = "../audio_protocol" }
 # tflitec is configured per-target below
 log = "0.4"
 env_logger = "0.10"
 clap = { version = "4.0", features = ["derive"] }
-tonic = "0.13"
 futures = "0.3"
-hyper-util = "0.1"
-prost = "0.13"
 tokio = { version = "1.0", features = ["full"] }
 hound = "3.5"
 thiserror = "1.0"
 rand = "0.8"
-tower = { version = "0.4", features = ["util"] }
 
 # Target-specific dependencies: XNNPACK automatically enabled on aarch64 Linux
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
@@ -39,7 +35,7 @@ xnnpack_qs8 = []
 
 [dev-dependencies]
 hound = "3.5"
-audio_api = { path = "../audio_api" }
+audio = { path = "../audio" }
 tokio-stream = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 

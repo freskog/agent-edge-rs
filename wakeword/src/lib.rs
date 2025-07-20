@@ -10,7 +10,8 @@
 //! for better compatibility and performance.
 
 pub mod error;
-pub mod grpc_client;
+// TODO: Convert to TCP protocol
+// pub mod grpc_client;
 pub mod model;
 pub mod utils;
 pub mod xnnpack_fix;

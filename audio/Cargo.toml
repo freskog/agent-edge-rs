@@ -1,5 +1,5 @@
 [package]
-name = "audio_api"
+name = "audio"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,6 +7,7 @@ description = "Audio input/output interface for agent-edge-rs"
 license.workspace = true
 
 [dependencies]
+audio_protocol = { path = "../audio_protocol" }
 cpal = "0.16.0"
 thiserror = "2.0"
 log.workspace = true
@@ -17,6 +18,7 @@ serde_json.workspace = true
 crossbeam = "0.8"
 rubato = "0.16.2"
 ctrlc = "3.4"
+samplerate = "0.2"
 
 [features]
 audio_available = []

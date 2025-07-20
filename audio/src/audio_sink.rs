@@ -369,23 +369,10 @@ impl AudioSink {
                     match command {
                         AudioCommand::WriteChunk(s16le_data) => {
                             // Add to platform-appropriate buffer
+                            // Let the bounded channel provide natural backpressure instead of dropping samples
                             {
                                 let mut buffer = audio_buffer.lock().unwrap();
                                 buffer.extend_from_s16le(&s16le_data, hardware_channels)?;
-
-                                // Prevent buffer from growing too large
-                                if buffer.len() > buffer_size {
-                                    let excess = buffer.len() - buffer_size;
-                                    match &mut *buffer {
-                                        PlatformAudioBuffer::I16(b) => {
-                                            b.drain(..excess);
-                                        }
-                                        PlatformAudioBuffer::F32(b) => {
-                                            b.drain(..excess);
-                                        }
-                                    }
-                                    log::warn!("Audio buffer overflow, dropped {} samples", excess);
-                                }
                             }
                         }
                         AudioCommand::EndStreamAndWait(tx) => {

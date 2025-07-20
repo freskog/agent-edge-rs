@@ -11,7 +11,7 @@ name = "agent"
 path = "src/lib.rs"
 
 [dependencies]
-audio_api = { path = "../audio_api" }
+audio = { path = "../audio" }
 
 # ONNX Runtime
 ort-sys = "=2.0.0-rc.9"

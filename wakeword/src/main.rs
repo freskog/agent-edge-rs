@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use log::{error, info};
 use std::path::PathBuf;
 
-use wakeword::{grpc_client, Model};
+use wakeword::Model;
 
 #[derive(Parser)]
 #[command(name = "wakeword")]
@@ -142,13 +142,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("📋 Using models: {:?}", model_names);
             info!("🎯 Detection threshold: {}", threshold);
 
+            // TODO: Convert to TCP client using audio_protocol
             // Start the gRPC client
-            if let Err(e) =
-                grpc_client::start_wakeword_detection(socket, model_names, *threshold).await
-            {
-                error!("❌ gRPC client failed: {}", e);
-                std::process::exit(1);
-            }
+            // if let Err(e) =
+            //     grpc_client::start_wakeword_detection(socket, model_names, *threshold).await
+            // {
+            //     error!("❌ gRPC client failed: {}", e);
+            //     std::process::exit(1);
+            // }
+            error!("❌ gRPC functionality temporarily disabled during refactoring");
+            error!("🔧 TODO: Convert to use audio_protocol TCP client");
+            std::process::exit(1);
         }
 
         Commands::Benchmark { model } => {
