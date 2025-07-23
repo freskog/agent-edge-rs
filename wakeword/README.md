@@ -13,6 +13,7 @@ This implementation closely mirrors the Python OpenWakeWord structure and API fo
 3. **Simplified API**: Direct port of the Python `predict()` method
 4. **Better Buffer Management**: Matches Python's approach for streaming audio processing
 5. **Model Loading**: Supports loading models by name or path, like the Python version
+6. **TCP Protocol**: Uses simple TCP protocol instead of gRPC for audio streaming
 
 ### Architecture
 
@@ -55,68 +56,133 @@ for (model_name, confidence) in predictions {
 ### Command Line Usage
 
 ```bash
-# Test with default model
-cargo run
-
-# Test with specific model and threshold
-cargo run -- --model hey_mycroft --threshold 0.3
-
 # Test with audio file
-cargo run -- --audio-file test.wav --threshold 0.5
+cargo run -- test --input audio.wav --models hey_mycroft,hey_jarvis --threshold 0.5
 
-# Enable debug logging
-cargo run -- --debug
+# Live detection with TCP audio stream  
+cargo run -- listen --server 127.0.0.1:50051 --models hey_mycroft --threshold 0.3
+
+# Performance benchmark
+cargo run -- benchmark --model hey_mycroft
 ```
 
-## Model Files
+### TCP Audio Streaming
 
-The implementation expects model files in the `models/` directory:
+The wakeword module connects to an audio server via TCP for real-time detection:
 
-- `melspectrogram.tflite` - Mel spectrogram feature extraction
-- `embedding_model.tflite` - Audio embedding model
-- `hey_mycroft_v0.1.tflite` - Hey Mycroft wake word model
-- Other wake word models...
+```rust
+use wakeword::tcp_client;
+
+// Simple synchronous API
+let server_address = "127.0.0.1:50051";
+let model_names = vec!["hey_mycroft".to_string()];
+let threshold = 0.5;
+
+tcp_client::start_wakeword_detection(server_address, model_names, threshold)?;
+```
+
+**Benefits of TCP over gRPC:**
+- **Simpler**: No async complexity, straightforward blocking I/O
+- **Faster**: Direct binary protocol, no protobuf overhead
+- **Portable**: Works across networks, not just Unix sockets
+- **Maintainable**: Easier to debug and understand for Scala developers
+
+## Audio Format
+
+The TCP protocol expects:
+- **Sample Rate**: 16 kHz (required for wake word models)
+- **Format**: 16-bit little-endian PCM
+- **Channels**: Mono (single channel)
+- **Chunk Size**: ~80ms chunks (1280 samples)
 
 ## Performance
 
-This implementation is designed to match the performance characteristics of the Python version:
+### XNNPACK Acceleration
 
-- **Streaming Processing**: Processes audio in 80ms chunks
-- **Memory Efficient**: Fixed-size buffers prevent memory growth
-- **TensorFlow Lite**: Uses XNNPACK acceleration when available
-- **Single-threaded**: Uses single-threaded inference for better control
+On ARM64 Linux systems, XNNPACK acceleration is automatically enabled for optimal performance:
 
-## API Compatibility
+```bash
+# Check XNNPACK is working
+cargo run -- benchmark --model hey_mycroft
+```
 
-The Rust API closely matches the Python version:
+Expected performance on ARM64:
+- **Inference Time**: 10-30ms per 1.28s audio chunk
+- **Real-time Factor**: 40-100x (much faster than real-time)
+- **CPU Usage**: Low, suitable for battery-powered devices
 
-| Python | Rust |
-|--------|------|
-| `Model(wakeword_models=["hey_mycroft"])` | `Model::new(vec!["hey_mycroft".to_string()], ...)` |
-| `model.predict(audio_data)` | `model.predict(&audio_data, None, 0.0)` |
-| `model.reset()` | `model.reset()` |
+### Synchronous Benefits
+
+The synchronous design provides:
+- **Low Latency**: No async scheduler overhead
+- **Predictable Timing**: Direct function calls  
+- **Simple Debugging**: Linear stack traces
+- **Better for Real-time**: No task yielding or context switching
+
+## Integration
+
+### With Audio API
+
+1. Start audio server:
+```bash
+cd audio_api && cargo run -- --address 127.0.0.1:50051
+```
+
+2. Connect wakeword client:
+```bash
+cd wakeword && cargo run -- listen --server 127.0.0.1:50051
+```
+
+### Programmatic Usage
+
+```rust
+use wakeword::tcp_client::WakewordClient;
+
+// Create client
+let mut client = WakewordClient::new(
+    "127.0.0.1:50051",
+    vec!["hey_mycroft".to_string()],
+    0.5
+)?;
+
+// Start detection (blocks until stream ends)
+client.start_detection()?;
+```
 
 ## Dependencies
 
-- `tflitec` - TensorFlow Lite C API bindings
-- `hound` - WAV file I/O
-- `clap` - Command line argument parsing
-- `tokio` - Async runtime
-- `log` - Logging
-- `rand` - Random number generation
+### Core Dependencies
+- **`audio_protocol`**: TCP communication with audio server
+- **`tflitec`**: TensorFlow Lite inference (with XNNPACK on ARM64)
+- **`log`**: Logging framework
+- **`clap`**: Command line interface
 
-## Building
+### Removed Dependencies
+- ~~`tonic`~~: gRPC framework (replaced with TCP)
+- ~~`futures`~~: Async streams (replaced with synchronous loops)
+- ~~`tokio`~~: Async runtime (now synchronous)
+- ~~`service-protos`~~: Protobuf definitions (replaced with binary protocol)
 
-```bash
-cargo build --release
+## Error Handling
+
+Simple synchronous error handling:
+
+```rust
+match tcp_client::start_wakeword_detection(server, models, threshold) {
+    Ok(()) => println!("Detection completed"),
+    Err(e) => {
+        eprintln!("Detection failed: {}", e);
+        // Handle connection errors, model errors, etc.
+    }
+}
 ```
 
-## Testing
+## Contributing
 
-```bash
-# Run tests
-cargo test
+This implementation prioritizes:
+1. **Simplicity**: Easy to understand and maintain
+2. **Performance**: Low-latency real-time processing  
+3. **Compatibility**: Matches Python OpenWakeWord behavior
+4. **Reliability**: Robust error handling and recovery
 
-# Run with example audio
-cargo run -- --audio-file example.wav
-``` 
+Perfect for Scala developers who value clean, synchronous APIs over async complexity. 

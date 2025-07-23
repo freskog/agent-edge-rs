@@ -1,64 +1,56 @@
-//! # gRPC Client Example
+//! # TCP Client Example
 //!
-//! This example demonstrates how to use the wake word detection gRPC client
+//! This example demonstrates how to use the wake word detection TCP client
 //! to connect to the audio API and detect wake words from live audio.
 //!
 //! ## Prerequisites
 //!
 //! 1. Start the audio API server:
 //!    ```bash
-//!    cd audio_api && cargo run -- --socket /tmp/audio_api.sock
+//!    cd audio_api && cargo run -- --address 127.0.0.1:50051
 //!    ```
 //!
 //! 2. Run this example:
 //!    ```bash
-//!    cd wakeword && cargo run --example grpc_client_example
+//!    cd wakeword && cargo run --example tcp_client_example
 //!    ```
 //!
 //! ## Usage
 //!
 //! The example will:
-//! - Connect to the audio API via Unix socket
+//! - Connect to the audio API via TCP
 //! - Subscribe to live audio streams
 //! - Process audio chunks and detect wake words
 //! - Print detection results to console
 
 use log::{error, info};
 use std::env;
-use wakeword::grpc_client;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     env_logger::init();
 
-    info!("🚀 Starting Wake Word Detection gRPC Client Example");
+    info!("🚀 Starting Wake Word Detection TCP Client Example");
 
     // Configuration
-    let socket_path =
-        env::var("AUDIO_API_SOCKET").unwrap_or_else(|_| "/tmp/audio_api.sock".to_string());
+    let server_address =
+        env::var("AUDIO_SERVER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
     let model_names = vec!["hey_mycroft".to_string(), "hey_jarvis".to_string()];
     let detection_threshold = 0.5;
 
     info!("📋 Configuration:");
-    info!("   Socket: {}", socket_path);
+    info!("   Server: {}", server_address);
     info!("   Models: {:?}", model_names);
     info!("   Threshold: {}", detection_threshold);
 
-    // Check if socket exists
-    if !std::path::Path::new(&socket_path).exists() {
-        error!("❌ Audio API socket not found: {}", socket_path);
-        error!("   Please start the audio API server first:");
-        error!("   cd audio_api && cargo run -- --socket {}", socket_path);
-        std::process::exit(1);
-    }
+    info!("🔌 Connecting to audio server...");
 
-    info!("🔌 Connecting to audio API...");
-
-    // Start wake word detection
-    match grpc_client::start_wakeword_detection(&socket_path, model_names, detection_threshold)
-        .await
-    {
+    // Start wake word detection (now synchronous!)
+    match wakeword::tcp_client::start_wakeword_detection(
+        &server_address,
+        model_names,
+        detection_threshold,
+    ) {
         Ok(()) => {
             info!("✅ Wake word detection completed successfully");
         }
@@ -67,13 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Provide helpful error messages
             let error_msg = e.to_string();
-            if error_msg.contains("Connection refused")
-                || error_msg.contains("No such file or directory")
-            {
+            if error_msg.contains("Connection refused") || error_msg.contains("connect") {
                 error!("💡 Troubleshooting:");
                 error!("   1. Make sure the audio API server is running");
-                error!("   2. Check the socket path is correct");
-                error!("   3. Verify the socket file exists and is accessible");
+                error!(
+                    "   2. Check the server address is correct: {}",
+                    server_address
+                );
+                error!("   3. Verify the server is listening on the specified port");
             } else if error_msg.contains("models") {
                 error!("💡 Troubleshooting:");
                 error!("   1. Make sure wake word model files are available");

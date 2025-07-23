@@ -19,7 +19,6 @@ pub struct Model {
     // Model storage
     models: HashMap<String, Interpreter<'static>>,
     model_inputs: HashMap<String, usize>,
-    model_outputs: HashMap<String, usize>,
 
     // Class mappings for multi-class models
     class_mapping: HashMap<String, HashMap<String, String>>,
@@ -29,10 +28,6 @@ pub struct Model {
 
     // Prediction buffers (deque with maxlen=30 like Python)
     prediction_buffer: HashMap<String, VecDeque<f32>>,
-
-    // Configuration
-    vad_threshold: f32,
-    custom_verifier_threshold: f32,
 }
 
 impl Model {
@@ -41,16 +36,12 @@ impl Model {
     /// # Arguments
     /// * `wakeword_models` - List of model names or paths to load
     /// * `class_mapping_dicts` - Optional class mappings for multi-class models
-    /// * `vad_threshold` - Voice activity detection threshold
-    /// * `custom_verifier_threshold` - Custom verifier threshold
     ///
     /// # Returns
     /// * `Result<Model>` - The created model instance
     pub fn new(
         wakeword_models: Vec<String>,
         class_mapping_dicts: Vec<HashMap<String, String>>,
-        vad_threshold: f32,
-        custom_verifier_threshold: f32,
     ) -> Result<Self> {
         let model_paths = MODELS;
         let mut model_names = Vec::new();
@@ -100,7 +91,7 @@ impl Model {
             })?));
 
             // Use our XNNPACK-safe interpreter creation
-            let mut interpreter =
+            let interpreter =
                 crate::xnnpack_fix::create_interpreter_with_xnnpack_safe(tflite_model, 1).map_err(
                     |e| {
                         OpenWakeWordError::ModelLoadError(format!(
@@ -195,12 +186,9 @@ impl Model {
         Ok(Model {
             models,
             model_inputs,
-            model_outputs,
             class_mapping,
             preprocessor,
             prediction_buffer,
-            vad_threshold,
-            custom_verifier_threshold,
         })
     }
 

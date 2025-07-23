@@ -181,6 +181,11 @@ impl AudioServer {
         let client_id = format!("client_{:?}", thread::current().id());
         let mut audio_rx: Option<crossbeam::channel::Receiver<Vec<u8>>> = None;
 
+        // Track slow client behavior
+        let mut failed_send_count = 0;
+        const MAX_FAILED_SENDS: usize = 10; // Allow some failures before giving up
+        const SLOW_CLIENT_THRESHOLD: Duration = Duration::from_millis(100);
+
         loop {
             let mut did_work = false;
 
@@ -197,14 +202,63 @@ impl AudioServer {
                                     .as_millis() as u64,
                             };
 
-                            if conn.write_message(&chunk_msg).is_err() {
-                                log::debug!(
-                                    "🎤 Failed to send audio to {}, closing connection",
-                                    client_id
-                                );
-                                break;
+                            // Try to send with timeout to detect slow clients
+                            let send_start = std::time::Instant::now();
+                            match conn.write_message(&chunk_msg) {
+                                Ok(()) => {
+                                    // Reset failure count on success
+                                    failed_send_count = 0;
+                                    did_work = true;
+
+                                    // Warn about slow writes (but don't disconnect)
+                                    let send_duration = send_start.elapsed();
+                                    if send_duration > SLOW_CLIENT_THRESHOLD {
+                                        log::warn!(
+                                            "🐌 Slow client {}: TCP write took {:?} (client may be overwhelmed)",
+                                            client_id, send_duration
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    failed_send_count += 1;
+
+                                    // Check if it's a real connection error or just backpressure
+                                    let is_connection_error = match &e {
+                                        ProtocolError::Io(io_err) => {
+                                            matches!(io_err.kind(),
+                                                std::io::ErrorKind::BrokenPipe |
+                                                std::io::ErrorKind::ConnectionReset |
+                                                std::io::ErrorKind::ConnectionAborted |
+                                                std::io::ErrorKind::UnexpectedEof
+                                            )
+                                        }
+                                        _ => false,
+                                    };
+
+                                    if is_connection_error {
+                                        log::info!(
+                                            "🔌 Client {} disconnected: {}",
+                                            client_id, e
+                                        );
+                                        break;
+                                    } else if failed_send_count >= MAX_FAILED_SENDS {
+                                        log::warn!(
+                                            "💤 Client {} is too slow ({} failed sends), disconnecting. Last error: {}",
+                                            client_id, failed_send_count, e
+                                        );
+                                        break;
+                                    } else {
+                                        log::debug!(
+                                            "⚠️  Temporary send failure to {} ({}/{}): {}",
+                                            client_id, failed_send_count, MAX_FAILED_SENDS, e
+                                        );
+                                        // Continue trying for a few more attempts
+                                    }
+                                }
                             }
-                            did_work = true;
+                        } else {
+                            // Channel closed from forwarding thread side
+                            log::debug!("📡 Audio channel closed for {}", client_id);
                         }
                     }
                     default(Duration::from_millis(1)) => {
@@ -233,7 +287,7 @@ impl AudioServer {
                             }
                         }
                         Err(e) => {
-                            log::error!("Error handling message: {}", e);
+                            log::error!("Error handling message from {}: {}", client_id, e);
                             let error_msg = Message::ErrorResponse {
                                 message: format!("Server error: {}", e),
                             };
@@ -243,14 +297,14 @@ impl AudioServer {
                     }
                 }
                 Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Client disconnected
+                    log::info!("🔌 Client {} disconnected (EOF)", client_id);
                     break;
                 }
                 Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No message available - this is expected in non-blocking mode
                 }
                 Err(e) => {
-                    log::error!("Protocol error: {}", e);
+                    log::error!("Protocol error with {}: {}", client_id, e);
                     let error_msg = Message::ErrorResponse {
                         message: format!("Protocol error: {}", e),
                     };
@@ -268,9 +322,10 @@ impl AudioServer {
         // Clean up audio capture subscription if any
         {
             let mut subscribers = capture_subscribers.lock().unwrap();
-            subscribers.remove(&client_id);
+            if subscribers.remove(&client_id).is_some() {
+                log::info!("🎤 Unsubscribed {} from audio capture", client_id);
+            }
         }
-        log::debug!("🎤 Removed subscriber: {}", client_id);
 
         Ok(())
     }
@@ -472,15 +527,17 @@ impl AudioServer {
     ) {
         log::info!("🎤 Audio forwarding thread started");
         let mut idle_count = 0;
+        let mut client_warnings: HashMap<String, usize> = HashMap::new();
+        const MAX_CHANNEL_WARNINGS: usize = 5;
 
         while forwarding_thread_running.load(Ordering::SeqCst) {
             // Check if we have any subscribers
-            let has_subscribers = {
+            let subscriber_count = {
                 let subscribers_guard = subscribers.lock().unwrap();
-                !subscribers_guard.is_empty()
+                subscribers_guard.len()
             };
 
-            if !has_subscribers {
+            if subscriber_count == 0 {
                 // No subscribers, stop the thread and clear audio capture to avoid buffer persistence
                 forwarding_thread_running.store(false, Ordering::SeqCst);
 
@@ -511,28 +568,65 @@ impl AudioServer {
                 // Reset idle counter - we have audio data
                 idle_count = 0;
 
-                // Send to all subscribers
-                let mut to_remove = Vec::new();
+                // Send to all subscribers with better handling of slow clients
+                let mut clients_to_warn = Vec::new();
+                let mut clients_to_remove = Vec::new();
+
                 {
                     let subscribers_guard = subscribers.lock().unwrap();
                     for (client_id, sender) in subscribers_guard.iter() {
-                        if sender.try_send(data.clone()).is_err() {
-                            // Channel is full or closed
-                            to_remove.push(client_id.clone());
+                        match sender.try_send(data.clone()) {
+                            Ok(()) => {
+                                // Success - reset warning count for this client
+                                client_warnings.remove(client_id);
+                            }
+                            Err(crossbeam::channel::TrySendError::Full(_)) => {
+                                // Channel is full - client is slow
+                                let warning_count =
+                                    client_warnings.get(client_id).unwrap_or(&0) + 1;
+                                client_warnings.insert(client_id.clone(), warning_count);
+
+                                if warning_count <= MAX_CHANNEL_WARNINGS {
+                                    clients_to_warn.push((client_id.clone(), warning_count));
+                                } else {
+                                    // Client has been slow for too long, mark for removal
+                                    clients_to_remove.push(client_id.clone());
+                                }
+                            }
+                            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                                // Channel is closed - client disconnected
+                                clients_to_remove.push(client_id.clone());
+                            }
                         }
                     }
                 }
 
-                // Remove dead subscribers
-                if !to_remove.is_empty() {
+                // Log warnings for slow clients (but don't remove them yet)
+                for (client_id, warning_count) in clients_to_warn {
+                    if warning_count == 1 {
+                        log::warn!(
+                            "🐌 Client {} has full channel buffer (may be slow to process audio)",
+                            client_id
+                        );
+                    } else if warning_count == MAX_CHANNEL_WARNINGS {
+                        log::warn!(
+                            "💤 Client {} consistently slow ({} warnings), will disconnect if it continues",
+                            client_id, warning_count
+                        );
+                    }
+                }
+
+                // Remove consistently problematic clients
+                if !clients_to_remove.is_empty() {
                     {
                         let mut subscribers_guard = subscribers.lock().unwrap();
-                        for client_id in &to_remove {
+                        for client_id in &clients_to_remove {
                             subscribers_guard.remove(client_id);
+                            client_warnings.remove(client_id);
                         }
                     }
-                    for client_id in to_remove {
-                        log::debug!("🎤 Removed dead subscriber: {}", client_id);
+                    for client_id in clients_to_remove {
+                        log::info!("🎤 Removed slow/disconnected subscriber: {}", client_id);
                     }
                 }
             } else {

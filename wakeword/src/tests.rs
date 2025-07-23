@@ -26,8 +26,7 @@ fn test_alexa_audio_no_false_positive() {
     // Create model
     let model_names = vec!["hey_mycroft".to_string()];
     let class_mappings = vec![]; // Empty class mappings
-    let mut model =
-        Model::new(model_names, class_mappings, 0.5, 0.5).expect("Failed to create model");
+    let mut model = Model::new(model_names, class_mappings).expect("Failed to create model");
 
     // Test prediction
     let results = model
@@ -96,8 +95,6 @@ fn test_hey_mycroft_audio_detection() {
     let mut model = Model::new(
         vec!["hey_mycroft".to_string()],
         vec![], // Empty class mappings
-        0.0,    // VAD threshold
-        0.1,    // Custom verifier threshold
     )
     .expect("Failed to create model");
 
@@ -327,7 +324,7 @@ fn test_model_creation() {
     // Test single model
     let model_names = vec!["hey_mycroft".to_string()];
     let class_mappings = vec![]; // Empty class mappings
-    let model = Model::new(model_names.clone(), class_mappings, 0.5, 0.5);
+    let model = Model::new(model_names.clone(), class_mappings);
     assert!(model.is_ok(), "Failed to create model: {:?}", model.err());
 
     let mut model = model.unwrap();
@@ -359,14 +356,13 @@ fn test_error_handling() {
     // Test with invalid model name
     let model_names = vec!["nonexistent_model".to_string()];
     let class_mappings = vec![]; // Empty class mappings
-    let model = Model::new(model_names, class_mappings, 0.5, 0.5);
+    let model = Model::new(model_names, class_mappings);
     assert!(model.is_err(), "Should fail with nonexistent model");
 
     // Test with empty audio
     let model_names = vec!["hey_mycroft".to_string()];
     let class_mappings = vec![]; // Empty class mappings
-    let mut model =
-        Model::new(model_names, class_mappings, 0.5, 0.5).expect("Failed to create model");
+    let mut model = Model::new(model_names, class_mappings).expect("Failed to create model");
 
     let empty_audio: Vec<i16> = vec![];
     let result = model.predict(&empty_audio, None, 0.0);
@@ -400,8 +396,7 @@ fn test_performance() {
     // Create model
     let model_names = vec!["hey_mycroft".to_string()];
     let class_mappings = vec![]; // Empty class mappings
-    let mut model =
-        Model::new(model_names, class_mappings, 0.5, 0.5).expect("Failed to create model");
+    let mut model = Model::new(model_names, class_mappings).expect("Failed to create model");
 
     // Time the prediction
     let start = std::time::Instant::now();

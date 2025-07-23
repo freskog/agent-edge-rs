@@ -9,22 +9,20 @@ audio_protocol = { path = "../audio_protocol" }
 log = "0.4"
 env_logger = "0.10"
 clap = { version = "4.0", features = ["derive"] }
-futures = "0.3"
-tokio = { version = "1.0", features = ["full"] }
 hound = "3.5"
 thiserror = "1.0"
 rand = "0.8"
 
-# Target-specific dependencies: XNNPACK automatically enabled on aarch64 Linux
-[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+# Target-specific dependencies: XNNPACK enabled on both aarch64 Linux AND macOS
+[target.'cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_os = "macos"))'.dependencies]
 tflitec = { version = "0.6.0", features = [
     "xnnpack",
     "xnnpack_qu8",
     "xnnpack_qs8",
 ] }
 
-# For all other targets: tflitec without XNNPACK (permanently disabled)
-[target.'cfg(not(all(target_arch = "aarch64", target_os = "linux")))'.dependencies]
+# For all other targets: tflitec without XNNPACK
+[target.'cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_os = "macos")))'.dependencies]
 tflitec = "0.6.0"
 
 [features]
@@ -35,9 +33,6 @@ xnnpack_qs8 = []
 
 [dev-dependencies]
 hound = "3.5"
-audio = { path = "../audio" }
-tokio-stream = "0.1"
-uuid = { version = "1.0", features = ["v4"] }
 
 [build-dependencies]
 cc = "1.0"

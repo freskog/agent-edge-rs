@@ -26,8 +26,6 @@ pub struct AudioFeatures {
     feature_buffer: Vec<Vec<f32>>, // Stores embeddings
 
     // Configuration
-    sample_rate: u32,
-    melspectrogram_max_len: usize, // 10*97 frames
     feature_buffer_max_len: usize, // 120 frames (~10 seconds)
 }
 
@@ -47,7 +45,7 @@ impl AudioFeatures {
         ));
 
         // Use our XNNPACK-safe interpreter creation for melspec model
-        let mut melspec_model =
+        let melspec_model =
             crate::xnnpack_fix::create_interpreter_with_xnnpack_safe(melspec_model_data, 1)
                 .map_err(|e| {
                     OpenWakeWordError::ModelLoadError(format!(
@@ -77,7 +75,7 @@ impl AudioFeatures {
         ));
 
         // Use our XNNPACK-safe interpreter creation for embedding model
-        let mut embedding_model =
+        let embedding_model =
             crate::xnnpack_fix::create_interpreter_with_xnnpack_safe(embedding_model_data, 1)
                 .map_err(|e| {
                     OpenWakeWordError::ModelLoadError(format!(
@@ -114,9 +112,7 @@ impl AudioFeatures {
             accumulated_samples: 0,
             raw_data_remainder: Vec::new(),
             feature_buffer: Vec::new(),
-            sample_rate: sr,
-            melspectrogram_max_len: 10 * 97, // 97 frames per second
-            feature_buffer_max_len: 120,     // ~10 seconds
+            feature_buffer_max_len: 120, // ~10 seconds
         };
 
         // Initialize feature buffer with dummy embeddings to avoid tensor allocation issues
