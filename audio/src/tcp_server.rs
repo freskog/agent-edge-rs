@@ -176,6 +176,11 @@ impl AudioServer {
         forwarding_thread_running: Arc<AtomicBool>,
     ) -> Result<(), ServerError> {
         let mut conn = Connection::new(stream)?;
+
+        // Set the underlying streams to non-blocking for audio streaming
+        // This must be done AFTER Connection::new() to avoid BufReader/BufWriter issues
+        conn.set_nonblocking(true)?;
+
         let client_id = format!("client_{:?}", thread::current().id());
         let mut audio_rx: Option<crossbeam::channel::Receiver<Vec<u8>>> = None;
         let mut chunks_played_count = 0u32; // Track chunks played for this stream

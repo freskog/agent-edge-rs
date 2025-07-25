@@ -368,6 +368,14 @@ impl Connection {
         log::debug!("✅ Successfully sent message: {:?}", message.message_type());
         Ok(())
     }
+
+    /// Set the underlying TCP streams to non-blocking mode
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), ProtocolError> {
+        // Access the underlying TCP stream from BufReader and BufWriter
+        self.reader.get_ref().set_nonblocking(nonblocking)?;
+        self.writer.get_ref().set_nonblocking(nonblocking)?;
+        Ok(())
+    }
 }
 
 // Helper functions for reading/writing strings and byte arrays
