@@ -20,10 +20,6 @@ rand = "0.8"
 anyhow = "1.0"
 
 [[bin]]
-name = "check_xnnpack_compat"
-path = "src/bin/check_xnnpack_compat.rs"
-
-[[bin]]
 name = "debug_audio"
 path = "src/bin/debug_audio.rs"
 

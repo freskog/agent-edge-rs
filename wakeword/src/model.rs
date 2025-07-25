@@ -82,6 +82,58 @@ impl Model {
         for (model_name, model_path) in model_names.iter().zip(resolved_paths.iter()) {
             log::debug!("Loading model: {} from {}", model_name, model_path);
 
+            // === MODEL FILE VALIDATION ===
+            let model_data = std::fs::read(model_path).map_err(|e| {
+                OpenWakeWordError::ModelLoadError(format!(
+                    "Failed to read model file {}: {}",
+                    model_path, e
+                ))
+            })?;
+
+            let file_size = model_data.len();
+            let hash = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                model_data.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            log::info!(
+                "🔍 MODEL_FILE_CHECK: {} - size={} bytes, hash={:x}",
+                model_name,
+                file_size,
+                hash
+            );
+
+            // === RUNTIME PLATFORM DIAGNOSTICS ===
+            log::info!(
+                "🔍 PLATFORM_DEBUG: Loading {} on target_os={}, target_arch={}",
+                model_name,
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+
+            // Check CPU features that might affect inference
+            #[cfg(target_arch = "aarch64")]
+            {
+                log::info!(
+                    "🔍 ARM64_DEBUG: Model {} loading on ARM64 platform",
+                    model_name
+                );
+                // Log any ARM-specific features if available
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                log::info!("🔍 MACOS_DEBUG: Model {} loading on macOS", model_name);
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                log::info!("🔍 LINUX_DEBUG: Model {} loading on Linux", model_name);
+            }
+
             // Load TFLite model (same pattern as utils.rs)
             let tflite_model = Box::leak(Box::new(TfliteModel::new(model_path).map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!(
@@ -90,10 +142,10 @@ impl Model {
                 ))
             })?));
 
-            // Re-enable XNNPACK with fixed bindings
+            // Match Python's single-threaded configuration for consistency
             let options = tflitec::interpreter::Options {
-                thread_count: 1,
-                is_xnnpack_enabled: true, // Re-enable XNNPACK with fixed bindings
+                thread_count: 1,          // Match Python's default (ncpu=1)
+                is_xnnpack_enabled: true, // Keep XNNPACK for performance
             };
 
             let interpreter = tflitec::interpreter::Interpreter::new(tflite_model, Some(options))
@@ -111,6 +163,7 @@ impl Model {
                 ))
             })?;
 
+            // === TENSORFLOW LITE DIAGNOSTICS ===
             let input_tensor = interpreter.input(0).map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!(
                     "Failed to get input tensor for {}: {}",
@@ -124,6 +177,14 @@ impl Model {
                     model_name, e
                 ))
             })?;
+
+            // Log tensor information for platform comparison
+            log::info!(
+                "🔍 TENSOR_DEBUG: Model {} - Input shape: {:?}, Output shape: {:?}",
+                model_name,
+                input_tensor.shape().dimensions(),
+                output_tensor.shape().dimensions()
+            );
 
             // Python uses shape[1] for input_size (number of frames, not total features)
             let input_size = input_tensor
@@ -186,6 +247,53 @@ impl Model {
             prediction_buffer.insert(model_name.clone(), deque);
         }
 
+        // === FUNDAMENTAL FLOATING-POINT TESTS ===
+        log::info!("🧮 MATH_TEST: Basic floating-point arithmetic comparison");
+
+        // Test basic operations that TensorFlow Lite uses
+        let test_vals = [0.1_f32, 0.7_f32, 0.9_f32];
+        for &val in &test_vals {
+            let exp_result = val.exp();
+            let log_result = val.ln();
+            let sqrt_result = val.sqrt();
+            let sin_result = val.sin();
+
+            log::info!(
+                "🧮 MATH_TEST: {} -> exp={:.15}, ln={:.15}, sqrt={:.15}, sin={:.15}",
+                val,
+                exp_result,
+                log_result,
+                sqrt_result,
+                sin_result
+            );
+        }
+
+        // Test IEEE 754 edge cases
+        let denormal = f32::MIN_POSITIVE / 2.0;
+        let inf_test = 1.0_f32 / 0.0_f32;
+        let nan_test = 0.0_f32 / 0.0_f32;
+
+        log::info!(
+            "🧮 MATH_TEST: Special values - denormal={:.15}, inf={:.15}, nan={:.15}",
+            denormal,
+            inf_test,
+            nan_test
+        );
+
+        // Test array operations (similar to neural network computations)
+        let test_array = [0.1_f32, 0.2, 0.3, 0.4, 0.5];
+        let sum: f32 = test_array.iter().sum();
+        let mean = sum / test_array.len() as f32;
+        let variance: f32 =
+            test_array.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / test_array.len() as f32;
+
+        log::info!(
+            "🧮 MATH_TEST: Array ops - sum={:.15}, mean={:.15}, variance={:.15}",
+            sum,
+            mean,
+            variance
+        );
+
         Ok(Model {
             models,
             model_inputs,
@@ -193,6 +301,27 @@ impl Model {
             preprocessor,
             prediction_buffer,
         })
+    }
+
+    /// Initialize model and run synthetic tests
+    pub fn new_with_tests(
+        wakeword_models: Vec<String>,
+        class_mapping_dicts: Vec<HashMap<String, String>>,
+    ) -> Result<Self> {
+        let mut model = Self::new(wakeword_models, class_mapping_dicts)?;
+
+        // Run synthetic tests for platform comparison
+        log::info!("🧪 Running cross-platform consistency tests...");
+        if let Err(e) = model.test_synthetic_prediction() {
+            log::warn!("🧪 Synthetic tests failed: {}", e);
+        }
+
+        // Run preprocessing model tests
+        if let Err(e) = model.test_preprocessing_models() {
+            log::warn!("🔊 Preprocessing tests failed: {}", e);
+        }
+
+        Ok(model)
     }
 
     /// Reset internal state
@@ -278,6 +407,32 @@ impl Model {
                             "🔍 Chunk {}: Model {}: feature stats: mean={:.6}, min={:.6}, max={:.6}",
                             chunk_idx, mdl, mean, min, max
                         );
+
+                        // === DETAILED FEATURE COMPARISON DEBUG ===
+                        log::debug!(
+                            "📊 FEATURE_COMPARISON: chunk={}, model={}, len={}, mean={:.8}, min={:.8}, max={:.8}",
+                            chunk_idx, mdl, features.len(), mean, min, max
+                        );
+
+                        // Log first 16 feature values for direct comparison
+                        log::debug!(
+                            "📊 FEATURE_VALUES: chunk={}, model={}, first_16={:?}",
+                            chunk_idx,
+                            mdl,
+                            &features[..features.len().min(16)]
+                        );
+
+                        // Calculate variance/std for distribution comparison
+                        let variance = features.iter().map(|&x| (x - mean).powi(2)).sum::<f32>()
+                            / features.len() as f32;
+                        let std_dev = variance.sqrt();
+                        log::debug!(
+                            "📊 FEATURE_DIST: chunk={}, model={}, variance={:.8}, std_dev={:.8}",
+                            chunk_idx,
+                            mdl,
+                            variance,
+                            std_dev
+                        );
                     }
 
                     // Only predict if we have enough features (don't pad with zeros)
@@ -294,10 +449,31 @@ impl Model {
                             prediction
                         );
 
+                        // === DETAILED PREDICTION COMPARISON DEBUG ===
+                        log::debug!(
+                            "🎯 PREDICTION_COMPARISON: chunk={}, model={}, raw_prediction={:.15}",
+                            chunk_idx,
+                            mdl,
+                            prediction
+                        );
+
+                        // Log prediction in scientific notation for extreme values
+                        log::debug!(
+                            "🎯 PREDICTION_SCIENTIFIC: chunk={}, model={}, prediction={:e}",
+                            chunk_idx,
+                            mdl,
+                            prediction
+                        );
+
                         // Take maximum prediction across chunks
                         let current_max = final_predictions.get(mdl).unwrap_or(&0.0);
+                        let old_max = *current_max;
                         if prediction > *current_max {
                             final_predictions.insert(mdl.clone(), prediction);
+                            log::debug!(
+                                "🎯 PREDICTION_UPDATE: chunk={}, model={}, new_max={:.15}, old_max={:.15}",
+                                chunk_idx, mdl, prediction, old_max
+                            );
                         }
                     } else {
                         log::debug!(
@@ -359,6 +535,146 @@ impl Model {
         }
 
         Ok(final_predictions)
+    }
+
+    /// Test model with synthetic input to compare cross-platform consistency  
+    pub fn test_synthetic_prediction(&mut self) -> Result<()> {
+        log::info!("🧪 SYNTHETIC_TEST: Testing model with known input");
+
+        // Create synthetic feature vector (1536 features for hey_mycroft)
+        let synthetic_features: Vec<f32> = (0..1536)
+            .map(|i| (i as f32 * 0.001) + 0.1) // Simple linear pattern
+            .collect();
+
+        // Test with hey_mycroft model
+        if let Some(interpreter) = self.models.get_mut("hey_mycroft") {
+            match Self::run_model_prediction_static(interpreter, &synthetic_features) {
+                Ok(prediction) => {
+                    log::info!(
+                        "🧪 SYNTHETIC_TEST: hey_mycroft prediction = {:.15}",
+                        prediction
+                    );
+                    log::info!(
+                        "🧪 SYNTHETIC_TEST: hey_mycroft prediction (scientific) = {:e}",
+                        prediction
+                    );
+                }
+                Err(e) => {
+                    log::error!("🧪 SYNTHETIC_TEST: Prediction failed: {}", e);
+                }
+            }
+        }
+
+        // Test with all zeros
+        let zero_features = vec![0.0_f32; 1536];
+        if let Some(interpreter) = self.models.get_mut("hey_mycroft") {
+            match Self::run_model_prediction_static(interpreter, &zero_features) {
+                Ok(prediction) => {
+                    log::info!("🧪 ZERO_TEST: hey_mycroft prediction = {:.15}", prediction);
+                }
+                Err(e) => {
+                    log::error!("🧪 ZERO_TEST: Prediction failed: {}", e);
+                }
+            }
+        }
+
+        // Test with all ones
+        let ones_features = vec![1.0_f32; 1536];
+        if let Some(interpreter) = self.models.get_mut("hey_mycroft") {
+            match Self::run_model_prediction_static(interpreter, &ones_features) {
+                Ok(prediction) => {
+                    log::info!("🧪 ONES_TEST: hey_mycroft prediction = {:.15}", prediction);
+                }
+                Err(e) => {
+                    log::error!("🧪 ONES_TEST: Prediction failed: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Test preprocessing models with synthetic audio to compare cross-platform consistency  
+    pub fn test_preprocessing_models(&mut self) -> Result<()> {
+        log::info!("🔊 PREPROCESSING_TEST: Testing melspec and embedding models");
+
+        // Create synthetic audio samples (1280 samples = 80ms at 16kHz)
+        let synthetic_audio: Vec<i16> = (0..1280)
+            .map(|i| ((i as f32 * 0.01).sin() * 1000.0) as i16) // Simple sine wave
+            .collect();
+
+        log::info!(
+            "🔊 AUDIO_INPUT: First 8 samples = {:?}",
+            &synthetic_audio[..8]
+        );
+
+        // Test preprocessing with known audio
+        match self.preprocessor.__call__(&synthetic_audio) {
+            Ok(n_samples) => {
+                log::info!("🔊 PREPROCESSOR: Processed {} samples", n_samples);
+
+                // Test getting features (same as real detection)
+                let features = self.preprocessor.get_features(16, -1); // 16 frames for hey_mycroft
+
+                if features.len() >= 1536 {
+                    let feature_stats = Self::calculate_feature_stats(&features[..1536]);
+                    log::info!(
+                        "🔊 FEATURES: len={}, mean={:.15}, min={:.15}, max={:.15}, std={:.15}",
+                        1536,
+                        feature_stats.0,
+                        feature_stats.1,
+                        feature_stats.2,
+                        feature_stats.3
+                    );
+
+                    // Test with hey_mycroft model using these preprocessed features
+                    if let Some(interpreter) = self.models.get_mut("hey_mycroft") {
+                        match Self::run_model_prediction_static(interpreter, &features[..1536]) {
+                            Ok(prediction) => {
+                                log::info!(
+                                    "🔊 PREPROCESSING_PREDICTION: hey_mycroft = {:.15}",
+                                    prediction
+                                );
+                                log::info!(
+                                    "🔊 PREPROCESSING_PREDICTION: hey_mycroft (scientific) = {:e}",
+                                    prediction
+                                );
+                            }
+                            Err(e) => {
+                                log::error!("🔊 PREPROCESSING_PREDICTION: Failed: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "🔊 FEATURES: Only got {} features, expected 1536",
+                        features.len()
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!("🔊 PREPROCESSOR: Failed: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Calculate statistics for feature vector comparison
+    fn calculate_feature_stats(features: &[f32]) -> (f32, f32, f32, f32) {
+        if features.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+
+        let mean = features.iter().sum::<f32>() / features.len() as f32;
+        let min = features.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let max = features.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+        let variance =
+            features.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / features.len() as f32;
+        let std_dev = variance.sqrt();
+
+        (mean, min, max, std_dev)
     }
 
     /// Get parent model name from label (for multi-class models)

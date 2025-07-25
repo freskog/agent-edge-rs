@@ -27,6 +27,9 @@ pub struct AudioFeatures {
 
     // Configuration
     feature_buffer_max_len: usize, // 120 frames (~10 seconds)
+
+    // Track processed chunks to avoid recomputation (like Python)
+    processed_chunks: usize, // Number of chunks we've already computed embeddings for
 }
 
 impl AudioFeatures {
@@ -44,10 +47,10 @@ impl AudioFeatures {
             })?,
         ));
 
-        // XNNPACK with v2.19.0 should work!
+        // Match Python's default single-threaded configuration for stability
         let mut options = tflitec::interpreter::Options::default();
-        options.thread_count = 1; // Single thread to avoid threading issues
-        options.is_xnnpack_enabled = true; // Re-enable XNNPACK with fixed bindings
+        options.thread_count = 1; // Match Python's default (ncpu=1)
+        options.is_xnnpack_enabled = true; // Keep XNNPACK for performance
 
         let melspec_model =
             tflitec::interpreter::Interpreter::new(melspec_model_data, Some(options)).map_err(
@@ -72,27 +75,26 @@ impl AudioFeatures {
             OpenWakeWordError::ModelLoadError(format!("Failed to allocate melspec tensors: {}", e))
         })?;
 
-        // Load embedding model
+        // Load embedding model with multi-core optimization
         let embedding_model_data = Box::leak(Box::new(
             TfliteModel::new(embedding_model_path).map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!("Failed to load embedding model: {}", e))
             })?,
         ));
 
-        // XNNPACK with v2.19.0 should work!
-        let mut options = tflitec::interpreter::Options::default();
-        options.thread_count = 1; // Single thread to avoid threading issues
-        options.is_xnnpack_enabled = true; // Re-enable XNNPACK with fixed bindings
+        // Match Python's single-threaded configuration for both models
+        let mut embedding_options = tflitec::interpreter::Options::default();
+        embedding_options.thread_count = 1; // Match Python's default (ncpu=1)
+        embedding_options.is_xnnpack_enabled = true; // Keep XNNPACK for performance
 
         let embedding_model =
-            tflitec::interpreter::Interpreter::new(embedding_model_data, Some(options)).map_err(
-                |e| {
-                    OpenWakeWordError::ModelLoadError(format!(
-                        "Failed to create embedding interpreter: {}",
-                        e
-                    ))
-                },
-            )?;
+            tflitec::interpreter::Interpreter::new(embedding_model_data, Some(embedding_options))
+                .map_err(|e| {
+                OpenWakeWordError::ModelLoadError(format!(
+                    "Failed to create embedding interpreter: {}",
+                    e
+                ))
+            })?;
 
         // Resize embedding input tensor to the correct shape: [1, 76, 32, 1]
         // This matches Python: self.embedding_model.resize_tensor_input(0, [1, 76, 32, 1], strict=True)
@@ -123,6 +125,7 @@ impl AudioFeatures {
             raw_data_remainder: Vec::new(),
             feature_buffer: Vec::new(),
             feature_buffer_max_len: 120, // ~10 seconds
+            processed_chunks: 0,
         };
 
         // Initialize feature buffer with dummy embeddings to avoid tensor allocation issues
@@ -138,6 +141,7 @@ impl AudioFeatures {
         self.melspectrogram_buffer = vec![vec![1.0; 32]; 76];
         self.accumulated_samples = 0;
         self.raw_data_remainder.clear();
+        self.processed_chunks = 0; // Reset processed chunks counter
 
         // Reinitialize feature buffer with dummy embeddings
         self.feature_buffer = vec![vec![0.0; 96]; 1]; // Start with one empty embedding
@@ -479,39 +483,53 @@ impl AudioFeatures {
 
                         // Add new frame to buffer (keep more frames for sliding windows)
                         self.melspectrogram_buffer.push(frame);
-                        // Keep enough frames for multiple overlapping windows (e.g., 150 frames)
-                        let max_frames = 150;
+
+                        // Calculate buffer size to match Python implementation exactly
+                        // Python: melspectrogram_max_len = 10*97 = 970 frames (10 seconds)
+                        // 97 frames = 1 second of 16kHz audio processed as melspectrograms
+                        let max_frames = 970; // Match Python's buffer size exactly
+
                         if self.melspectrogram_buffer.len() > max_frames {
+                            let dropped_frame_ms = (160.0 / 16000.0 * 1000.0) as u32; // Each frame = 160 samples = 10ms at 16kHz
+                            log::debug!(
+                                "⚠️ MELSPEC BUFFER OVERFLOW: Dropping oldest frame ({}ms of data) - buffer was {} frames", 
+                                dropped_frame_ms, self.melspectrogram_buffer.len()
+                            );
                             self.melspectrogram_buffer.remove(0);
+                            log::debug!(
+                                "🔧 Melspec buffer trimmed to {} frames (max: {})",
+                                self.melspectrogram_buffer.len(),
+                                max_frames
+                            );
                         }
                     }
 
-                    // Calculate embeddings from overlapping windows (match Python approach)
-                    // Python extracts 76-frame windows with step size 8 from the melspectrogram buffer
+                    // Calculate embeddings from NEW chunks only (match Python approach)
+                    // Python extracts embeddings only for newly processed chunks
                     if self.melspectrogram_buffer.len() >= 76 {
-                        let step_size = 8;
-                        let window_size = 76;
-
-                        // Calculate how many windows we can extract
-                        let max_start_idx = self.melspectrogram_buffer.len() - window_size;
-                        let num_windows = (max_start_idx / step_size) + 1;
+                        let chunks_to_process = self.accumulated_samples / chunk_size;
+                        let new_chunks = chunks_to_process - self.processed_chunks;
 
                         log::debug!(
-                            "🔍 Extracting {} overlapping windows from {} frames (step_size={})",
-                            num_windows,
-                            self.melspectrogram_buffer.len(),
-                            step_size
+                            "🔍 Processing {} new chunks (total processed: {} -> {})",
+                            new_chunks,
+                            self.processed_chunks,
+                            chunks_to_process
                         );
 
-                        // Extract windows starting from the oldest (step_size intervals)
-                        for window_idx in 0..num_windows {
-                            let start_idx = window_idx * step_size;
-                            let end_idx = start_idx + window_size;
+                        // Only compute embeddings for NEW chunks (like Python)
+                        for i in (0..new_chunks).rev() {
+                            // Calculate the index offset (matches Python: ndx = -8*i)
+                            let offset = 8 * i;
+                            let end_idx = self.melspectrogram_buffer.len() - offset;
+                            let start_idx = if end_idx >= 76 { end_idx - 76 } else { 0 };
 
-                            if end_idx <= self.melspectrogram_buffer.len() {
+                            if end_idx > start_idx && (end_idx - start_idx) == 76 {
                                 log::debug!(
-                                    "🔍 Creating embedding window {}: frames {}..{} (total frames: {})",
-                                    window_idx, start_idx, end_idx, self.melspectrogram_buffer.len()
+                                    "🔍 Computing embedding for chunk {} (frames {}..{})",
+                                    i,
+                                    start_idx,
+                                    end_idx
                                 );
 
                                 // Extract exactly 76 frames from melspectrogram buffer
@@ -522,51 +540,48 @@ impl AudioFeatures {
 
                                 // Compute embedding if we have exactly 76 frames (76 * 32 = 2432 elements)
                                 if melspec_window.len() == 76 * 32 {
-                                    log::debug!(
-                                        "🔍 Computing embedding from 76 mel frames (window {})",
-                                        window_idx
-                                    );
-
                                     let embedding =
                                         self._get_embeddings_from_melspec(&melspec_window)?;
                                     log::debug!(
-                                        "🔍 Got embedding with {} features",
-                                        embedding.len()
+                                        "🔍 Got embedding with {} features for chunk {}",
+                                        embedding.len(),
+                                        i
                                     );
 
                                     // Update feature buffer (FIFO)
                                     self.feature_buffer.push(embedding);
                                     if self.feature_buffer.len() > self.feature_buffer_max_len {
+                                        let dropped_embedding_ms =
+                                            (8.0 * 160.0 / 16000.0 * 1000.0) as u32; // Each embedding represents ~80ms of audio
+                                        log::debug!(
+                                            "⚠️ FEATURE BUFFER OVERFLOW: Dropping oldest embedding (~{}ms of detection data) - buffer was {} embeddings",
+                                            dropped_embedding_ms, self.feature_buffer.len()
+                                        );
                                         self.feature_buffer.remove(0);
+                                        log::debug!(
+                                            "🔧 Feature buffer trimmed to {} embeddings (max: {})",
+                                            self.feature_buffer.len(),
+                                            self.feature_buffer_max_len
+                                        );
                                     }
-                                    log::debug!(
-                                        "🔍 Feature buffer now has {} embeddings",
-                                        self.feature_buffer.len()
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "🔍 Window {} has {} elements, expected 2432",
-                                        window_idx,
-                                        melspec_window.len()
-                                    );
                                 }
                             }
                         }
-                    } else {
-                        log::debug!(
-                            "🔍 Not enough frames for embedding: have {}, need {}",
-                            self.melspectrogram_buffer.len(),
-                            76
-                        );
+
+                        // Update processed chunks counter (like Python resets accumulated_samples)
+                        self.processed_chunks = chunks_to_process;
+                        log::debug!("🔍 Updated processed_chunks to {}", self.processed_chunks);
                     }
+
+                    // Reset accumulated samples counter (like Python does)
+                    processed_samples = self.accumulated_samples;
+                    self.accumulated_samples = 0;
+                    self.processed_chunks = 0; // Reset when we finish processing this batch
                 }
 
-                // Reset accumulated samples counter
-                self.accumulated_samples = 0;
+                // Store remainder for next processing
+                self.raw_data_remainder = remainder_data;
             }
-
-            // Store remainder for next processing
-            self.raw_data_remainder = remainder_data;
         } else {
             // Not enough samples yet, just accumulate
             self.accumulated_samples += combined_data.len();

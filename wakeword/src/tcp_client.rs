@@ -51,7 +51,7 @@ impl WakewordClient {
             client_id,
             model_names.len()
         );
-        let model = Model::new(
+        let model = Model::new_with_tests(
             model_names,
             vec![], // Empty metadata for now
         )?;
@@ -130,6 +130,18 @@ impl WakewordClient {
                             detection_count,
                             avg_processing_time
                         );
+                        
+                        // Buffer health metrics every 50 chunks (reduce log spam)
+                        if chunk_count % 50 == 0 {
+                            let buffer_utilization = (audio_buffer.len() as f32 / 16000.0 * 100.0).min(100.0);
+                            debug!(
+                                "📊 [{}] Buffer Health: {} samples ({:.1}% full, {:.1}s of audio)",
+                                self.client_id, 
+                                audio_buffer.len(), 
+                                buffer_utilization,
+                                audio_buffer.len() as f32 / 16000.0
+                            );
+                        }
                     }
 
                     let processing_start = Instant::now();
@@ -151,10 +163,11 @@ impl WakewordClient {
                     total_processing_time += processing_time;
 
                     // Check for slow processing
-                    if processing_time > Duration::from_millis(20) {
+                    if processing_time > Duration::from_millis(80) {
                         debug!(
-                            "🐌 [{}] Slow processing: chunk {} took {:?}",
-                            self.client_id, chunk_count, processing_time
+                            "🐌 [{}] Chunk processing too slow: {}ms (chunk=80ms) - falling behind real-time!",
+                            self.client_id,
+                            processing_time.as_millis()
                         );
                     }
 
@@ -293,6 +306,30 @@ impl WakewordClient {
         if samples.is_empty() {
             debug!("[{}] Received empty audio chunk, skipping", self.client_id);
             return Ok(());
+        }
+
+        // === DETAILED AUDIO DATA COMPARISON DEBUG ===
+        if !samples.is_empty() {
+            let mean = samples.iter().map(|&x| x as f64).sum::<f64>() / samples.len() as f64;
+            let min = *samples.iter().min().unwrap_or(&0);
+            let max = *samples.iter().max().unwrap_or(&0);
+            let rms = (samples.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
+            debug!(
+                "📊 RAW_AUDIO: len={}, mean={:.1}, min={}, max={}, rms={:.1}",
+                samples.len(), mean, min, max, rms
+            );
+            
+            // Log first 16 samples for comparison
+            let first_samples: Vec<i16> = samples.iter().take(16).copied().collect();
+            debug!("📊 RAW_SAMPLES: First 16 = {:?}", first_samples);
+            
+            // Check for audio corruption indicators
+            if samples.iter().all(|&x| x == 0) {
+                warn!("⚠️ AUDIO_WARNING: All samples are zero (silence)");
+            }
+            if samples.len() != chunk.data.len() / 2 {
+                warn!("⚠️ AUDIO_WARNING: Sample count mismatch: {} vs {}", samples.len(), chunk.data.len() / 2);
+            }
         }
 
         #[cfg(feature = "latency-diagnostics")]
@@ -519,7 +556,20 @@ impl WakewordClient {
             const MAX_BUFFER_SAMPLES: usize = 16000; // 1 second at 16kHz
             if audio_buffer.len() > MAX_BUFFER_SAMPLES {
                 let keep_from = audio_buffer.len() - MAX_BUFFER_SAMPLES;
+                let dropped_samples = keep_from;
+                let dropped_ms = (dropped_samples as f32 / 16000.0 * 1000.0) as u32;
+                
+                debug!(
+                    "⚠️ [{}] AUDIO BUFFER OVERFLOW: Dropping {} samples ({} ms of audio) - buffer was {} samples",
+                    self.client_id, dropped_samples, dropped_ms, audio_buffer.len()
+                );
+                
                 audio_buffer.drain(0..keep_from);
+                
+                debug!(
+                    "🔧 [{}] Audio buffer trimmed to {} samples (1 second retained)",
+                    self.client_id, audio_buffer.len()
+                );
             }
         } else {
             #[cfg(feature = "latency-diagnostics")]
