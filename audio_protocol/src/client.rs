@@ -39,36 +39,47 @@ impl AudioClient {
         Ok(())
     }
 
-    /// Unsubscribe from audio capture stream
+    /// Unsubscribe from audio capture
     pub fn unsubscribe_audio(&mut self) -> Result<UnsubscribeResult, ProtocolError> {
         debug!("📤 Sending UnsubscribeAudio message");
 
         let message = Message::UnsubscribeAudio;
         self.connection.write_message(&message)?;
 
-        // Wait for response
-        let response = self.connection.read_message()?;
+        // Drain any in-flight AudioChunk messages before expecting UnsubscribeResponse
+        // This fixes the race condition with network latency
+        loop {
+            let response = self.connection.read_message()?;
 
-        match response {
-            Message::UnsubscribeResponse { success, message } => {
-                if success {
-                    info!("✅ Unsubscribed from audio capture: {}", message);
-                } else {
-                    error!("❌ Unsubscribe failed: {}", message);
+            match response {
+                Message::AudioChunk { .. } => {
+                    // Drain in-flight audio chunks that were sent before unsubscribe took effect
+                    debug!("🔄 Draining in-flight audio chunk during unsubscribe");
+                    continue;
                 }
+                Message::UnsubscribeResponse { success, message } => {
+                    if success {
+                        info!("✅ Unsubscribed from audio capture: {}", message);
+                    } else {
+                        error!("❌ Unsubscribe failed: {}", message);
+                    }
 
-                Ok(UnsubscribeResult { success, message })
-            }
-            Message::ErrorResponse { message } => {
-                error!("❌ Server error: {}", message);
-                Ok(UnsubscribeResult {
-                    success: false,
-                    message,
-                })
-            }
-            other => {
-                error!("❌ Unexpected response type: {:?}", other.message_type());
-                Err(ProtocolError::InvalidMessageType(other.message_type() as u8))
+                    return Ok(UnsubscribeResult { success, message });
+                }
+                Message::ErrorResponse { message } => {
+                    error!("❌ Server error: {}", message);
+                    return Ok(UnsubscribeResult {
+                        success: false,
+                        message,
+                    });
+                }
+                other => {
+                    error!(
+                        "❌ Unexpected response type during unsubscribe: {:?}",
+                        other.message_type()
+                    );
+                    return Err(ProtocolError::InvalidMessageType(other.message_type() as u8));
+                }
             }
         }
     }
@@ -124,29 +135,39 @@ impl AudioClient {
 
         self.connection.write_message(&message)?;
 
-        // Wait for response
-        let response = self.connection.read_message()?;
+        // Wait for response, but handle any unexpected delayed messages
+        loop {
+            let response = self.connection.read_message()?;
 
-        match response {
-            Message::PlayResponse { success, message } => {
-                if success {
-                    debug!("✅ Play response: {}", message);
-                } else {
-                    error!("❌ Play failed: {}", message);
+            match response {
+                Message::PlayResponse { success, message } => {
+                    if success {
+                        debug!("✅ Play response: {}", message);
+                    } else {
+                        error!("❌ Play failed: {}", message);
+                    }
+
+                    return Ok(PlayResult { success, message });
                 }
-
-                Ok(PlayResult { success, message })
-            }
-            Message::ErrorResponse { message } => {
-                error!("❌ Server error: {}", message);
-                Ok(PlayResult {
-                    success: false,
-                    message,
-                })
-            }
-            other => {
-                error!("❌ Unexpected response type: {:?}", other.message_type());
-                Err(ProtocolError::InvalidMessageType(other.message_type() as u8))
+                Message::ErrorResponse { message } => {
+                    error!("❌ Server error: {}", message);
+                    return Ok(PlayResult {
+                        success: false,
+                        message,
+                    });
+                }
+                Message::UnsubscribeResponse { .. } => {
+                    // Drain delayed UnsubscribeResponse messages that arrived after we started playback
+                    debug!("🔄 Draining delayed UnsubscribeResponse during playback");
+                    continue;
+                }
+                other => {
+                    error!(
+                        "❌ Unexpected response type during playback: {:?}",
+                        other.message_type()
+                    );
+                    return Err(ProtocolError::InvalidMessageType(other.message_type() as u8));
+                }
             }
         }
     }
@@ -161,41 +182,51 @@ impl AudioClient {
 
         self.connection.write_message(&message)?;
 
-        // Wait for response
-        let response = self.connection.read_message()?;
+        // Wait for response, but handle any unexpected delayed messages
+        loop {
+            let response = self.connection.read_message()?;
 
-        match response {
-            Message::EndStreamResponse {
-                success,
-                message,
-                chunks_played,
-            } => {
-                if success {
-                    info!(
-                        "✅ Stream ended: {} (played {} chunks)",
-                        message, chunks_played
-                    );
-                } else {
-                    error!("❌ End stream failed: {}", message);
-                }
-
-                Ok(EndStreamResult {
+            match response {
+                Message::EndStreamResponse {
                     success,
                     message,
                     chunks_played,
-                })
-            }
-            Message::ErrorResponse { message } => {
-                error!("❌ Server error: {}", message);
-                Ok(EndStreamResult {
-                    success: false,
-                    message,
-                    chunks_played: 0,
-                })
-            }
-            other => {
-                error!("❌ Unexpected response type: {:?}", other.message_type());
-                Err(ProtocolError::InvalidMessageType(other.message_type() as u8))
+                } => {
+                    if success {
+                        info!(
+                            "✅ Stream ended: {} (played {} chunks)",
+                            message, chunks_played
+                        );
+                    } else {
+                        error!("❌ End stream failed: {}", message);
+                    }
+
+                    return Ok(EndStreamResult {
+                        success,
+                        message,
+                        chunks_played,
+                    });
+                }
+                Message::ErrorResponse { message } => {
+                    error!("❌ Server error: {}", message);
+                    return Ok(EndStreamResult {
+                        success: false,
+                        message,
+                        chunks_played: 0,
+                    });
+                }
+                Message::PlayResponse { .. } => {
+                    // Drain delayed PlayResponse messages
+                    debug!("🔄 Draining delayed PlayResponse during stream end");
+                    continue;
+                }
+                other => {
+                    error!(
+                        "❌ Unexpected response type during stream end: {:?}",
+                        other.message_type()
+                    );
+                    return Err(ProtocolError::InvalidMessageType(other.message_type() as u8));
+                }
             }
         }
     }
@@ -210,29 +241,39 @@ impl AudioClient {
 
         self.connection.write_message(&message)?;
 
-        // Wait for response
-        let response = self.connection.read_message()?;
+        // Wait for response, but handle any unexpected delayed messages
+        loop {
+            let response = self.connection.read_message()?;
 
-        match response {
-            Message::AbortResponse { success, message } => {
-                if success {
-                    info!("✅ Playback aborted: {}", message);
-                } else {
-                    error!("❌ Abort failed: {}", message);
+            match response {
+                Message::AbortResponse { success, message } => {
+                    if success {
+                        info!("✅ Playback aborted: {}", message);
+                    } else {
+                        error!("❌ Abort failed: {}", message);
+                    }
+
+                    return Ok(AbortResult { success, message });
                 }
-
-                Ok(AbortResult { success, message })
-            }
-            Message::ErrorResponse { message } => {
-                error!("❌ Server error: {}", message);
-                Ok(AbortResult {
-                    success: false,
-                    message,
-                })
-            }
-            other => {
-                error!("❌ Unexpected response type: {:?}", other.message_type());
-                Err(ProtocolError::InvalidMessageType(other.message_type() as u8))
+                Message::ErrorResponse { message } => {
+                    error!("❌ Server error: {}", message);
+                    return Ok(AbortResult {
+                        success: false,
+                        message,
+                    });
+                }
+                Message::PlayResponse { .. } => {
+                    // Drain delayed PlayResponse messages
+                    debug!("🔄 Draining delayed PlayResponse during abort");
+                    continue;
+                }
+                other => {
+                    error!(
+                        "❌ Unexpected response type during abort: {:?}",
+                        other.message_type()
+                    );
+                    return Err(ProtocolError::InvalidMessageType(other.message_type() as u8));
+                }
             }
         }
     }

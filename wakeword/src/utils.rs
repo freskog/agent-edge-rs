@@ -44,15 +44,20 @@ impl AudioFeatures {
             })?,
         ));
 
-        // Use our XNNPACK-safe interpreter creation for melspec model
+        // XNNPACK with v2.19.0 should work!
+        let mut options = tflitec::interpreter::Options::default();
+        options.thread_count = 1; // Single thread to avoid threading issues
+        options.is_xnnpack_enabled = true; // Re-enable XNNPACK with fixed bindings
+
         let melspec_model =
-            crate::xnnpack_fix::create_interpreter_with_xnnpack_safe(melspec_model_data, 1)
-                .map_err(|e| {
+            tflitec::interpreter::Interpreter::new(melspec_model_data, Some(options)).map_err(
+                |e| {
                     OpenWakeWordError::ModelLoadError(format!(
                         "Failed to create melspec interpreter: {}",
                         e
                     ))
-                })?;
+                },
+            )?;
 
         // Resize melspec input tensor to a reasonable shape before allocating tensors
         // This avoids the integer overflow issue with the default model shape
@@ -74,15 +79,20 @@ impl AudioFeatures {
             })?,
         ));
 
-        // Use our XNNPACK-safe interpreter creation for embedding model
+        // XNNPACK with v2.19.0 should work!
+        let mut options = tflitec::interpreter::Options::default();
+        options.thread_count = 1; // Single thread to avoid threading issues
+        options.is_xnnpack_enabled = true; // Re-enable XNNPACK with fixed bindings
+
         let embedding_model =
-            crate::xnnpack_fix::create_interpreter_with_xnnpack_safe(embedding_model_data, 1)
-                .map_err(|e| {
+            tflitec::interpreter::Interpreter::new(embedding_model_data, Some(options)).map_err(
+                |e| {
                     OpenWakeWordError::ModelLoadError(format!(
                         "Failed to create embedding interpreter: {}",
                         e
                     ))
-                })?;
+                },
+            )?;
 
         // Resize embedding input tensor to the correct shape: [1, 76, 32, 1]
         // This matches Python: self.embedding_model.resize_tensor_input(0, [1, 76, 32, 1], strict=True)

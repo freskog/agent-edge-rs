@@ -175,11 +175,12 @@ impl AudioServer {
         capture_subscribers: Arc<Mutex<HashMap<String, crossbeam::channel::Sender<Vec<u8>>>>>,
         forwarding_thread_running: Arc<AtomicBool>,
     ) -> Result<(), ServerError> {
-        // Set stream to non-blocking for audio streaming
-        stream.set_nonblocking(true)?;
         let mut conn = Connection::new(stream)?;
         let client_id = format!("client_{:?}", thread::current().id());
         let mut audio_rx: Option<crossbeam::channel::Receiver<Vec<u8>>> = None;
+        let mut chunks_played_count = 0u32; // Track chunks played for this stream
+
+        log::info!("🔌 Client {} connected", client_id);
 
         // Track slow client behavior
         let mut failed_send_count = 0;
@@ -280,6 +281,7 @@ impl AudioServer {
                         &capture_subscribers,
                         &forwarding_thread_running,
                         &mut audio_rx,
+                        &mut chunks_played_count,
                     ) {
                         Ok(should_continue) => {
                             if !should_continue {
@@ -341,6 +343,7 @@ impl AudioServer {
         capture_subscribers: &Arc<Mutex<HashMap<String, crossbeam::channel::Sender<Vec<u8>>>>>,
         forwarding_thread_running: &Arc<AtomicBool>,
         audio_rx: &mut Option<crossbeam::channel::Receiver<Vec<u8>>>,
+        chunks_played_count: &mut u32,
     ) -> Result<bool, ServerError> {
         match message {
             Message::SubscribeAudio => {
@@ -447,6 +450,8 @@ impl AudioServer {
                     if let Some(ref sink) = *sink_guard {
                         sink.write_chunk(audio_data)
                             .map_err(|e| ServerError::Audio(e.to_string()))?;
+                        // Increment chunk count after successful write
+                        *chunks_played_count += 1;
                     }
                 }
 
@@ -475,7 +480,7 @@ impl AudioServer {
                 let response = Message::EndStreamResponse {
                     success: true,
                     message: "Stream ended successfully".to_string(),
-                    chunks_played: 0, // TODO: Track actual chunks played
+                    chunks_played: *chunks_played_count,
                 };
                 conn.write_message(&response)?;
 
@@ -541,10 +546,13 @@ impl AudioServer {
                 // No subscribers, stop the thread and clear audio capture to avoid buffer persistence
                 forwarding_thread_running.store(false, Ordering::SeqCst);
 
-                // Clear the AudioCapture instance to ensure fresh buffers for next subscriber
+                // Stop and clear the AudioCapture instance to ensure proper device cleanup
                 {
                     let mut capture_guard = audio_capture.lock().unwrap();
-                    *capture_guard = None;
+                    if let Some(capture) = capture_guard.take() {
+                        capture.stop(); // Properly stop the audio capture thread
+                        log::info!("🎤 Stopped audio capture and released device");
+                    }
                 }
 
                 log::info!(

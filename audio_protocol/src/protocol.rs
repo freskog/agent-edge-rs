@@ -281,6 +281,9 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(stream: TcpStream) -> Result<Self, ProtocolError> {
+        // Configure TCP socket for better performance with large messages
+        stream.set_nodelay(true)?; // Disable Nagle's algorithm for low latency
+
         let reader_stream = stream.try_clone()?;
         let reader = BufReader::new(reader_stream);
         let writer = BufWriter::new(stream);
@@ -294,11 +297,40 @@ impl Connection {
         let mut header = [0u8; 5];
         self.reader.read_exact(&mut header)?;
 
-        let message_type = MessageType::try_from(header[0])?;
+        let message_type_byte = header[0];
         let payload_length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
 
-        // Sanity check payload length (max 16MB)
+        // Debug logging for protocol analysis
+        log::debug!(
+            "📥 Reading message: type={} (0x{:02X}), payload_length={}",
+            message_type_byte,
+            message_type_byte,
+            payload_length
+        );
+
+        // Enhanced validation for protocol integrity
+        if message_type_byte == 0 {
+            log::error!("❌ Received zero message type - possible protocol desync");
+            return Err(ProtocolError::InvalidMessageType(0));
+        }
+
+        // Check for obviously corrupted values
+        if payload_length > 1024 * 1024 {
+            log::error!(
+                "❌ Suspiciously large payload: {} bytes for message type 0x{:02X} - possible corruption",
+                payload_length, message_type_byte
+            );
+        }
+
+        let message_type = MessageType::try_from(message_type_byte)?;
+
+        // Sanity check payload length (max 16MB, min reasonable size)
         if payload_length > 16 * 1024 * 1024 {
+            log::error!(
+                "❌ Invalid payload size: {} bytes (type: 0x{:02X})",
+                payload_length,
+                message_type_byte
+            );
             return Err(ProtocolError::InvalidPayloadSize(payload_length));
         }
 
@@ -309,14 +341,31 @@ impl Connection {
         }
 
         // Parse message
-        Message::from_bytes(message_type, &payload)
+        let message = Message::from_bytes(message_type, &payload)?;
+        log::debug!(
+            "✅ Successfully parsed message: {:?}",
+            message.message_type()
+        );
+
+        Ok(message)
     }
 
     /// Write a message to the connection
     pub fn write_message(&mut self, message: &Message) -> Result<(), ProtocolError> {
         let bytes = message.to_bytes()?;
+
+        // Debug logging for protocol analysis
+        log::debug!(
+            "📤 Writing message: type={:?} (0x{:02X}), total_bytes={}",
+            message.message_type(),
+            message.message_type() as u8,
+            bytes.len()
+        );
+
         self.writer.write_all(&bytes)?;
-        self.writer.flush()?;
+        self.writer.flush()?; // Flush the buffer
+
+        log::debug!("✅ Successfully sent message: {:?}", message.message_type());
         Ok(())
     }
 }

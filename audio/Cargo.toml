@@ -25,3 +25,7 @@ audio_available = []
 
 [build-dependencies]
 cpal = "0.16.0"
+
+[[bin]]
+name = "test_audio_formats"
+path = "src/bin/test_audio_formats.rs"

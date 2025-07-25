@@ -358,27 +358,57 @@ fn playback_audio(
     let stream_id = "echo-demo";
     let mut successful_chunks = 0;
     let mut failed_chunks = 0;
+    let max_chunk_size = 1024; // TCP is working now, use larger chunks for smoother audio
 
     for (i, chunk_data) in resampled_chunks.iter().enumerate() {
-        match client.play_audio_chunk(stream_id, chunk_data.clone()) {
-            Ok(result) => {
-                if result.success {
-                    successful_chunks += 1;
-                    if (i + 1) % 20 == 0 {
-                        info!("📤 Sent chunk {}/{}", i + 1, resampled_chunks.len());
+        // Split large chunks into smaller pieces for reliable TCP transmission
+        let mut offset = 0;
+        let mut sub_chunk_index = 0;
+
+        while offset < chunk_data.len() {
+            let end = std::cmp::min(offset + max_chunk_size, chunk_data.len());
+            let sub_chunk = chunk_data[offset..end].to_vec();
+
+            match client.play_audio_chunk(stream_id, sub_chunk) {
+                Ok(result) => {
+                    if result.success {
+                        successful_chunks += 1;
+                        if (successful_chunks) % 20 == 0 {
+                            info!(
+                                "📤 Sent chunk {}_{} (total: {})",
+                                i + 1,
+                                sub_chunk_index,
+                                successful_chunks
+                            );
+                        }
+                    } else {
+                        error!(
+                            "❌ Play failed for chunk {}_{}: {}",
+                            i + 1,
+                            sub_chunk_index,
+                            result.message
+                        );
+                        failed_chunks += 1;
                     }
-                } else {
-                    error!("❌ Play failed for chunk {}: {}", i + 1, result.message);
+                }
+                Err(e) => {
+                    error!(
+                        "❌ Error sending chunk {}_{}: {}",
+                        i + 1,
+                        sub_chunk_index,
+                        e
+                    );
                     failed_chunks += 1;
                 }
             }
-            Err(e) => {
-                error!("❌ Error sending chunk {}: {}", i + 1, e);
-                failed_chunks += 1;
-            }
+
+            offset = end;
+            sub_chunk_index += 1;
         }
 
-        // No artificial delay - let the audio sink provide natural backpressure
+        if (i + 1) % 10 == 0 {
+            info!("📤 Completed chunk {}/{}", i + 1, resampled_chunks.len());
+        }
     }
 
     // Signal end of stream

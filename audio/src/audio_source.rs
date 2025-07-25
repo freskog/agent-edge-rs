@@ -70,6 +70,7 @@ pub struct AudioDeviceInfo {
 /// Handles platform-specific resampling automatically
 pub struct AudioCapture {
     receiver: Receiver<Vec<u8>>,
+    stop_sender: Sender<()>,
     _handle: thread::JoinHandle<()>,
 }
 
@@ -78,10 +79,11 @@ impl AudioCapture {
     /// Output is always mono 16kHz s16le regardless of hardware
     pub fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
         let (sender, receiver) = bounded(100);
+        let (stop_sender, stop_receiver) = bounded(1);
 
         // Spawn thread to manage CPAL resources
         let handle = thread::spawn(move || {
-            if let Err(e) = Self::run_capture_thread(config, sender) {
+            if let Err(e) = Self::run_capture_thread(config, sender, stop_receiver) {
                 log::error!("Audio capture thread failed: {}", e);
             }
         });
@@ -91,8 +93,14 @@ impl AudioCapture {
 
         Ok(Self {
             receiver,
+            stop_sender,
             _handle: handle,
         })
+    }
+
+    /// Stop the audio capture and release the device
+    pub fn stop(&self) {
+        let _ = self.stop_sender.send(());
     }
 
     /// Get the next audio chunk as s16le bytes (blocking)
@@ -111,6 +119,7 @@ impl AudioCapture {
     fn run_capture_thread(
         config: AudioCaptureConfig,
         sender: Sender<Vec<u8>>,
+        stop_receiver: Receiver<()>,
     ) -> Result<(), AudioCaptureError> {
         let host = cpal::default_host();
         log::info!("🎤 Initializing audio capture with host: {:?}", host.id());
@@ -165,8 +174,12 @@ impl AudioCapture {
 
             let resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, CHUNK_SIZE, 1)
                 .map_err(|e| AudioCaptureError::Resampling(e.to_string()))?;
-            
-            log::info!("🔄 Created resampler: {}Hz → 16kHz (ratio: {:.3})", hardware_sample_rate, ratio);
+
+            log::info!(
+                "🔄 Created resampler: {}Hz → 16kHz (ratio: {:.3})",
+                hardware_sample_rate,
+                ratio
+            );
             Some(Arc::new(Mutex::new(resampler)))
         } else {
             log::info!("🔄 No resampling needed (hardware is 16kHz)");
@@ -223,8 +236,14 @@ impl AudioCapture {
 
         // Keep the thread alive to maintain the audio capture
         loop {
+            if stop_receiver.try_recv().is_ok() {
+                log::info!("Audio capture thread received stop signal. Exiting.");
+                break;
+            }
             thread::sleep(Duration::from_millis(100));
         }
+
+        Ok(())
     }
 
     fn create_input_stream<T>(
@@ -256,19 +275,17 @@ impl AudioCapture {
                     // Process complete chunks
                     while f32_buffer.len() >= CHUNK_SIZE {
                         let chunk: Vec<f32> = f32_buffer.drain(..CHUNK_SIZE).collect();
-                        
+
                         // Apply resampling if needed
                         let output_samples = if let Some(ref resampler) = resampler {
                             match resampler.lock() {
-                                Ok(mut r) => {
-                                    match r.process(&[chunk], None) {
-                                        Ok(output_channels) => output_channels[0].clone(),
-                                        Err(e) => {
-                                            log::error!("Resampling error: {}", e);
-                                            continue;
-                                        }
+                                Ok(mut r) => match r.process(&[chunk], None) {
+                                    Ok(output_channels) => output_channels[0].clone(),
+                                    Err(e) => {
+                                        log::error!("Resampling error: {}", e);
+                                        continue;
                                     }
-                                }
+                                },
                                 Err(_) => {
                                     log::error!("Failed to lock resampler");
                                     continue;
@@ -280,7 +297,7 @@ impl AudioCapture {
 
                         // Convert to s16le bytes
                         let s16le_bytes = Self::f32_to_s16le_bytes(&output_samples);
-                        
+
                         // Send to receiver (non-blocking)
                         if sender.try_send(s16le_bytes).is_err() {
                             // Channel is full or closed, drop the chunk
@@ -316,15 +333,14 @@ impl AudioCapture {
             .map_err(|e| AudioCaptureError::Device(e.to_string()))?;
 
         let default_device = host.default_input_device();
-        let default_name = default_device
-            .and_then(|d| d.name().ok());
+        let default_name = default_device.and_then(|d| d.name().ok());
 
         let mut device_infos = Vec::new();
         for device in devices {
             let name = device
                 .name()
                 .map_err(|e| AudioCaptureError::Device(e.to_string()))?;
-            
+
             let config = device
                 .default_input_config()
                 .map_err(|e| AudioCaptureError::Config(e.to_string()))?;
@@ -338,5 +354,14 @@ impl AudioCapture {
         }
 
         Ok(device_infos)
+    }
+}
+
+impl Drop for AudioCapture {
+    fn drop(&mut self) {
+        log::debug!("🎤 Dropping AudioCapture - sending stop signal");
+        let _ = self.stop_sender.send(());
+        // Give the thread a moment to clean up
+        thread::sleep(Duration::from_millis(10));
     }
 }

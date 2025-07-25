@@ -13,7 +13,6 @@ pub mod error;
 pub mod model;
 pub mod tcp_client;
 pub mod utils;
-pub mod xnnpack_fix;
 
 pub use error::*;
 pub use model::*;

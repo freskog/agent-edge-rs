@@ -70,3 +70,5 @@ cross-target/
 # Runtime generated files
 *.pid
 *.sock 
+
+tensorflow/

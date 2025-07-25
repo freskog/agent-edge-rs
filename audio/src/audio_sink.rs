@@ -100,6 +100,27 @@ impl PlatformAudioBuffer {
         }
     }
 
+    /// Create buffer based on actual stream format (fixes cross-platform format mismatch)
+    fn new_with_stream_format(stream_format: SampleFormat) -> Self {
+        match stream_format {
+            SampleFormat::I16 => {
+                log::info!("🔊 Using I16 audio buffer (matches stream format)");
+                Self::I16(Vec::new())
+            }
+            SampleFormat::F32 => {
+                log::info!("🔊 Using F32 audio buffer (matches stream format)");
+                Self::F32(Vec::new())
+            }
+            _ => {
+                log::warn!(
+                    "⚠️  Unsupported stream format {:?}, defaulting to F32 buffer",
+                    stream_format
+                );
+                Self::F32(Vec::new())
+            }
+        }
+    }
+
     /// Add s16le data to buffer with platform-optimized conversion
     fn extend_from_s16le(
         &mut self,
@@ -339,7 +360,9 @@ impl AudioSink {
 
         // Create platform-appropriate buffer
         let buffer_size = 48000; // ~1 second buffer
-        let audio_buffer = Arc::new(Mutex::new(PlatformAudioBuffer::new(platform)));
+        let audio_buffer = Arc::new(Mutex::new(PlatformAudioBuffer::new_with_stream_format(
+            use_format,
+        )));
 
         // Create stream based on chosen format
         let stream = match use_format {

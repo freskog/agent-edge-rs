@@ -5,31 +5,31 @@ edition = "2021"
 
 [dependencies]
 audio_protocol = { path = "../audio_protocol" }
-# tflitec is configured per-target below
+# Use our XNNPACK-fixed tflitec fork
+tflitec = { path = "../tflitec-rs-fork", features = [
+    "xnnpack",
+    "xnnpack_qu8",
+    "xnnpack_qs8",
+] }
 log = "0.4"
 env_logger = "0.10"
 clap = { version = "4.0", features = ["derive"] }
 hound = "3.5"
 thiserror = "1.0"
 rand = "0.8"
+anyhow = "1.0"
 
-# Target-specific dependencies: XNNPACK enabled on both aarch64 Linux AND macOS
-[target.'cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_os = "macos"))'.dependencies]
-tflitec = { version = "0.6.0", features = [
-    "xnnpack",
-    "xnnpack_qu8",
-    "xnnpack_qs8",
-] }
+[[bin]]
+name = "check_xnnpack_compat"
+path = "src/bin/check_xnnpack_compat.rs"
 
-# For all other targets: tflitec without XNNPACK
-[target.'cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_os = "macos")))'.dependencies]
-tflitec = "0.6.0"
+[[bin]]
+name = "debug_audio"
+path = "src/bin/debug_audio.rs"
 
 [features]
-# XNNPACK features only work on aarch64 Linux due to target-specific dependencies
-xnnpack = []
-xnnpack_qu8 = []
-xnnpack_qs8 = []
+# Enable detailed latency diagnostics and verbose logging for debugging performance issues
+latency-diagnostics = []
 
 [dev-dependencies]
 hound = "3.5"

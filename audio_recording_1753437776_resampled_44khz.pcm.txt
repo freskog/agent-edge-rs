@@ -1,0 +1,11 @@
+Resampled Audio Recording Metadata
+==================================
+Format: s16le (16-bit signed little-endian)
+Sample Rate: 44.1kHz
+Channels: 1 (mono)
+Bytes: 222718
+Samples: 111359
+Duration: 2.53s
+
+To play with ffplay:
+ffplay -f s16le -ar 44100 -ac 1 audio_recording_1753437776_resampled_44khz.pcm

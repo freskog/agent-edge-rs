@@ -90,16 +90,19 @@ impl Model {
                 ))
             })?));
 
-            // Use our XNNPACK-safe interpreter creation
-            let interpreter =
-                crate::xnnpack_fix::create_interpreter_with_xnnpack_safe(tflite_model, 1).map_err(
-                    |e| {
-                        OpenWakeWordError::ModelLoadError(format!(
-                            "Failed to create interpreter for {}: {}",
-                            model_name, e
-                        ))
-                    },
-                )?;
+            // Re-enable XNNPACK with fixed bindings
+            let options = tflitec::interpreter::Options {
+                thread_count: 1,
+                is_xnnpack_enabled: true, // Re-enable XNNPACK with fixed bindings
+            };
+
+            let interpreter = tflitec::interpreter::Interpreter::new(tflite_model, Some(options))
+                .map_err(|e| {
+                OpenWakeWordError::ModelLoadError(format!(
+                    "Failed to create interpreter for {}: {}",
+                    model_name, e
+                ))
+            })?;
 
             interpreter.allocate_tensors().map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!(
