@@ -191,21 +191,10 @@ impl WakewordClient {
                 Err(e) => {
                     error!("❌ [{}] Error receiving audio chunk: {}", self.client_id, e);
 
-                    // Check if it's a timeout
-                    if e.to_string().contains("timed out") || e.to_string().contains("timeout") {
-                        warn!("⏰ [{}] Audio chunk timeout detected", self.client_id);
-                        if last_chunk_time.elapsed() > chunk_timeout {
-                            error!(
-                                "💀 [{}] No audio chunks received for {:?}, giving up",
-                                self.client_id, chunk_timeout
-                            );
-                            break;
-                        }
-                    } else {
-                        // For other errors, continue trying
-                        warn!("🔄 [{}] Continuing after error...", self.client_id);
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
+                    // For systemd managed services, exit immediately on any connection error
+                    // so systemd can restart us and reconnect to the audio server
+                    error!("💀 [{}] Connection lost, exiting for systemd restart", self.client_id);
+                    break;
                 }
             }
 
@@ -243,56 +232,6 @@ impl WakewordClient {
         detection_count: &mut u64,
     ) -> Result<(), OpenWakeWordError> {
         let chunk_receive_time = Instant::now();
-
-        #[cfg(feature = "latency-diagnostics")]
-        {
-            // === NETWORK LATENCY DIAGNOSTICS ===
-            // Track when chunks were captured vs received
-            let network_latency = (SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64)
-                .saturating_sub(chunk.timestamp_ms);
-
-            // Track network jitter (variation in chunk arrival timing)
-            self.chunk_receive_times
-                .push_back((chunk.timestamp_ms, chunk_receive_time));
-            if self.chunk_receive_times.len() > 10 {
-                self.chunk_receive_times.pop_front();
-            }
-
-            // Calculate jitter from last few chunks
-            if self.chunk_receive_times.len() >= 3 {
-                let times: Vec<_> = self.chunk_receive_times.iter().collect();
-                let mut intervals = Vec::new();
-                for i in 1..times.len() {
-                    let interval = times[i].1.duration_since(times[i - 1].1).as_millis() as i64;
-                    intervals.push(interval);
-                }
-
-                if !intervals.is_empty() {
-                    let mean_interval = intervals.iter().sum::<i64>() / intervals.len() as i64;
-                    let jitter = intervals
-                        .iter()
-                        .map(|&i| (i - mean_interval).abs())
-                        .max()
-                        .unwrap_or(0);
-
-                    debug!(
-                        "[{}] Network: latency={}ms, jitter={}ms, chunk_interval={}ms",
-                        self.client_id, network_latency, jitter, mean_interval
-                    );
-                }
-            }
-
-            debug!(
-                "[{}] Processing audio chunk: {} bytes (timestamp: {}, network_latency: {}ms)",
-                self.client_id,
-                chunk.size_bytes(),
-                chunk.timestamp_ms,
-                network_latency
-            );
-        }
 
         // Convert audio data to i16 samples
         let conversion_start = Instant::now();
@@ -332,44 +271,6 @@ impl WakewordClient {
             }
         }
 
-        #[cfg(feature = "latency-diagnostics")]
-        {
-            // Debug: Log sample statistics for comparison with test audio
-            if !samples.is_empty() {
-                let mean = samples.iter().map(|&x| x as f64).sum::<f64>() / samples.len() as f64;
-                let min = samples.iter().min().unwrap_or(&0);
-                let max = samples.iter().max().unwrap_or(&0);
-                let rms = (samples.iter().map(|&x| (x as f64).powi(2)).sum::<f64>()
-                    / samples.len() as f64)
-                    .sqrt();
-
-                debug!(
-                    "[{}] Live audio stats: {} samples, mean={:.2}, min={}, max={}, RMS={:.2}",
-                    self.client_id,
-                    samples.len(),
-                    mean,
-                    min,
-                    max,
-                    rms
-                );
-
-                // Log first few samples for debugging
-                debug!(
-                    "[{}] First 8 samples: {:?}",
-                    self.client_id,
-                    &samples[..samples.len().min(8)]
-                );
-            }
-
-            debug!(
-                "[{}] Converted {} bytes to {} i16 samples in {:?}",
-                self.client_id,
-                chunk.data.len(),
-                samples.len(),
-                conversion_time
-            );
-        }
-
         // === BUFFER ACCUMULATION DIAGNOSTICS ===
         let buffer_size_before = audio_buffer.len();
         audio_buffer.extend_from_slice(&samples);
@@ -381,8 +282,6 @@ impl WakewordClient {
         // Track when we start accumulating buffer for detection
         if buffer_size_before < DETECTION_WINDOW_SAMPLES && self.buffer_fill_start.is_none() {
             self.buffer_fill_start = Some(chunk_receive_time);
-            #[cfg(feature = "latency-diagnostics")]
-            debug!("[{}] Buffer accumulation started", self.client_id);
         }
 
         const DETECTION_INTERVAL_MS: u64 = 160; // Run detection every 160ms for real-time processing
@@ -392,47 +291,7 @@ impl WakewordClient {
             last_detection_time.elapsed() >= Duration::from_millis(DETECTION_INTERVAL_MS);
         let should_detect = has_enough_samples && enough_time_passed;
 
-        #[cfg(feature = "latency-diagnostics")]
-        {
-            // === DETECTION LATENCY DIAGNOSTICS ===
-            if has_enough_samples && !enough_time_passed {
-                let time_until_detection = Duration::from_millis(DETECTION_INTERVAL_MS)
-                    .saturating_sub(last_detection_time.elapsed());
-                debug!(
-                    "[{}] Detection delayed by interval: {}ms remaining",
-                    self.client_id,
-                    time_until_detection.as_millis()
-                );
-            }
-        }
-
         if should_detect {
-            #[cfg(feature = "latency-diagnostics")]
-            {
-                // === AUDIO AGE ANALYSIS ===
-                // Calculate how old the audio we're about to process is
-                let buffer_fill_time = self
-                    .buffer_fill_start
-                    .map(|start| chunk_receive_time.duration_since(start))
-                    .unwrap_or_default();
-
-                // Estimate age of oldest sample in detection window
-                let network_latency = (SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64)
-                    .saturating_sub(chunk.timestamp_ms);
-                let estimated_oldest_sample_age =
-                    buffer_fill_time + Duration::from_millis(network_latency);
-
-                info!(
-                    "🔍 [{}] DETECTION START: buffer_time={}ms, est_audio_age={}ms, samples={}",
-                    self.client_id,
-                    buffer_fill_time.as_millis(),
-                    estimated_oldest_sample_age.as_millis(),
-                    buffer_size_after
-                );
-            }
 
             // Take the most recent window for detection
             let detection_samples = audio_buffer
@@ -441,37 +300,6 @@ impl WakewordClient {
                 .copied()
                 .collect::<Vec<i16>>();
 
-            #[cfg(feature = "latency-diagnostics")]
-            {
-                // Debug: Log detection window statistics
-                let det_mean = detection_samples.iter().map(|&x| x as f64).sum::<f64>()
-                    / detection_samples.len() as f64;
-                let det_min = detection_samples.iter().min().unwrap_or(&0);
-                let det_max = detection_samples.iter().max().unwrap_or(&0);
-                let det_rms = (detection_samples
-                    .iter()
-                    .map(|&x| (x as f64).powi(2))
-                    .sum::<f64>()
-                    / detection_samples.len() as f64)
-                    .sqrt();
-
-                debug!(
-                    "🔍 [{}] Detection window stats: {} samples, mean={:.2}, min={}, max={}, RMS={:.2}",
-                    self.client_id,
-                    detection_samples.len(),
-                    det_mean,
-                    det_min,
-                    det_max,
-                    det_rms
-                );
-
-                debug!(
-                    "🔍 [{}] Running wake word detection (buffer: {} samples)",
-                    self.client_id,
-                    audio_buffer.len()
-                );
-            }
-
             // === MODEL INFERENCE TIMING ===
             let inference_start = Instant::now();
             match self.model.predict(&detection_samples, None, 1.0) {
@@ -479,59 +307,6 @@ impl WakewordClient {
                     let inference_time = inference_start.elapsed();
                     let total_detection_time = inference_start.elapsed();
 
-                    #[cfg(feature = "latency-diagnostics")]
-                    {
-                        // === END-TO-END LATENCY CALCULATION ===
-                        let buffer_fill_time = self
-                            .buffer_fill_start
-                            .map(|start| chunk_receive_time.duration_since(start))
-                            .unwrap_or_default();
-                        let network_latency = (SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64)
-                            .saturating_sub(chunk.timestamp_ms);
-                        let estimated_oldest_sample_age =
-                            buffer_fill_time + Duration::from_millis(network_latency);
-                        let end_to_end_latency = estimated_oldest_sample_age + total_detection_time;
-
-                        info!(
-                            "✅ [{}] DETECTION COMPLETE: inference={}ms, total={}ms, end_to_end={}ms",
-                            self.client_id,
-                            inference_time.as_millis(),
-                            total_detection_time.as_millis(),
-                            end_to_end_latency.as_millis()
-                        );
-
-                        // Warn about concerning latencies
-                        if inference_time > Duration::from_millis(50) {
-                            warn!(
-                                "🐌 [{}] Slow inference: {}ms",
-                                self.client_id,
-                                inference_time.as_millis()
-                            );
-                        }
-                        if end_to_end_latency > Duration::from_millis(500) {
-                            warn!(
-                                "🐌 [{}] High end-to-end latency: {}ms",
-                                self.client_id,
-                                end_to_end_latency.as_millis()
-                            );
-                        }
-                        if network_latency > 100 {
-                            warn!(
-                                "🌐 [{}] High network latency: {}ms",
-                                self.client_id, network_latency
-                            );
-                        }
-
-                        debug!(
-                            "[{}] Detection completed in {:?}: {:?}",
-                            self.client_id, inference_time, predictions
-                        );
-                    }
-
-                    #[cfg(not(feature = "latency-diagnostics"))]
                     debug!(
                         "[{}] Detection completed in {:?}ms",
                         self.client_id,
@@ -569,42 +344,6 @@ impl WakewordClient {
                 debug!(
                     "🔧 [{}] Audio buffer trimmed to {} samples (1 second retained)",
                     self.client_id, audio_buffer.len()
-                );
-            }
-        } else {
-            #[cfg(feature = "latency-diagnostics")]
-            {
-                // === BUFFER STATUS LOGGING ===
-                if buffer_size_after != self.last_buffer_size_logged
-                    && buffer_size_after % 1000 == 0
-                {
-                    let progress = (buffer_size_after as f32 / DETECTION_WINDOW_SAMPLES as f32
-                        * 100.0)
-                        .min(100.0);
-                    debug!(
-                        "[{}] Buffer progress: {}/{} samples ({:.1}%)",
-                        self.client_id, buffer_size_after, DETECTION_WINDOW_SAMPLES, progress
-                    );
-                    self.last_buffer_size_logged = buffer_size_after;
-                }
-
-                debug!(
-                    "[{}] Skipping detection: buffer={}, since_last={:?}",
-                    self.client_id,
-                    audio_buffer.len(),
-                    last_detection_time.elapsed()
-                );
-            }
-        }
-
-        #[cfg(feature = "latency-diagnostics")]
-        {
-            // === CONVERSION TIME WARNING ===
-            if conversion_time > Duration::from_millis(5) {
-                debug!(
-                    "🐌 [{}] Slow conversion: {}ms",
-                    self.client_id,
-                    conversion_time.as_millis()
                 );
             }
         }

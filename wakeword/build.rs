@@ -65,4 +65,68 @@ fn main() {
             println!("cargo:warning=⚠️  Custom TensorFlow Lite library not found at {}, tflitec will build from source", tflite_lib_path.display());
         }
     }
+
+    // Set up custom TensorFlow Lite library for tflitec on macOS
+    if target_os == "macos" {
+        println!("cargo:warning=🔍 macOS detected - using custom TensorFlow Lite libraries");
+
+        let arch_dir = if target_arch == "aarch64" {
+            "darwin-aarch64"
+        } else {
+            "darwin-x86_64"
+        };
+
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+        let lib_dir = PathBuf::from(manifest_dir).join("libs").join(arch_dir);
+
+        let tflite_lib_path = lib_dir.join("libtensorflowlite_c.dylib");
+
+        println!("cargo:warning=🔍 Debug: target_arch = {}", target_arch);
+        println!("cargo:warning=🔍 Debug: arch_dir = {}", arch_dir);
+        println!("cargo:warning=🔍 Debug: lib_dir = {}", lib_dir.display());
+        println!(
+            "cargo:warning=🔍 Debug: tflite_lib_path = {}",
+            tflite_lib_path.display()
+        );
+        println!(
+            "cargo:warning=🔍 Debug: tflite_lib_path.exists() = {}",
+            tflite_lib_path.exists()
+        );
+
+        if tflite_lib_path.exists() {
+            println!(
+                "cargo:warning=📚 Using custom TensorFlow Lite library: {}",
+                tflite_lib_path.display()
+            );
+
+            // Tell tflitec to use our custom library for macOS
+            let env_var = if target_arch == "aarch64" {
+                "TFLITEC_PREBUILT_PATH_AARCH64_APPLE_DARWIN"
+            } else {
+                "TFLITEC_PREBUILT_PATH_X86_64_APPLE_DARWIN"
+            };
+
+            println!(
+                "cargo:warning=🔍 Debug: Setting {} = {}",
+                env_var,
+                tflite_lib_path.display()
+            );
+            env::set_var(env_var, &tflite_lib_path);
+
+            // Also set the generic one for good measure
+            env::set_var("TFLITEC_PREBUILT_PATH", &tflite_lib_path);
+
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+            // Link the Metal delegate if available (for GPU acceleration)
+            if lib_dir
+                .join("libtensorflowlite_metal_delegate.dylib")
+                .exists()
+            {
+                println!("cargo:warning=🔗 Metal delegate available for GPU acceleration");
+            }
+        } else {
+            println!("cargo:warning=⚠️  Custom TensorFlow Lite library not found at {}, tflitec will try to build from source", tflite_lib_path.display());
+        }
+    }
 }

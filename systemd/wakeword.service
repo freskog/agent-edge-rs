@@ -1,0 +1,34 @@
+[Unit]
+Description=Wake Word Detection Service
+Documentation=https://github.com/your-org/agent-edge-rs
+After=audio-api.service
+Requires=audio-api.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wakeword --server 127.0.0.1:50051 --models hey_mycroft --threshold 0.5
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wakeword
+
+# Security
+NoNewPrivileges=true
+ProtectHome=false
+ProtectSystem=strict
+PrivateTmp=true
+
+# Resource limits
+MemoryHigh=200M
+MemoryMax=500M
+
+# Environment
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=default.target 
