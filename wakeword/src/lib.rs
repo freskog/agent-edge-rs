@@ -11,6 +11,7 @@
 
 pub mod error;
 pub mod model;
+pub mod server;
 pub mod tcp_client;
 pub mod utils;
 

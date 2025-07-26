@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 audio_protocol = { path = "../audio_protocol" }
+wakeword_protocol = { path = "../wakeword_protocol" }
 # Use our XNNPACK-fixed tflitec fork
 tflitec = { path = "../tflitec-rs-fork", features = [
     "xnnpack",

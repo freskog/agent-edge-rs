@@ -1,8 +1,10 @@
-use crate::{error::OpenWakeWordError, Model};
+use crate::{error::OpenWakeWordError, Model, server::WakewordServer};
 use audio_protocol::{AudioChunk, AudioClient};
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wakeword_protocol::WakewordEvent;
 
 /// Simple TCP client for connecting to audio_api and performing wake word detection
 pub struct WakewordClient {
@@ -21,6 +23,9 @@ pub struct WakewordClient {
     // Debouncing fields
     last_positive_detection: Option<Instant>,
     debounce_duration: Duration,
+
+    // Event broadcasting
+    wakeword_server: Option<Arc<WakewordServer>>,
 }
 
 impl WakewordClient {
@@ -73,7 +78,15 @@ impl WakewordClient {
             // Initialize debouncing (2.5 seconds should be enough to prevent duplicate detections)
             last_positive_detection: None,
             debounce_duration: Duration::from_millis(2500),
+            // No event broadcasting by default
+            wakeword_server: None,
         })
+    }
+
+    /// Set the wakeword server for broadcasting events
+    pub fn set_wakeword_server(&mut self, server: Arc<WakewordServer>) {
+        self.wakeword_server = Some(server);
+        info!("[{}] Enabled wakeword event broadcasting", self.client_id);
     }
 
     /// Start listening for audio and detecting wake words
@@ -381,7 +394,15 @@ impl WakewordClient {
                     // Update debounce timer
                     self.last_positive_detection = Some(current_time);
 
-                    // TODO: Add metrics, webhooks, or other actions here
+                    // Broadcast wakeword event if server is available
+                    if let Some(ref server) = self.wakeword_server {
+                        let event = WakewordEvent::new(
+                            model_name.clone(),
+                            confidence,
+                            self.client_id.clone(),
+                        );
+                        server.broadcast_event(event);
+                    }
                 }
             } else {
                 // Always log predictions to debug what's happening (increased precision)
@@ -401,5 +422,31 @@ pub fn start_wakeword_detection(
     detection_threshold: f32,
 ) -> Result<(), OpenWakeWordError> {
     let mut client = WakewordClient::new(server_address, model_names, detection_threshold)?;
+    client.start_detection()
+}
+
+/// Convenience function to start wakeword detection with event server
+pub fn start_wakeword_detection_with_server(
+    audio_server_address: &str,
+    wakeword_server_address: &str,
+    model_names: Vec<String>,
+    detection_threshold: f32,
+) -> Result<(), OpenWakeWordError> {
+    // Create and start the wakeword event server
+    let wakeword_server = Arc::new(WakewordServer::new());
+    wakeword_server.start(wakeword_server_address).map_err(|e| {
+        OpenWakeWordError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to start wakeword server: {}", e),
+        ))
+    })?;
+
+    // Create the wakeword detection client
+    let mut client = WakewordClient::new(audio_server_address, model_names, detection_threshold)?;
+    
+    // Enable event broadcasting
+    client.set_wakeword_server(wakeword_server);
+
+    // Start detection (blocking)
     client.start_detection()
 }

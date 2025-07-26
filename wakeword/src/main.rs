@@ -16,6 +16,10 @@ struct Args {
     /// Detection threshold
     #[arg(short, long, default_value = "0.5")]
     threshold: f32,
+
+    /// Wakeword event server address (optional - if provided, will serve wakeword events)
+    #[arg(long)]
+    wakeword_server: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,10 +34,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("📋 Using models: {:?}", &model_names);
     info!("🎯 Detection threshold: {}", args.threshold);
 
-    // Start the TCP client (now synchronous!)
-    if let Err(e) =
+    let result = if let Some(wakeword_server_addr) = &args.wakeword_server {
+        info!(
+            "🌐 Starting wakeword event server at: {}",
+            wakeword_server_addr
+        );
+        wakeword::tcp_client::start_wakeword_detection_with_server(
+            &args.server,
+            wakeword_server_addr,
+            model_names,
+            args.threshold,
+        )
+    } else {
+        info!("ℹ️ Running without wakeword event server (use --wakeword-server to enable)");
         wakeword::tcp_client::start_wakeword_detection(&args.server, model_names, args.threshold)
-    {
+    };
+
+    if let Err(e) = result {
         error!("❌ TCP client failed: {}", e);
         std::process::exit(1);
     }

@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 audio = { path = "../audio" }
+wakeword_protocol = { path = "../wakeword_protocol" }
 
 # ONNX Runtime
 ort-sys = "=2.0.0-rc.9"
