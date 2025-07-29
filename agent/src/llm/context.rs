@@ -27,17 +27,20 @@ impl ConversationContext {
 
     /// Set the system message
     pub fn set_system_message(&mut self, content: impl Into<String>) {
-        self.system_message = Some(Message::system(content));
+        let content_string = content.into();
+        self.system_message = Some(Message::system(&content_string));
     }
 
-    /// Add a user message
+    /// Add a user message to the conversation
     pub fn add_user_message(&mut self, content: impl Into<String>) {
-        self.add_message(Message::user(content));
+        let content_string = content.into();
+        self.add_message(Message::user(&content_string));
     }
 
-    /// Add an assistant message
+    /// Add an assistant message to the conversation
     pub fn add_assistant_message(&mut self, content: impl Into<String>) {
-        self.add_message(Message::assistant(content));
+        let content_string = content.into();
+        self.add_message(Message::assistant(&content_string));
     }
 
     /// Add a message to the context

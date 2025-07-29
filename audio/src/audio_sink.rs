@@ -86,20 +86,6 @@ enum PlatformAudioBuffer {
 }
 
 impl PlatformAudioBuffer {
-    fn new(platform: AudioPlatform) -> Self {
-        let config = platform.playback_config();
-        match config.format {
-            PlatformSampleFormat::I16 => {
-                log::info!("🔊 Using I16 audio buffer (no unnecessary conversions)");
-                Self::I16(Vec::new())
-            }
-            PlatformSampleFormat::F32 => {
-                log::info!("🔊 Using F32 audio buffer");
-                Self::F32(Vec::new())
-            }
-        }
-    }
-
     /// Create buffer based on actual stream format (fixes cross-platform format mismatch)
     fn new_with_stream_format(stream_format: SampleFormat) -> Self {
         match stream_format {
@@ -359,7 +345,6 @@ impl AudioSink {
         };
 
         // Create platform-appropriate buffer
-        let buffer_size = 48000; // ~1 second buffer
         let audio_buffer = Arc::new(Mutex::new(PlatformAudioBuffer::new_with_stream_format(
             use_format,
         )));

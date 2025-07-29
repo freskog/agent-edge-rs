@@ -1,99 +1,51 @@
+use std::collections::VecDeque;
 use std::time::Instant;
 
-/// Audio events that can occur during audio processing
+/// Represents different types of audio events for speech processing
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioEvent {
-    /// First audio chunk after silence - triggers processing
-    StartedAudio,
-    /// Ongoing audio chunk - continues processing
-    Audio,
-    /// First silence chunk after audio - signals end of audio
-    StoppedAudio,
+    StartedAudio, // User started speaking
+    Audio,        // User is speaking
+    StoppedAudio, // User stopped speaking (End of Speech)
 }
 
-/// A chunk of audio with event information
+/// Represents a chunk of audio data
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
-    /// Raw audio samples (1280 samples at 16kHz)
-    pub samples: [f32; 1280],
-    /// Timestamp when this chunk was captured
+    pub data: Vec<f32>,
+    pub sample_rate: u32,
+    pub channels: u16,
     pub timestamp: Instant,
-    /// The audio event for this chunk
-    pub audio_event: AudioEvent,
 }
 
-impl AudioChunk {
-    /// Create a new audio chunk
-    pub fn new(samples_f32: [f32; 1280], timestamp: Instant, audio_event: AudioEvent) -> Self {
-        Self {
-            samples: samples_f32,
-            timestamp,
-            audio_event,
-        }
-    }
-
-    /// Returns true if this chunk contains audio (not silence)
-    pub fn has_audio(&self) -> bool {
-        matches!(
-            self.audio_event,
-            AudioEvent::StartedAudio | AudioEvent::Audio
-        )
-    }
-
-    /// Returns true if this is the start of an audio segment
-    pub fn is_audio_start(&self) -> bool {
-        matches!(self.audio_event, AudioEvent::StartedAudio)
-    }
-
-    /// Returns true if this signals the end of an audio segment
-    pub fn is_audio_end(&self) -> bool {
-        matches!(self.audio_event, AudioEvent::StoppedAudio)
-    }
-}
-
-/// Audio capture configuration
+/// Configuration for audio processing
 #[derive(Debug, Clone)]
-pub struct AudioCaptureConfig {
-    pub device_id: Option<String>,
-    pub channel: u32,
+pub struct AudioConfig {
     pub sample_rate: u32,
     pub channels: u16,
     pub buffer_size: usize,
 }
 
-impl Default for AudioCaptureConfig {
+impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            device_id: None,
-            channel: 0,
-            sample_rate: 16000, // 16kHz for audio processing
-            channels: 1,        // Mono
-            buffer_size: 1280,  // 80ms at 16kHz
-        }
-    }
-}
-
-/// Audio sink configuration
-#[derive(Debug, Clone)]
-pub struct AudioSinkConfig {
-    pub device_id: Option<String>,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub buffer_size: usize,
-}
-
-impl Default for AudioSinkConfig {
-    fn default() -> Self {
-        Self {
-            device_id: None,
             sample_rate: 16000,
             channels: 1,
-            buffer_size: 1280,
+            buffer_size: 1024,
         }
     }
 }
 
-/// Audio sink trait for output
+/// Audio source trait (now blocking)
+pub trait AudioSource: Send + Sync {
+    /// Get the next audio chunk (blocking)
+    fn next_chunk(&mut self) -> Option<AudioChunk>;
+
+    /// Get the audio configuration
+    fn config(&self) -> &AudioConfig;
+}
+
+/// Audio sink trait for output (needed by TTS)
 pub trait AudioSink: Send + Sync {
     fn play(&self, samples: &[f32]) -> Result<(), String>;
     fn stop(&self) -> Result<(), String>;
@@ -102,7 +54,25 @@ pub trait AudioSink: Send + Sync {
     }
 }
 
-/// Stub implementation for now - will be replaced with gRPC client
+/// Audio sink configuration
+#[derive(Debug, Clone)]
+pub struct AudioSinkConfig {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub buffer_size: usize,
+}
+
+impl Default for AudioSinkConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 16000,
+            channels: 1,
+            buffer_size: 1024,
+        }
+    }
+}
+
+/// Stub audio sink for testing
 pub struct StubAudioSink;
 
 impl StubAudioSink {
@@ -123,29 +93,31 @@ impl AudioSink for StubAudioSink {
     }
 }
 
-/// Audio hub trait for streaming
-pub trait AudioHub {
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AudioChunk>;
-    fn audio_subscriber_count(&self) -> usize;
+/// Stub audio source for testing
+pub struct StubAudioSource {
+    config: AudioConfig,
+    buffer: VecDeque<AudioChunk>,
 }
 
-/// Stub implementation for now - will be replaced with gRPC client
-pub struct StubAudioHub;
+impl StubAudioSource {
+    pub fn new(config: AudioConfig) -> Self {
+        Self {
+            config,
+            buffer: VecDeque::new(),
+        }
+    }
 
-impl StubAudioHub {
-    pub fn new(_config: AudioCaptureConfig) -> Result<Self, String> {
-        Ok(Self)
+    pub fn add_chunk(&mut self, chunk: AudioChunk) {
+        self.buffer.push_back(chunk);
     }
 }
 
-impl AudioHub for StubAudioHub {
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AudioChunk> {
-        let (tx, rx) = tokio::sync::broadcast::channel(128);
-        // TODO: Connect to gRPC stream from audio_api
-        rx
+impl AudioSource for StubAudioSource {
+    fn next_chunk(&mut self) -> Option<AudioChunk> {
+        self.buffer.pop_front()
     }
 
-    fn audio_subscriber_count(&self) -> usize {
-        0 // TODO: Get from gRPC service
+    fn config(&self) -> &AudioConfig {
+        &self.config
     }
 }

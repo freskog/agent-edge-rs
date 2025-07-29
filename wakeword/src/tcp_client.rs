@@ -3,7 +3,7 @@ use audio_protocol::{AudioChunk, AudioClient};
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use wakeword_protocol::WakewordEvent;
 
 /// Simple TCP client for connecting to audio_api and performing wake word detection
@@ -112,8 +112,8 @@ impl WakewordClient {
 
         // Performance tracking
         let start_time = Instant::now();
-        let mut last_chunk_time = Instant::now();
-        let chunk_timeout = Duration::from_secs(5);
+        let mut _last_chunk_time = Instant::now();
+        let _chunk_timeout = Duration::from_secs(5);
         let mut total_processing_time = Duration::new(0, 0);
         let mut detection_count = 0;
 
@@ -125,7 +125,7 @@ impl WakewordClient {
             match self.client.read_audio_chunk() {
                 Ok(Some(chunk)) => {
                     chunk_count += 1;
-                    last_chunk_time = Instant::now();
+                    _last_chunk_time = Instant::now();
 
                     // Log every 10th chunk to reduce noise
                     if chunk_count % 10 == 0 {

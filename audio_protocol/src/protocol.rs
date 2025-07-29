@@ -1,3 +1,4 @@
+use log::trace;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use thiserror::Error;
@@ -301,7 +302,7 @@ impl Connection {
         let payload_length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
 
         // Debug logging for protocol analysis
-        log::debug!(
+        log::trace!(
             "📥 Reading message: type={} (0x{:02X}), payload_length={}",
             message_type_byte,
             message_type_byte,
@@ -342,7 +343,7 @@ impl Connection {
 
         // Parse message
         let message = Message::from_bytes(message_type, &payload)?;
-        log::debug!(
+        log::trace!(
             "✅ Successfully parsed message: {:?}",
             message.message_type()
         );

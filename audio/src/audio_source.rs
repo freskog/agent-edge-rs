@@ -13,18 +13,6 @@ use thiserror::Error;
 
 pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size (in samples)
 
-// Build-time platform detection
-#[cfg(target_os = "macos")]
-const PLATFORM: Platform = Platform::MacOS;
-#[cfg(target_os = "linux")]
-const PLATFORM: Platform = Platform::RaspberryPi;
-
-#[derive(Debug, Clone, Copy)]
-enum Platform {
-    MacOS,
-    RaspberryPi,
-}
-
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
     #[error("No audio devices found")]
@@ -316,9 +304,10 @@ impl AudioCapture {
         let mut s16le_bytes = Vec::with_capacity(f32_samples.len() * 2);
 
         for &sample in f32_samples {
-            // Clamp to [-1.0, 1.0] and convert to i16
+            // Clamp to [-1.0, 1.0] and convert to i16 using symmetric scaling
             let clamped = sample.clamp(-1.0, 1.0);
-            let i16_sample = (clamped * 32767.0) as i16;
+            // Use 32768.0 for proper symmetric conversion (matches STT service expectation)
+            let i16_sample = (clamped * 32768.0).clamp(-32768.0, 32767.0) as i16;
             s16le_bytes.extend_from_slice(&i16_sample.to_le_bytes());
         }
 

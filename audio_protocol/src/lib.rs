@@ -5,9 +5,11 @@
 //! This crate provides:
 //! - Low-level protocol definitions (messages, serialization)
 //! - High-level client for easy usage
+//! - Buffered client for continuous streaming with internal buffering
 //!
 //! ## Example Usage
 //!
+//! ### Basic Client
 //! ```rust,no_run
 //! use audio_protocol::client::AudioClient;
 //! use std::time::Duration;
@@ -25,9 +27,33 @@
 //!         println!("Received {} bytes", chunk.size_bytes());
 //!     }
 //! }
+//! # Ok(())
+//! # }
+//! ```
 //!
-//! // Play the audio back
-//! // (implementation depends on your audio processing pipeline)
+//! ### Buffered Client (Recommended)
+//! ```rust,no_run
+//! use audio_protocol::client::BufferedAudioClient;
+//! use std::time::Duration;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Connect with 2-second internal buffer
+//! let client = BufferedAudioClient::connect_default("127.0.0.1:50051")?;
+//!
+//! // Read chunks continuously - no data loss!
+//! for _ in 0..100 {
+//!     if let Some(chunk) = client.read_chunk_timeout(Duration::from_millis(100)) {
+//!         println!("Received {} bytes", chunk.size_bytes());
+//!     }
+//! }
+//!
+//! // Check buffer health
+//! if let Some(stats) = client.get_stats() {
+//!     if !stats.is_healthy() {
+//!         println!("Warning: Audio buffer is unhealthy!");
+//!         stats.log_status();
+//!     }
+//! }
 //! # Ok(())
 //! # }
 //! ```
