@@ -14,10 +14,14 @@ pub mod model;
 pub mod server;
 pub mod tcp_client;
 pub mod utils;
+pub mod vad; // New VAD module
 
 pub use error::*;
 pub use model::*;
+pub use server::*;
+pub use tcp_client::*;
 pub use utils::*;
+pub use vad::*; // Export VAD types
 
 #[cfg(test)]
 mod tests;

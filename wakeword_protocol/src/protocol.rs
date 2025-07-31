@@ -21,6 +21,56 @@ pub enum ProtocolError {
     Json(#[from] serde_json::Error),
 }
 
+/// Types of subscriptions available
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SubscriptionType {
+    /// Just wake word events (current behavior)
+    WakewordOnly,
+    /// Wake word event followed by audio stream until EOS
+    WakewordPlusUtterance,
+    /// Just audio stream until EOS (for follow-up questions)
+    UtteranceOnly,
+}
+
+/// Audio chunk for streaming
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioChunk {
+    /// Raw PCM data (16-bit, 16kHz, mono)
+    pub data: Vec<u8>,
+    /// Unix timestamp in milliseconds when chunk was captured
+    pub timestamp: u64,
+    /// Sequence ID for ordering/deduplication
+    pub sequence_id: u64,
+    /// Session ID this chunk belongs to
+    pub session_id: String,
+}
+
+/// Reasons why speech ended
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EosReason {
+    /// VAD detected end of speech (silence)
+    VadSilence,
+    /// Maximum utterance duration reached
+    Timeout,
+    /// Manually triggered end
+    Manual,
+    /// Error occurred during capture
+    Error,
+}
+
+/// End of speech event
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EndOfSpeechEvent {
+    /// Session ID that ended
+    pub session_id: String,
+    /// Unix timestamp when speech ended
+    pub timestamp: u64,
+    /// Total audio chunks sent in this session
+    pub total_chunks: u64,
+    /// Reason speech ended
+    pub reason: EosReason,
+}
+
 /// Message types for the wakeword protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -28,12 +78,17 @@ pub enum MessageType {
     // Client → Server
     SubscribeWakeword = 0x01,
     UnsubscribeWakeword = 0x02,
+    SubscribeUtterance = 0x03,   // New: Subscribe with subscription type
+    UnsubscribeUtterance = 0x04, // New: Unsubscribe from utterance streaming
 
     // Server → Client
     WakewordEvent = 0x10,
     SubscribeResponse = 0x11,
     UnsubscribeResponse = 0x12,
     ErrorResponse = 0x13,
+    AudioChunkMessage = 0x14,       // New: Streaming audio chunk
+    EndOfSpeechMessage = 0x15,      // New: End of speech detection
+    UtteranceSessionStarted = 0x16, // New: Utterance capture session started
 }
 
 impl TryFrom<u8> for MessageType {
@@ -43,10 +98,15 @@ impl TryFrom<u8> for MessageType {
         match value {
             0x01 => Ok(MessageType::SubscribeWakeword),
             0x02 => Ok(MessageType::UnsubscribeWakeword),
+            0x03 => Ok(MessageType::SubscribeUtterance),
+            0x04 => Ok(MessageType::UnsubscribeUtterance),
             0x10 => Ok(MessageType::WakewordEvent),
             0x11 => Ok(MessageType::SubscribeResponse),
             0x12 => Ok(MessageType::UnsubscribeResponse),
             0x13 => Ok(MessageType::ErrorResponse),
+            0x14 => Ok(MessageType::AudioChunkMessage),
+            0x15 => Ok(MessageType::EndOfSpeechMessage),
+            0x16 => Ok(MessageType::UtteranceSessionStarted),
             _ => Err(ProtocolError::InvalidMessageType(value)),
         }
     }
@@ -79,15 +139,36 @@ impl WakewordEvent {
     }
 }
 
+/// Session started event
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UtteranceSessionStarted {
+    /// Unique session identifier
+    pub session_id: String,
+    /// Timestamp when session started
+    pub timestamp: u64,
+    /// Type of subscription that triggered this session
+    pub subscription_type: SubscriptionType,
+    /// Wake word that triggered this (if applicable)
+    pub trigger_model: Option<String>,
+}
+
 /// Protocol messages
 #[derive(Debug, Clone)]
 pub enum Message {
+    // Existing messages
     SubscribeWakeword,
     UnsubscribeWakeword,
     WakewordEvent(WakewordEvent),
     SubscribeResponse { success: bool, message: String },
     UnsubscribeResponse { success: bool, message: String },
     ErrorResponse { error: String },
+
+    // New messages for audio streaming
+    SubscribeUtterance(SubscriptionType),
+    UnsubscribeUtterance,
+    AudioChunk(AudioChunk),
+    EndOfSpeech(EndOfSpeechEvent),
+    UtteranceSessionStarted(UtteranceSessionStarted),
 }
 
 impl Message {
@@ -96,20 +177,33 @@ impl Message {
         match self {
             Message::SubscribeWakeword => MessageType::SubscribeWakeword,
             Message::UnsubscribeWakeword => MessageType::UnsubscribeWakeword,
+            Message::SubscribeUtterance(_) => MessageType::SubscribeUtterance,
+            Message::UnsubscribeUtterance => MessageType::UnsubscribeUtterance,
             Message::WakewordEvent(_) => MessageType::WakewordEvent,
             Message::SubscribeResponse { .. } => MessageType::SubscribeResponse,
             Message::UnsubscribeResponse { .. } => MessageType::UnsubscribeResponse,
             Message::ErrorResponse { .. } => MessageType::ErrorResponse,
+            Message::AudioChunk(_) => MessageType::AudioChunkMessage,
+            Message::EndOfSpeech(_) => MessageType::EndOfSpeechMessage,
+            Message::UtteranceSessionStarted(_) => MessageType::UtteranceSessionStarted,
         }
     }
 
     /// Serialize message to bytes (JSON payload for data messages)
     pub fn to_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         let payload = match self {
-            Message::SubscribeWakeword | Message::UnsubscribeWakeword => {
+            Message::SubscribeWakeword
+            | Message::UnsubscribeWakeword
+            | Message::UnsubscribeUtterance => {
                 Vec::new() // No payload for simple commands
             }
+            Message::SubscribeUtterance(subscription_type) => {
+                serde_json::to_vec(subscription_type)?
+            }
             Message::WakewordEvent(event) => serde_json::to_vec(event)?,
+            Message::AudioChunk(chunk) => serde_json::to_vec(chunk)?,
+            Message::EndOfSpeech(eos_event) => serde_json::to_vec(eos_event)?,
+            Message::UtteranceSessionStarted(session) => serde_json::to_vec(session)?,
             Message::SubscribeResponse { success, message } => {
                 serde_json::to_vec(&serde_json::json!({
                     "success": success,
@@ -141,9 +235,26 @@ impl Message {
         match message_type {
             MessageType::SubscribeWakeword => Ok(Message::SubscribeWakeword),
             MessageType::UnsubscribeWakeword => Ok(Message::UnsubscribeWakeword),
+            MessageType::UnsubscribeUtterance => Ok(Message::UnsubscribeUtterance),
+            MessageType::SubscribeUtterance => {
+                let subscription_type: SubscriptionType = serde_json::from_slice(payload)?;
+                Ok(Message::SubscribeUtterance(subscription_type))
+            }
             MessageType::WakewordEvent => {
                 let event: WakewordEvent = serde_json::from_slice(payload)?;
                 Ok(Message::WakewordEvent(event))
+            }
+            MessageType::AudioChunkMessage => {
+                let chunk: AudioChunk = serde_json::from_slice(payload)?;
+                Ok(Message::AudioChunk(chunk))
+            }
+            MessageType::EndOfSpeechMessage => {
+                let eos_event: EndOfSpeechEvent = serde_json::from_slice(payload)?;
+                Ok(Message::EndOfSpeech(eos_event))
+            }
+            MessageType::UtteranceSessionStarted => {
+                let session: UtteranceSessionStarted = serde_json::from_slice(payload)?;
+                Ok(Message::UtteranceSessionStarted(session))
             }
             MessageType::SubscribeResponse => {
                 let data: serde_json::Value = serde_json::from_slice(payload)?;

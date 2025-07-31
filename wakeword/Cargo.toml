@@ -1,35 +1,35 @@
 [package]
 name = "wakeword"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Wake word detection engine based on OpenWakeWord"
+license.workspace = true
 
 [dependencies]
-audio_protocol = { path = "../audio_protocol" }
 wakeword_protocol = { path = "../wakeword_protocol" }
-# Use our XNNPACK-fixed tflitec fork
-tflitec = { path = "../tflitec-rs-fork", features = [
-    "xnnpack",
-    "xnnpack_qu8",
-    "xnnpack_qs8",
-] }
-log = "0.4"
-env_logger = "0.10"
-clap = { version = "4.0", features = ["derive"] }
+audio_protocol = { path = "../audio_protocol" }
+voice_activity_detector = "0.2.0"
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tflitec = { path = "../tflitec-rs-fork" }
+ndarray = "0.16"
+rubato = "0.16.2"
 hound = "3.5"
-thiserror = "1.0"
+thiserror = "2.0"
 rand = "0.8"
 anyhow = "1.0"
-
-[[bin]]
-name = "debug_audio"
-path = "src/bin/debug_audio.rs"
 
 [features]
 # Enable detailed latency diagnostics and verbose logging for debugging performance issues
 latency-diagnostics = []
 
 [dev-dependencies]
-hound = "3.5"
+audio = { path = "../audio" }
+tokio = { version = "1.0", features = ["full"] }
 
 [build-dependencies]
 cc = "1.0"

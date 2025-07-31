@@ -2,6 +2,7 @@ use crate::blocking_stt::{types::RawChunk, BlockingSTTService};
 use crate::error::AgentError;
 use audio_protocol::client::AudioClient;
 use std::collections::VecDeque;
+use std::time::Duration;
 use std::time::Instant;
 
 /// Simple STT Service - maintains continuous audio buffer, single connection
@@ -145,6 +146,79 @@ impl crate::services::STTService for STTService {
             Err(e) => {
                 log::error!("❌ STT transcription failed: {}", e);
                 Err(AgentError::STT(format!("Transcription failed: {}", e)))
+            }
+        }
+    }
+
+    /// Transcribe speech from provided audio chunks (new streaming approach)
+    fn transcribe_from_chunks(
+        &self,
+        audio_chunks: Vec<wakeword_protocol::protocol::AudioChunk>,
+    ) -> Result<String, AgentError> {
+        log::info!(
+            "🎯 Starting STT transcription from {} provided audio chunks",
+            audio_chunks.len()
+        );
+
+        if audio_chunks.is_empty() {
+            log::warn!("⚠️ No audio chunks provided for transcription");
+            return Ok(String::new());
+        }
+
+        // Convert wakeword protocol audio chunks to RawChunk format expected by blocking STT
+        let context_chunks: Vec<RawChunk> = audio_chunks
+            .into_iter()
+            .map(|chunk| {
+                // The audio data is already in u8 format from the wakeword protocol
+                RawChunk::new(
+                    chunk.data, // Use the u8 data directly
+                    Instant::now(),
+                    crate::blocking_stt::types::SpeechEvent::Speech,
+                )
+            })
+            .collect();
+
+        log::info!(
+            "📝 Converted {} wakeword chunks to STT format (~{:.1}s of audio)",
+            context_chunks.len(),
+            context_chunks.len() as f32 * 0.032 // ~32ms per chunk
+        );
+
+        // Create a dummy audio source that provides no additional audio since we have all chunks
+        struct NoAudioSource;
+        impl crate::blocking_stt::AudioSource for NoAudioSource {
+            type Error = std::io::Error;
+
+            fn read_audio_chunk_timeout(
+                &mut self,
+                _timeout: Duration,
+            ) -> Result<Option<audio_protocol::AudioChunk>, Self::Error> {
+                // Return None immediately to signal no more audio
+                Ok(None)
+            }
+        }
+
+        let dummy_audio_source = NoAudioSource;
+
+        // Use the blocking STT service with the converted chunks
+        let result = self
+            .blocking_stt
+            .transcribe_from_wakeword(dummy_audio_source, context_chunks);
+
+        match result {
+            Ok(transcript) => {
+                log::info!(
+                    "✅ STT transcription from chunks successful: '{}'",
+                    transcript
+                );
+                Ok(transcript)
+            }
+            Err(e) => {
+                log::error!("❌ STT transcription from chunks failed: {}", e);
+                Err(AgentError::STT(format!(
+                    "Chunk transcription failed: {}",
+                    e
+                )))
             }
         }
     }

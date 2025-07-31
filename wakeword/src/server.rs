@@ -1,14 +1,35 @@
 use log::{debug, error, info, warn};
+use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use wakeword_protocol::{Connection, Message, ProtocolError, WakewordEvent};
+use wakeword_protocol::{
+    protocol::{AudioChunk, EndOfSpeechEvent, SubscriptionType, UtteranceSessionStarted},
+    Connection, Message, ProtocolError, WakewordEvent,
+};
+
+/// Streaming message types that can be sent to subscribers
+#[derive(Debug, Clone)]
+pub enum StreamingMessage {
+    WakewordEvent(WakewordEvent),
+    AudioChunk(AudioChunk),
+    EndOfSpeech(EndOfSpeechEvent),
+    UtteranceSessionStarted(UtteranceSessionStarted),
+}
+
+/// Subscriber information with subscription type
+#[derive(Debug)]
+struct SubscriberInfo {
+    sender: mpsc::Sender<StreamingMessage>,
+    subscription_type: SubscriptionType,
+    subscriber_id: String,
+}
 
 /// Handle for managing the wakeword event server
 #[derive(Clone)]
 pub struct WakewordServer {
-    subscribers: Arc<Mutex<Vec<mpsc::Sender<WakewordEvent>>>>,
+    subscribers: Arc<Mutex<HashMap<String, SubscriberInfo>>>,
     next_subscriber_id: Arc<Mutex<u32>>,
 }
 
@@ -16,7 +37,7 @@ impl WakewordServer {
     /// Create a new wakeword server
     pub fn new() -> Self {
         Self {
-            subscribers: Arc::new(Mutex::new(Vec::new())),
+            subscribers: Arc::new(Mutex::new(HashMap::new())),
             next_subscriber_id: Arc::new(Mutex::new(0)),
         }
     }
@@ -64,21 +85,31 @@ impl WakewordServer {
             .map_err(ProtocolError::Io)?;
 
         let mut connection = Connection::new(stream)?;
-        let mut event_receiver: Option<mpsc::Receiver<WakewordEvent>> = None;
+        let mut event_receiver: Option<mpsc::Receiver<StreamingMessage>> = None;
         let mut subscriber_id: Option<String> = None;
 
         loop {
             // Check for incoming events to send to client
             if let Some(ref receiver) = event_receiver {
                 match receiver.try_recv() {
-                    Ok(event) => {
-                        let message = Message::WakewordEvent(event.clone());
+                    Ok(streaming_message) => {
+                        let message = match streaming_message {
+                            StreamingMessage::WakewordEvent(event) => Message::WakewordEvent(event),
+                            StreamingMessage::AudioChunk(chunk) => Message::AudioChunk(chunk),
+                            StreamingMessage::EndOfSpeech(eos_event) => {
+                                Message::EndOfSpeech(eos_event)
+                            }
+                            StreamingMessage::UtteranceSessionStarted(session) => {
+                                Message::UtteranceSessionStarted(session)
+                            }
+                        };
+
                         if let Err(e) = connection.write_message(&message) {
-                            error!("❌ Failed to send event to {}: {}", peer_addr, e);
+                            error!("❌ Failed to send message to {}: {}", peer_addr, e);
                             break;
                         }
                         debug!(
-                            "✅ Sent event to {} ({})",
+                            "✅ Sent streaming message to {} ({})",
                             peer_addr,
                             subscriber_id.as_ref().unwrap_or(&"unknown".to_string())
                         );
@@ -116,15 +147,25 @@ impl WakewordServer {
                         format!("subscriber_{}", *next_id)
                     };
 
-                    info!("📝 Client {} subscribed with ID: {}", peer_addr, id);
+                    info!(
+                        "📝 Client {} subscribed to wakeword events with ID: {}",
+                        peer_addr, id
+                    );
 
                     // Create channel for this subscriber
                     let (sender, receiver) = mpsc::channel();
 
-                    // Add sender to subscribers list
+                    // Add subscriber info to map
                     {
                         let mut subscribers = self.subscribers.lock().unwrap();
-                        subscribers.push(sender);
+                        subscribers.insert(
+                            id.clone(),
+                            SubscriberInfo {
+                                sender,
+                                subscription_type: SubscriptionType::WakewordOnly,
+                                subscriber_id: id.clone(),
+                            },
+                        );
                     }
 
                     event_receiver = Some(receiver);
@@ -132,14 +173,71 @@ impl WakewordServer {
 
                     let response = Message::SubscribeResponse {
                         success: true,
-                        message: format!("Subscribed with ID: {}", id),
+                        message: format!("Subscribed to wakeword events with ID: {}", id),
                     };
                     connection.write_message(&response)?;
                 }
-                Ok(Message::UnsubscribeWakeword) => {
-                    if subscriber_id.take().is_some() {
+                Ok(Message::SubscribeUtterance(subscription_type)) => {
+                    if subscriber_id.is_some() {
+                        // Already subscribed
+                        let response = Message::SubscribeResponse {
+                            success: false,
+                            message: "Already subscribed".to_string(),
+                        };
+                        connection.write_message(&response)?;
+                        continue;
+                    }
+
+                    // Generate new subscriber ID
+                    let id = {
+                        let mut next_id = self.next_subscriber_id.lock().unwrap();
+                        *next_id += 1;
+                        format!("subscriber_{}", *next_id)
+                    };
+
+                    info!(
+                        "📝 Client {} subscribed to utterance streaming ({:?}) with ID: {}",
+                        peer_addr, subscription_type, id
+                    );
+
+                    // Create channel for this subscriber
+                    let (sender, receiver) = mpsc::channel();
+
+                    // Add subscriber info to map
+                    {
+                        let mut subscribers = self.subscribers.lock().unwrap();
+                        subscribers.insert(
+                            id.clone(),
+                            SubscriberInfo {
+                                sender,
+                                subscription_type: subscription_type.clone(),
+                                subscriber_id: id.clone(),
+                            },
+                        );
+                    }
+
+                    event_receiver = Some(receiver);
+                    subscriber_id = Some(id.clone());
+
+                    let response = Message::SubscribeResponse {
+                        success: true,
+                        message: format!(
+                            "Subscribed to utterance streaming ({:?}) with ID: {}",
+                            subscription_type, id
+                        ),
+                    };
+                    connection.write_message(&response)?;
+                }
+                Ok(Message::UnsubscribeWakeword) | Ok(Message::UnsubscribeUtterance) => {
+                    if let Some(id) = subscriber_id.take() {
+                        // Remove from subscribers map
+                        {
+                            let mut subscribers = self.subscribers.lock().unwrap();
+                            subscribers.remove(&id);
+                        }
+
                         event_receiver = None;
-                        info!("📝 Client {} unsubscribed", peer_addr);
+                        info!("📝 Client {} unsubscribed (ID: {})", peer_addr, id);
 
                         let response = Message::UnsubscribeResponse {
                             success: true,
@@ -191,60 +289,135 @@ impl WakewordServer {
         Ok(())
     }
 
-    /// Broadcast a wakeword event to all subscribers
+    /// Broadcast a wakeword event to all subscribers (backward compatibility)
     pub fn broadcast_event(&self, event: WakewordEvent) {
-        let mut subscribers = self.subscribers.lock().unwrap();
+        self.broadcast_message(StreamingMessage::WakewordEvent(event));
+    }
+
+    /// Broadcast a streaming message to appropriate subscribers
+    pub fn broadcast_message(&self, message: StreamingMessage) {
+        info!("📢 Starting broadcast_message");
+        let subscribers = self.subscribers.lock().unwrap();
+        info!(
+            "📢 Acquired subscribers lock, {} total subscribers",
+            subscribers.len()
+        );
         let mut to_remove = Vec::new();
 
         if subscribers.is_empty() {
-            debug!(
-                "📢 No active subscribers for wakeword event: {}",
-                event.model_name
-            );
+            debug!("📢 No active subscribers for streaming message");
             return;
         }
 
-        debug!(
-            "📢 Broadcasting wakeword event to {} subscribers",
+        // Filter subscribers based on message type and subscription
+        let relevant_subscribers: Vec<_> = subscribers
+            .iter()
+            .filter(|(_, info)| self.should_send_message(&message, &info.subscription_type))
+            .collect();
+
+        if relevant_subscribers.is_empty() {
+            debug!("📢 No relevant subscribers for message type");
+            return;
+        }
+
+        info!(
+            "📢 Broadcasting streaming message to {} relevant subscribers (out of {} total)",
+            relevant_subscribers.len(),
             subscribers.len()
         );
 
-        // Send event to all subscribers
-        for (index, sender) in subscribers.iter().enumerate() {
-            match sender.send(event.clone()) {
+        // Send message to relevant subscribers
+        for (subscriber_id, info) in relevant_subscribers {
+            info!("📢 Sending message to subscriber {}", subscriber_id);
+            match info.sender.send(message.clone()) {
                 Ok(_) => {
-                    debug!("✅ Sent event to subscriber {}", index);
+                    info!("✅ Sent message to subscriber {}", subscriber_id);
                 }
                 Err(_) => {
-                    debug!(
-                        "❌ Failed to send event to subscriber {} (disconnected)",
-                        index
+                    info!(
+                        "❌ Failed to send message to subscriber {} (disconnected)",
+                        subscriber_id
                     );
-                    to_remove.push(index);
+                    to_remove.push(subscriber_id.clone());
                 }
             }
         }
 
-        // Remove disconnected subscribers (in reverse order to maintain indices)
-        for &index in to_remove.iter().rev() {
-            subscribers.remove(index);
-        }
+        info!("📢 Finished sending to all subscribers");
 
+        // Remove disconnected subscribers
         if !to_remove.is_empty() {
+            drop(subscribers); // Release the lock before acquiring it again
+            let mut subscribers = self.subscribers.lock().unwrap();
+            for subscriber_id in &to_remove {
+                subscribers.remove(subscriber_id);
+            }
             info!("🧹 Removed {} disconnected subscribers", to_remove.len());
         }
 
-        let active_count = subscribers.len();
-        if active_count > 0 {
-            info!(
-                "📢 Broadcasted wakeword event '{}' to {} subscribers",
-                event.model_name, active_count
-            );
+        info!("📢 Broadcast complete");
+    }
+
+    /// Check if a message should be sent to a subscriber based on their subscription type
+    fn should_send_message(
+        &self,
+        message: &StreamingMessage,
+        subscription_type: &SubscriptionType,
+    ) -> bool {
+        match (message, subscription_type) {
+            // WakewordOnly subscribers only get wake word events
+            (StreamingMessage::WakewordEvent(_), SubscriptionType::WakewordOnly) => true,
+
+            // WakewordPlusUtterance subscribers get all messages
+            (_, SubscriptionType::WakewordPlusUtterance) => true,
+
+            // UtteranceOnly subscribers get audio and EOS messages (no wake word events)
+            (StreamingMessage::AudioChunk(_), SubscriptionType::UtteranceOnly) => true,
+            (StreamingMessage::EndOfSpeech(_), SubscriptionType::UtteranceOnly) => true,
+            (StreamingMessage::UtteranceSessionStarted(_), SubscriptionType::UtteranceOnly) => true,
+
+            // All other combinations are filtered out
+            _ => false,
         }
+    }
+
+    /// Check if there are any subscribers who want utterance streaming
+    pub fn has_utterance_subscribers(&self) -> bool {
+        let subscribers = self.subscribers.lock().unwrap();
+        let utterance_count = subscribers
+            .values()
+            .filter(|info| {
+                matches!(
+                    info.subscription_type,
+                    SubscriptionType::WakewordPlusUtterance | SubscriptionType::UtteranceOnly
+                )
+            })
+            .count();
+
+        info!(
+            "🔍 Server has {} total subscribers, {} want utterance streaming",
+            subscribers.len(),
+            utterance_count
+        );
+
+        for (id, info) in subscribers.iter() {
+            info!("🔍 Subscriber {}: type={:?}", id, info.subscription_type);
+        }
+
+        utterance_count > 0
     }
 
     /// Get the number of active subscribers
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.lock().unwrap().len()
+    }
+
+    /// Get the number of subscribers by type
+    pub fn subscriber_count_by_type(&self, subscription_type: &SubscriptionType) -> usize {
+        let subscribers = self.subscribers.lock().unwrap();
+        subscribers
+            .values()
+            .filter(|info| &info.subscription_type == subscription_type)
+            .count()
     }
 }

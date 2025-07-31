@@ -256,7 +256,9 @@ fn test_embedding_stage() {
 fn test_streaming_behavior() {
     env_logger::try_init().ok();
 
-    let test_file = "../tests/data/alexa_test.wav";
+    // Use a longer audio file that has enough content to generate 1536+ features
+    // alexa_test.wav is only 0.625s, but delay_start_what_time_is_it.wav is 5.92s
+    let test_file = "../tests/data/delay_start_what_time_is_it.wav";
     if !Path::new(test_file).exists() {
         panic!("Test file not found: {}", test_file);
     }
@@ -267,6 +269,12 @@ fn test_streaming_behavior() {
         .samples()
         .collect::<std::result::Result<Vec<_>, _>>()
         .expect("Failed to read audio samples");
+
+    println!(
+        "Audio file duration: ~{:.2}s, {} samples",
+        samples.len() as f32 / 16000.0,
+        samples.len()
+    );
 
     // Create AudioFeatures processor
     let mut audio_features = AudioFeatures::new(
@@ -302,7 +310,7 @@ fn test_streaming_behavior() {
         }
 
         // After several chunks, should have enough features
-        if i >= 5 && current_feature_count >= 1536 {
+        if i >= 10 && current_feature_count >= 1536 {
             println!("Reached 1536 features after {} chunks", i);
             break;
         }
@@ -311,8 +319,9 @@ fn test_streaming_behavior() {
     // Should eventually reach the target feature count
     assert!(
         total_features >= 1536,
-        "Failed to reach 1536 features, only got {}",
-        total_features
+        "Failed to reach 1536 features, only got {} (audio duration: {:.2}s)",
+        total_features,
+        samples.len() as f32 / 16000.0
     );
 }
 

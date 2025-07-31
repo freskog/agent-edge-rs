@@ -15,6 +15,13 @@ pub trait STTService: Send + Sync {
     /// Transcribe speech starting from wakeword detection
     /// Uses buffered context + new streaming audio until EOS
     fn transcribe_from_wakeword(&mut self) -> Result<String, AgentError>;
+
+    /// Transcribe speech from provided audio chunks (new streaming approach)
+    /// Used when audio chunks are provided directly from wakeword streaming
+    fn transcribe_from_chunks(
+        &self,
+        audio_chunks: Vec<wakeword_protocol::protocol::AudioChunk>,
+    ) -> Result<String, AgentError>;
 }
 
 /// Service trait for LLM processing (now blocking with ureq)
