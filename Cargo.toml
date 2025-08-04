@@ -1,19 +1,32 @@
-[workspace]
-resolver = "2"
-members = ["agent", "wakeword", "audio", "audio_protocol", "wakeword_protocol"]
-
-[workspace.package]
+[package]
+name = "audio"
 version = "0.1.0"
 edition = "2021"
 authors = ["Fredrik Skogberg <freskog@gmail.com>"]
-description = "Agent Edge RS - Split into wakeword, agent, and audio-interface binaries"
+description = "Binary Audio Service with integrated wakeword detection and VAD processing"
 license = "MIT"
 
-[workspace.dependencies]
-tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+[dependencies]
+cpal = "0.16.0"
+thiserror = "2.0"
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 clap = { version = "4.0", features = ["derive"] }
-dotenvy = "0.15"
+crossbeam = "0.8"
+rubato = "0.16.2"
+ctrlc = "3.4"
+samplerate = "0.2"
+hound = "3.5"                                     # For reading wave files
+
+# Wakeword detection dependencies
+voice_activity_detector = "0.2.0"        # VAD processing
+tflitec = { path = "./tflitec-rs-fork" } # TensorFlow Lite models
+ndarray = "0.16"                         # Array operations
+anyhow = "1.0"                           # Error handling
+
+[features]
+audio_available = []
+
+[build-dependencies]
+cpal = "0.16.0"
+cc = "1.0"      # For wakeword native code

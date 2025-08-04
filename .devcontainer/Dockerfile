@@ -95,8 +95,9 @@ RUN echo 'source "$HOME/.cargo/env"' >> ~/.bashrc
 
 # Environment for dev tools
 ENV PATH="/home/${USERNAME}/.cargo/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/usr/local/lib"
+ENV LD_LIBRARY_PATH="/home/$USERNAME/agent-edge-rs/libs/linux-aarch64:/usr/local/lib"
 ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig"
+
 
 # Start Bash in login mode so .bashrc is loaded
 CMD [ "/bin/bash" ]

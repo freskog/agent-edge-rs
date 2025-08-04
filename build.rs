@@ -1,132 +1,132 @@
-use std::{
-    env, fs,
-    os::unix::fs as unix_fs,
-    path::{Path, PathBuf},
-};
+use std::env;
+use std::path::PathBuf;
 
 fn main() {
-    // Only do special handling for aarch64-linux builds (Pi / aarch64 dev-container)
-    let target = env::var("TARGET").unwrap_or_default();
-    if !(target.starts_with("aarch64") && target.contains("linux")) {
-        return;
-    }
+    println!("cargo:rerun-if-changed=build.rs");
 
-    /* ------------------------------------------------------------------------
-       1.  Validate that both pre-built TFLite libraries exist in the source tree
-    -------------------------------------------------------------------------*/
-    let project_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let lib_src_dir = project_root.join("libs/linux-aarch64");
-    let pthreadpool_dir = project_root.join("libs");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
-    let c_api = lib_src_dir.join("libtensorflowlite_c.so");
-    let cpp_api = lib_src_dir.join("libtensorflowlite.so");
-    let pthreadpool_lib = pthreadpool_dir.join("libpthreadpool.a");
-
-    for lib in [&c_api, &cpp_api] {
-        if !lib.exists() {
-            panic!(
-                "Missing TensorFlow Lite library: {}\n\
-                 (expected in libs/linux-aarch64/)",
-                lib.display()
-            );
-        }
-    }
-
-    if !pthreadpool_lib.exists() {
-        panic!(
-            "Missing pthreadpool static library: {}\n\
-             (expected in libs/)",
-            pthreadpool_lib.display()
+    // Set up custom TensorFlow Lite library for tflitec on Linux aarch64
+    if target_os == "linux" && target_arch == "aarch64" {
+        println!(
+            "cargo:warning=🔍 Linux aarch64 detected - using custom TensorFlow Lite libraries"
         );
-    }
 
-    /* ------------------------------------------------------------------------
-       2.  Tell rustc how to link against the libraries
-    -------------------------------------------------------------------------*/
-    println!("cargo:rustc-link-search=native={}", lib_src_dir.display());
-    println!(
-        "cargo:rustc-link-search=native={}",
-        pthreadpool_dir.display()
-    );
-
-    // Link pthreadpool statically (before TensorFlow Lite)
-    println!("cargo:rustc-link-lib=static=pthreadpool");
-
-    println!("cargo:rustc-link-lib=dylib=tensorflowlite_c");
-    println!("cargo:rustc-link-lib=dylib=tensorflowlite");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-
-    // Embed rpath so the binary looks in ./libs/linux-aarch64 and ./libs at runtime
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/libs/linux-aarch64");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/libs");
-    // Disable --as-needed to ensure tensorflow-lite is retained even if referenced later
-    println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
-    // Link again after disabling as-needed to ensure symbols are resolved
-    println!("cargo:rustc-link-lib=dylib=pthreadpool");
-    println!("cargo:rustc-link-lib=dylib=tensorflowlite");
-    println!("cargo:rustc-link-lib=dylib=tensorflowlite_c");
-    // Duplicate link using link-arg to force placement at very end of command
-    println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-    println!(
-        "cargo:rustc-link-arg=-Wl,{}/libpthreadpool.a",
-        pthreadpool_dir.display()
-    );
-    println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-    println!("cargo:rustc-link-arg=-lcpuinfo");
-    println!("cargo:rustc-link-arg=-lpthreadpool");
-    println!("cargo:rustc-link-arg=-ltensorflowlite");
-
-    /* ------------------------------------------------------------------------
-       3.  Make `cargo run` work (debug & release) by copying/symlinking .so's
-           next to the produced binary inside target/{debug|release}/…
-    -------------------------------------------------------------------------*/
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    // ../.. = target/<triple>/<profile>
-    let bin_dir = out_dir
-        .ancestors()
-        .nth(3)
-        .expect("Failed to locate target profile directory");
-
-    let dest_dir = bin_dir.join("libs/linux-aarch64");
-    fs::create_dir_all(&dest_dir).expect("Creating libs/linux-aarch64 in target directory failed");
-
-    for lib in [&c_api, &cpp_api] {
-        let dest = dest_dir.join(lib.file_name().unwrap());
-
-        if needs_copy(&lib, &dest) {
-            // Prefer a symlink to save space; fall back to copy on failure
-            match unix_fs::symlink(&lib, &dest) {
-                Ok(_) => {}
-                Err(_) => {
-                    fs::copy(&lib, &dest)
-                        .unwrap_or_else(|e| panic!("Copying {} failed: {e}", lib.display()));
-                }
+        let lib_dir = match env::var("TFLITEC_PREBUILT_PATH_AARCH64_UNKNOWN_LINUX_GNU") {
+            Ok(path_str) => PathBuf::from(path_str),
+            Err(_) => {
+                // Default to our custom libraries directory (not the file itself)
+                let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+                PathBuf::from(manifest_dir)
+                    .join("libs")
+                    .join("linux-aarch64")
             }
+        };
+
+        let tflite_lib_path = lib_dir.join("libtensorflowlite_c.so");
+
+        println!("cargo:warning=🔍 Debug: lib_dir = {}", lib_dir.display());
+        println!(
+            "cargo:warning=🔍 Debug: tflite_lib_path = {}",
+            tflite_lib_path.display()
+        );
+        println!(
+            "cargo:warning=🔍 Debug: tflite_lib_path.exists() = {}",
+            tflite_lib_path.exists()
+        );
+
+        if tflite_lib_path.exists() {
+            println!(
+                "cargo:warning=📚 Using custom TensorFlow Lite library: {}",
+                tflite_lib_path.display()
+            );
+
+            // Tell tflitec to use our custom library
+            println!("cargo:warning=🔍 Debug: Setting TFLITEC_PREBUILT_PATH_AARCH64_UNKNOWN_LINUX_GNU = {}", tflite_lib_path.display());
+            env::set_var(
+                "TFLITEC_PREBUILT_PATH_AARCH64_UNKNOWN_LINUX_GNU",
+                &tflite_lib_path,
+            );
+
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+            // Link the supporting XNNPACK libraries
+            if lib_dir.join("libcpuinfo.so").exists() {
+                println!("cargo:rustc-link-lib=cpuinfo");
+                println!("cargo:warning=🔗 Linking custom libcpuinfo.so");
+            }
+
+            if lib_dir.join("libpthreadpool.so").exists() {
+                println!("cargo:rustc-link-lib=pthreadpool");
+                println!("cargo:warning=🔗 Linking custom libpthreadpool.so");
+            }
+        } else {
+            println!("cargo:warning=⚠️  Custom TensorFlow Lite library not found at {}, tflitec will build from source", tflite_lib_path.display());
         }
     }
 
-    // Remove all pthreadpool/cpuinfo .so copy logic
+    // Set up custom TensorFlow Lite library for tflitec on macOS
+    if target_os == "macos" {
+        println!("cargo:warning=🔍 macOS detected - using custom TensorFlow Lite libraries");
 
-    let deps_dir = bin_dir.join("deps/libs/linux-aarch64");
-    fs::create_dir_all(&deps_dir).ok();
+        let arch_dir = if target_arch == "aarch64" {
+            "darwin-aarch64"
+        } else {
+            "darwin-x86_64"
+        };
 
-    for lib in [&c_api, &cpp_api] {
-        let dest = deps_dir.join(lib.file_name().unwrap());
-        if needs_copy(&lib, &dest) {
-            match unix_fs::symlink(&lib, &dest) {
-                Ok(_) => {}
-                Err(_) => {
-                    let _ = fs::copy(&lib, &dest);
-                }
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+        let lib_dir = PathBuf::from(manifest_dir).join("libs").join(arch_dir);
+
+        let tflite_lib_path = lib_dir.join("libtensorflowlite_c.dylib");
+
+        println!("cargo:warning=🔍 Debug: target_arch = {}", target_arch);
+        println!("cargo:warning=🔍 Debug: arch_dir = {}", arch_dir);
+        println!("cargo:warning=🔍 Debug: lib_dir = {}", lib_dir.display());
+        println!(
+            "cargo:warning=🔍 Debug: tflite_lib_path = {}",
+            tflite_lib_path.display()
+        );
+        println!(
+            "cargo:warning=🔍 Debug: tflite_lib_path.exists() = {}",
+            tflite_lib_path.exists()
+        );
+
+        if tflite_lib_path.exists() {
+            println!(
+                "cargo:warning=📚 Using custom TensorFlow Lite library: {}",
+                tflite_lib_path.display()
+            );
+
+            // Tell tflitec to use our custom library for macOS
+            let env_var = if target_arch == "aarch64" {
+                "TFLITEC_PREBUILT_PATH_AARCH64_APPLE_DARWIN"
+            } else {
+                "TFLITEC_PREBUILT_PATH_X86_64_APPLE_DARWIN"
+            };
+
+            println!(
+                "cargo:warning=🔍 Debug: Setting {} = {}",
+                env_var,
+                tflite_lib_path.display()
+            );
+            env::set_var(env_var, &tflite_lib_path);
+
+            // Also set the generic one for good measure
+            env::set_var("TFLITEC_PREBUILT_PATH", &tflite_lib_path);
+
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+            // Link the Metal delegate if available (for GPU acceleration)
+            if lib_dir
+                .join("libtensorflowlite_metal_delegate.dylib")
+                .exists()
+            {
+                println!("cargo:warning=🔗 Metal delegate available for GPU acceleration");
             }
+        } else {
+            println!("cargo:warning=⚠️  Custom TensorFlow Lite library not found at {}, tflitec will try to build from source", tflite_lib_path.display());
         }
-    }
-}
-
-/// Returns true if dest is missing or differs in size or mtime from src
-fn needs_copy(src: &Path, dest: &Path) -> bool {
-    match (src.metadata(), dest.metadata()) {
-        (Ok(s), Ok(d)) => s.len() != d.len() || s.modified().ok() != d.modified().ok(),
-        _ => true,
     }
 }
