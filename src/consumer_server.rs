@@ -299,13 +299,6 @@ impl ConsumerServer {
                 let capture_guard = audio_capture.lock().unwrap();
                 capture_guard.as_ref().and_then(|c| c.try_next_chunk())
             } {
-                // Process audio through VAD and get speech detection result
-                let speech_detected = Self::process_vad_for_chunk(
-                    &vad_processor,
-                    &audio_data,
-                    &client_id,
-                )?;
-
                 // Convert audio data to i16 samples for processing
                 let samples: Vec<i16> = audio_data
                     .chunks_exact(2)
@@ -313,10 +306,10 @@ impl ConsumerServer {
                     .collect();
 
                 if !samples.is_empty() {
-                    // Add samples to processing buffer
+                    // Add samples to processing buffer FIRST
                     audio_buffer.extend(samples.iter());
 
-                    // Check if we should run wakeword detection
+                    // Run wakeword detection BEFORE forwarding audio
                     let has_enough_samples = audio_buffer.len() >= DETECTION_WINDOW_SAMPLES;
                     let enough_time_passed = last_detection_time.elapsed()
                         >= Duration::from_millis(DETECTION_INTERVAL_MS);
@@ -347,10 +340,15 @@ impl ConsumerServer {
                     }
                 }
 
-                // Always forward the audio chunk to consumer with VAD result
-                let audio_msg = ConsumerMessage::Audio { 
-                    data: audio_data, 
-                    speech_detected 
+                // Process audio through VAD and get speech detection result
+                let speech_detected =
+                    Self::process_vad_for_chunk(&vad_processor, &audio_data, &client_id)?;
+
+                // Forward the audio chunk to consumer with VAD result
+                // (wakeword detection has already run and sent any detection messages)
+                let audio_msg = ConsumerMessage::Audio {
+                    data: audio_data,
+                    speech_detected,
                 };
                 if let Err(e) = connection.write_message(&audio_msg) {
                     log::warn!("❌ Failed to send audio to consumer {}: {}", client_id, e);
@@ -420,7 +418,7 @@ impl ConsumerServer {
                 }
             }
         }
-        
+
         Ok(chunk_has_speech)
     }
 
