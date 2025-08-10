@@ -74,6 +74,7 @@ pub enum ConsumerMessage {
     Audio {
         data: Vec<u8>,
         speech_detected: bool, // VAD result for this chunk
+        timestamp: u64,        // When this chunk was captured (ms since epoch)
     },
     WakewordDetected {
         model: String,
@@ -115,11 +116,13 @@ impl ConsumerMessage {
             ConsumerMessage::Audio {
                 data,
                 speech_detected,
+                timestamp,
             } => {
                 bytes.push(ConsumerMessageType::Audio as u8);
-                // Payload: [speech_detected: u8][data_length: u32][data: bytes]
-                let payload_len = 1 + 4 + data.len();
+                // Payload: [timestamp: u64][speech_detected: u8][data_length: u32][data: bytes]
+                let payload_len = 8 + 1 + 4 + data.len();
                 bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                bytes.extend_from_slice(&timestamp.to_le_bytes());
                 bytes.push(if *speech_detected { 1u8 } else { 0u8 });
                 bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(data);
@@ -151,22 +154,29 @@ impl ConsumerMessage {
                 Ok(ConsumerMessage::Error { message })
             }
             ConsumerMessageType::Audio => {
-                if payload.len() < 5 {
+                if payload.len() < 13 {
+                    // minimum: u64 + u8 + u32
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
 
-                let speech_detected = payload[0] != 0;
+                let timestamp = u64::from_le_bytes([
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
+                ]);
+                let speech_detected = payload[8] != 0;
                 let data_length =
-                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+                    u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]])
+                        as usize;
 
-                if payload.len() < 5 + data_length {
+                if payload.len() < 13 + data_length {
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
 
-                let data = payload[5..5 + data_length].to_vec();
+                let data = payload[13..13 + data_length].to_vec();
                 Ok(ConsumerMessage::Audio {
                     data,
                     speech_detected,
+                    timestamp,
                 })
             }
             ConsumerMessageType::WakewordDetected => {
@@ -415,6 +425,7 @@ mod tests {
         let msg = ConsumerMessage::Audio {
             data: audio_data.clone(),
             speech_detected: true,
+            timestamp: 1234567890,
         };
         let bytes = msg.to_bytes().unwrap();
 
@@ -430,9 +441,11 @@ mod tests {
             ConsumerMessage::Audio {
                 data,
                 speech_detected,
+                timestamp,
             } => {
                 assert_eq!(data, audio_data);
                 assert_eq!(speech_detected, true);
+                assert_eq!(timestamp, 1234567890);
             }
             _ => panic!("Expected Audio message"),
         }

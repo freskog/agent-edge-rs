@@ -84,13 +84,7 @@ impl ConsumerServer {
             self.config.bind_address
         );
 
-        // Signal handling
-        let should_stop = Arc::clone(&self.should_stop);
-        ctrlc::set_handler(move || {
-            log::info!("🛑 Consumer server received shutdown signal");
-            should_stop.store(true, Ordering::SeqCst);
-        })
-        .ok();
+        // Note: Signal handling is done in main.rs via stop() method
 
         while !self.should_stop.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -155,7 +149,7 @@ impl ConsumerServer {
             let result = Self::consumer_thread(
                 stream,
                 addr.clone(),
-                should_stop,
+                should_stop.clone(),
                 consumer_connected.clone(),
                 audio_capture,
                 wakeword_model,
@@ -167,9 +161,21 @@ impl ConsumerServer {
             consumer_connected.store(false, Ordering::SeqCst);
 
             match result {
-                Ok(()) => log::info!("✅ Consumer {} disconnected cleanly", addr),
-                Err(e) => log::error!("❌ Consumer {} error: {}", addr, e),
+                Ok(()) => {
+                    log::info!("✅ Consumer {} disconnected cleanly - triggering server shutdown for clean restart", addr);
+                }
+                Err(e) => {
+                    log::error!(
+                        "❌ Consumer {} error: {} - triggering server shutdown for clean restart",
+                        addr,
+                        e
+                    );
+                }
             }
+
+            // Trigger server shutdown so systemd can restart with clean state
+            log::info!("🔄 Stopping server to allow systemd restart with fresh state");
+            should_stop.store(true, Ordering::SeqCst);
         });
     }
 
@@ -266,9 +272,11 @@ impl ConsumerServer {
         // Audio processing buffers (matching original wakeword logic)
         let mut audio_buffer = VecDeque::new();
         let mut last_detection_time = Instant::now();
+        let mut last_wakeword_time: Option<Instant> = None; // For debouncing
         const DETECTION_WINDOW_SAMPLES: usize = 5120; // 320ms at 16kHz
         const DETECTION_INTERVAL_MS: u64 = 160; // Run detection every 160ms
         const MAX_BUFFER_SAMPLES: usize = 16000; // 1 second at 16kHz
+        const WAKEWORD_DEBOUNCE_MS: u64 = 2000; // Don't detect same wake word for 2 seconds
 
         while !should_stop.load(Ordering::SeqCst) {
             // Get next audio chunk (blocking with timeout)
@@ -301,13 +309,17 @@ impl ConsumerServer {
                             .copied()
                             .collect();
 
-                        Self::process_wakeword_detection(
+                        if let Some(wakeword_timestamp) = Self::process_wakeword_detection(
                             &wakeword_model,
                             &detection_samples,
                             config.detection_threshold,
                             &mut connection,
                             &addr.to_string(),
-                        )?;
+                            &last_wakeword_time,
+                            WAKEWORD_DEBOUNCE_MS,
+                        )? {
+                            last_wakeword_time = Some(wakeword_timestamp);
+                        }
                         last_detection_time = Instant::now();
                     }
 
@@ -344,6 +356,7 @@ impl ConsumerServer {
                 let audio_msg = ConsumerMessage::Audio {
                     data: audio_data,
                     speech_detected,
+                    timestamp: ConsumerMessage::current_timestamp(),
                 };
                 if let Err(e) = connection.write_message(&audio_msg) {
                     log::warn!("❌ Failed to send audio to consumer {}: {}", addr, e);
@@ -365,19 +378,41 @@ impl ConsumerServer {
     }
 
     /// Process audio through wakeword detection and emit wakeword events
+    /// Returns Some(timestamp) if a wake word was detected and sent
     fn process_wakeword_detection(
         wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
         detection_samples: &[i16],
         threshold: f32,
         connection: &mut ConsumerConnection<TcpStream>,
         client_id: &str,
-    ) -> Result<(), ConsumerServerError> {
+        last_wakeword_time: &Option<Instant>,
+        debounce_ms: u64,
+    ) -> Result<Option<Instant>, ConsumerServerError> {
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
             match model.predict(detection_samples, None, 1.0) {
                 Ok(predictions) => {
                     // Check predictions against threshold
                     for (model_name, confidence) in predictions {
                         if confidence >= threshold {
+                            // Check debouncing - don't send wake word if we sent one recently
+                            let now = Instant::now();
+                            let should_debounce = if let Some(last_time) = last_wakeword_time {
+                                now.duration_since(*last_time).as_millis() < debounce_ms as u128
+                            } else {
+                                false
+                            };
+
+                            if should_debounce {
+                                log::debug!(
+                                    "🔇 [{}] Wake word '{}' debounced (confidence {:.6}) - last detection was {:.1}ms ago",
+                                    client_id,
+                                    model_name,
+                                    confidence,
+                                    last_wakeword_time.unwrap().elapsed().as_millis()
+                                );
+                                continue;
+                            }
+
                             log::info!(
                                 "🎯 [{}] WAKEWORD DETECTED: '{}' with confidence {:.6}",
                                 client_id,
@@ -395,6 +430,9 @@ impl ConsumerServer {
                                     client_id,
                                     e
                                 );
+                            } else {
+                                // Successfully sent wake word event
+                                return Ok(Some(now));
                             }
                         }
                     }
@@ -404,6 +442,6 @@ impl ConsumerServer {
                 }
             }
         }
-        Ok(())
+        Ok(None) // No wake word detected or sent
     }
 }

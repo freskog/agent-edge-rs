@@ -98,34 +98,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    // Create servers
-    let consumer_server = ConsumerServer::new(consumer_config);
-    let producer_server = ProducerServer::new(producer_config);
+    // Create servers wrapped in Arc for sharing
+    let consumer_server = Arc::new(ConsumerServer::new(consumer_config));
+    let producer_server = Arc::new(ProducerServer::new(producer_config));
 
     // Shared shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Clone server references for shutdown
+    let consumer_server_ref = Arc::clone(&consumer_server);
+    let producer_server_ref = Arc::clone(&producer_server);
 
     // Signal handling
     let shutdown_signal = Arc::clone(&shutdown);
     ctrlc::set_handler(move || {
         info!("🛑 Received shutdown signal");
         shutdown_signal.store(true, Ordering::SeqCst);
+
+        // Stop servers explicitly
+        consumer_server_ref.stop();
+        producer_server_ref.stop();
     })
     .expect("Error setting Ctrl-C handler");
 
     // Start consumer server in thread
+    let consumer_server_thread = Arc::clone(&consumer_server);
     let consumer_shutdown = Arc::clone(&shutdown);
     let consumer_handle = thread::spawn(move || {
-        if let Err(e) = consumer_server.run() {
+        if let Err(e) = consumer_server_thread.run() {
             error!("❌ Consumer server error: {}", e);
         }
         consumer_shutdown.store(true, Ordering::SeqCst);
     });
 
     // Start producer server in thread
+    let producer_server_thread = Arc::clone(&producer_server);
     let producer_shutdown = Arc::clone(&shutdown);
     let producer_handle = thread::spawn(move || {
-        if let Err(e) = producer_server.run() {
+        if let Err(e) = producer_server_thread.run() {
             error!("❌ Producer server error: {}", e);
         }
         producer_shutdown.store(true, Ordering::SeqCst);
@@ -137,6 +147,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("🛑 Shutting down servers...");
+
+    // Stop servers explicitly (same as Ctrl-C handler)
+    consumer_server.stop();
+    producer_server.stop();
 
     // Wait for threads to finish
     if let Err(e) = consumer_handle.join() {

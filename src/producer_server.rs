@@ -71,13 +71,7 @@ impl ProducerServer {
             self.config.bind_address
         );
 
-        // Signal handling
-        let should_stop = Arc::clone(&self.should_stop);
-        ctrlc::set_handler(move || {
-            log::info!("🛑 Producer server received shutdown signal");
-            should_stop.store(true, Ordering::SeqCst);
-        })
-        .ok();
+        // Note: Signal handling is done in main.rs via stop() method
 
         while !self.should_stop.load(Ordering::SeqCst) {
             match listener.accept() {

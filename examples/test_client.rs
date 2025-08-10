@@ -42,6 +42,7 @@ fn test_consumer() -> Result<(), Box<dyn std::error::Error>> {
             Ok(ConsumerMessage::Audio {
                 data,
                 speech_detected,
+                timestamp,
             }) => {
                 chunk_count += 1;
                 if speech_detected {
@@ -63,9 +64,10 @@ fn test_consumer() -> Result<(), Box<dyn std::error::Error>> {
                         (speech_count as f32 / chunk_count as f32) * 100.0
                     );
                     println!(
-                        "  🔍 Latest chunk: {} bytes, speech={}",
+                        "  🔍 Latest chunk: {} bytes, speech={}, timestamp={}",
                         data.len(),
-                        speech_detected
+                        speech_detected,
+                        timestamp
                     );
                 }
 

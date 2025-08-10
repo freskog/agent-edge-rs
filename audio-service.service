@@ -1,0 +1,28 @@
+[Unit]
+Description=Audio Service with Wake Word Detection
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=your-user
+Group=your-group
+WorkingDirectory=/path/to/agent-edge-rs
+ExecStart=/path/to/agent-edge-rs/target/release/audio
+Environment=RUST_LOG=info
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/path/to/agent-edge-rs
+
+# Resource limits
+LimitNOFILE=1024
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

@@ -174,6 +174,12 @@ impl VadProcessor {
         Ok(any_speech)
     }
 
+    /// Reset the VAD processor state (clear remainder buffer)
+    pub fn reset(&mut self) {
+        self.remainder_buffer.clear();
+        debug!("🎤 VAD processor state reset - remainder buffer cleared");
+    }
+
     /// Get current buffer state for debugging
     pub fn buffer_samples(&self) -> usize {
         self.remainder_buffer.len()
