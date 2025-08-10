@@ -167,8 +167,7 @@ impl ProducerServer {
     ) -> Result<(), ProducerServerError> {
         let mut connection = ProducerConnection::new(stream);
 
-        // Send Connected confirmation immediately (no subscribe required for producer)
-        connection.write_message(&ProducerMessage::Connected)?;
+        // No connection confirmation needed - client can start sending immediately
         log::info!("✅ Producer {} connected successfully", addr);
 
         // Initialize audio sink if not already running
@@ -219,7 +218,7 @@ impl ProducerServer {
                                 connection.write_message(&error_msg)?;
                             }
                         }
-                        ProducerMessage::Stop => {
+                        ProducerMessage::Stop { .. } => {
                             log::info!("🛑 Producer {} requested stop (abort playback)", addr);
 
                             // Abort current playback and clear queue
@@ -236,7 +235,7 @@ impl ProducerServer {
                                 }
                             }
                         }
-                        ProducerMessage::Connected | ProducerMessage::Error { .. } => {
+                        ProducerMessage::Error { .. } => {
                             // These are server-to-client messages, should not be received
                             log::warn!(
                                 "⚠️  Producer {} sent unexpected message: {:?}",

@@ -1,7 +1,7 @@
 use crate::audio_source::{AudioCapture, AudioCaptureConfig};
 use crate::protocol::{ConsumerConnection, ConsumerMessage, ProtocolError};
 use crate::wakeword_model::Model as WakewordModel;
-use crate::wakeword_vad::{AudioEvent, VadConfig, VadProcessor};
+use crate::wakeword_vad::{VadConfig, VadProcessor};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,31 +186,8 @@ impl ConsumerServer {
     ) -> Result<(), ConsumerServerError> {
         let mut connection = ConsumerConnection::new(stream);
 
-        // Read the subscribe message
-        let subscribe_msg = connection.read_message()?;
-        let client_id = match subscribe_msg {
-            ConsumerMessage::Subscribe { id } => {
-                log::info!("🎯 Consumer {} subscribed with ID: {}", addr, id);
-                id
-            }
-            _ => {
-                let error_msg = ConsumerMessage::Error {
-                    message: "Expected Subscribe message".to_string(),
-                };
-                connection.write_message(&error_msg)?;
-                return Err(ConsumerServerError::Protocol(
-                    ProtocolError::InvalidMessageType(0),
-                ));
-            }
-        };
-
-        // Send Connected confirmation
-        connection.write_message(&ConsumerMessage::Connected)?;
-        log::info!(
-            "✅ Consumer {} ({}) connected successfully",
-            addr,
-            client_id
-        );
+        // No subscription needed - client can start receiving immediately
+        log::info!("✅ Consumer {} connected successfully", addr);
 
         // Initialize audio capture if not already running
         {
@@ -283,7 +260,7 @@ impl ConsumerServer {
         // Stream audio chunks to consumer with wakeword detection and VAD processing
         log::info!(
             "🎵 Starting audio stream with wakeword detection for consumer {}",
-            client_id
+            addr
         );
 
         // Audio processing buffers (matching original wakeword logic)
@@ -329,7 +306,7 @@ impl ConsumerServer {
                             &detection_samples,
                             config.detection_threshold,
                             &mut connection,
-                            &client_id,
+                            &addr.to_string(),
                         )?;
                         last_detection_time = Instant::now();
                     }
@@ -341,8 +318,26 @@ impl ConsumerServer {
                 }
 
                 // Process audio through VAD and get speech detection result
-                let speech_detected =
-                    Self::process_vad_for_chunk(&vad_processor, &audio_data, &client_id)?;
+                let speech_detected = {
+                    let mut vad_guard = vad_processor.lock().unwrap();
+                    if let Some(ref mut vad) = vad_guard.as_mut() {
+                        match vad.analyze_chunk(&audio_data) {
+                            Ok(has_speech) => {
+                                if has_speech {
+                                    log::debug!("🗣️ [{}] Speech detected in chunk", addr);
+                                }
+                                has_speech
+                            }
+                            Err(e) => {
+                                log::warn!("⚠️ [{}] VAD processing error: {}", addr, e);
+                                false // Default to no speech on error
+                            }
+                        }
+                    } else {
+                        log::warn!("⚠️ [{}] VAD processor not initialized", addr);
+                        false
+                    }
+                };
 
                 // Forward the audio chunk to consumer with VAD result
                 // (wakeword detection has already run and sent any detection messages)
@@ -351,7 +346,7 @@ impl ConsumerServer {
                     speech_detected,
                 };
                 if let Err(e) = connection.write_message(&audio_msg) {
-                    log::warn!("❌ Failed to send audio to consumer {}: {}", client_id, e);
+                    log::warn!("❌ Failed to send audio to consumer {}: {}", addr, e);
                     break;
                 }
             } else {
@@ -360,66 +355,13 @@ impl ConsumerServer {
             }
         }
 
-        log::info!("🛑 Audio stream ended for consumer {}", client_id);
+        log::info!("🛑 Audio stream ended for consumer {}", addr);
         Ok(())
     }
 
     /// Stop the server
     pub fn stop(&self) {
         self.should_stop.store(true, Ordering::SeqCst);
-    }
-
-    /// Process audio through VAD and return speech detection result for this chunk
-    fn process_vad_for_chunk(
-        vad_processor: &Arc<Mutex<Option<VadProcessor>>>,
-        audio_data: &[u8],
-        client_id: &str,
-    ) -> Result<bool, ConsumerServerError> {
-        // Convert audio data to f32 samples for VAD processing
-        let f32_samples: Vec<f32> = audio_data
-            .chunks_exact(2)
-            .map(|chunk| {
-                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                sample as f32 / 32768.0 // Convert to [-1.0, 1.0] range
-            })
-            .collect();
-
-        let mut chunk_has_speech = false;
-
-        // Process in 512-sample chunks for VAD
-        for chunk_512 in f32_samples.chunks(512) {
-            if chunk_512.len() == 512 {
-                let mut samples_array = [0.0f32; 512];
-                samples_array.copy_from_slice(chunk_512);
-
-                // Process through VAD
-                if let Some(ref mut vad) = vad_processor.lock().unwrap().as_mut() {
-                    match vad.process_chunk(&samples_array) {
-                        Ok(AudioEvent::StartedAudio) => {
-                            log::info!("🗣️ [{}] Speech started", client_id);
-                            chunk_has_speech = true;
-                        }
-                        Ok(AudioEvent::StoppedAudio) => {
-                            log::info!("🔇 [{}] Speech stopped", client_id);
-                            // Note: We still consider this chunk as having speech since it detected the end
-                            chunk_has_speech = true;
-                        }
-                        Ok(AudioEvent::Audio) => {
-                            // Check current VAD state to determine if we're in speech or silence
-                            // For now, we'll assume this means ongoing speech if we're in the speech state
-                            if vad.current_state() == "speech" {
-                                chunk_has_speech = true;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("⚠️ [{}] VAD processing error: {}", client_id, e);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(chunk_has_speech)
     }
 
     /// Process audio through wakeword detection and emit wakeword events
@@ -443,8 +385,10 @@ impl ConsumerServer {
                                 confidence
                             );
 
-                            let wakeword_msg =
-                                ConsumerMessage::WakewordDetected { model: model_name };
+                            let wakeword_msg = ConsumerMessage::WakewordDetected {
+                                model: model_name,
+                                timestamp: ConsumerMessage::current_timestamp(),
+                            };
                             if let Err(e) = connection.write_message(&wakeword_msg) {
                                 log::warn!(
                                     "❌ Failed to send WakewordDetected to {}: {}",

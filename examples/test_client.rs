@@ -26,52 +26,55 @@ fn test_consumer() -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect("127.0.0.1:8080")?;
     let mut connection = ConsumerConnection::new(stream);
 
-    // Send Subscribe message
-    println!("  📨 Sending Subscribe message...");
-    let subscribe_msg = ConsumerMessage::Subscribe {
-        id: "test-client".to_string(),
-    };
-    connection.write_message(&subscribe_msg)?;
+    println!("  ✅ Consumer connected successfully!");
 
-    // Read Connected response
-    println!("  📥 Waiting for Connected response...");
-    match connection.read_message()? {
-        ConsumerMessage::Connected => {
-            println!("  ✅ Consumer connected successfully!");
-        }
-        ConsumerMessage::Error { message } => {
-            println!("  ❌ Consumer connection error: {}", message);
-            return Err(format!("Consumer error: {}", message).into());
-        }
-        other => {
-            println!("  ❌ Unexpected message: {:?}", other);
-            return Err("Unexpected response".into());
-        }
-    }
-
-    // Read a few audio chunks to verify streaming
-    println!("  🎵 Reading audio chunks for 2 seconds...");
+    // Read a few audio chunks to verify streaming and debug VAD
+    println!("  🎵 Reading audio chunks for 10 seconds...");
+    println!("  Legend: S=Speech detected, .=Silence, chunks shown every 100ms");
     let start_time = std::time::Instant::now();
     let mut chunk_count = 0;
+    let mut speech_count = 0;
+    let mut silence_count = 0;
 
-    while start_time.elapsed() < Duration::from_secs(2) {
+    while start_time.elapsed() < Duration::from_secs(10) {
         // Set a short timeout for reads
         match connection.read_message() {
-            Ok(ConsumerMessage::Audio { data, speech_detected }) => {
+            Ok(ConsumerMessage::Audio {
+                data,
+                speech_detected,
+            }) => {
                 chunk_count += 1;
                 if speech_detected {
                     print!("S"); // Speech detected
+                    speech_count += 1;
                 } else {
                     print!("."); // Silence
+                    silence_count += 1;
                 }
                 io::stdout().flush().unwrap();
 
-                if chunk_count >= 50 {
+                // Print stats every 50 chunks (roughly every 3.2 seconds at 16kHz)
+                if chunk_count % 50 == 0 {
+                    println!(
+                        "\n  📊 After {} chunks: {} speech, {} silence ({:.1}% speech)",
+                        chunk_count,
+                        speech_count,
+                        silence_count,
+                        (speech_count as f32 / chunk_count as f32) * 100.0
+                    );
+                    println!(
+                        "  🔍 Latest chunk: {} bytes, speech={}",
+                        data.len(),
+                        speech_detected
+                    );
+                }
+
+                if chunk_count >= 200 {
                     // Don't flood the output
                     break;
                 }
             }
-            Ok(ConsumerMessage::WakewordDetected { model }) => {
+            Ok(ConsumerMessage::WakewordDetected { model, .. }) => {
                 println!("\n  🎯 Wake word detected: {}", model);
             }
             Ok(other) => {
@@ -97,21 +100,7 @@ fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect("127.0.0.1:8081")?;
     let mut connection = ProducerConnection::new(stream);
 
-    // Read Connected response (producer sends this immediately)
-    println!("  📥 Waiting for Connected response...");
-    match connection.read_message()? {
-        ProducerMessage::Connected => {
-            println!("  ✅ Producer connected successfully!");
-        }
-        ProducerMessage::Error { message } => {
-            println!("  ❌ Producer connection error: {}", message);
-            return Err(format!("Producer error: {}", message).into());
-        }
-        other => {
-            println!("  ❌ Unexpected message: {:?}", other);
-            return Err("Unexpected response".into());
-        }
-    }
+    println!("  ✅ Producer connected successfully!");
 
     // Send some test audio data
     println!("  🎵 Sending test audio chunks...");
@@ -158,7 +147,9 @@ fn test_producer() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test stop command
     println!("  🛑 Testing Stop command...");
-    let stop_msg = ProducerMessage::Stop;
+    let stop_msg = ProducerMessage::Stop {
+        timestamp: ProducerMessage::current_timestamp(),
+    };
     connection.write_message(&stop_msg)?;
 
     println!("  ✅ Producer test completed!");

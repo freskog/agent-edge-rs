@@ -6,25 +6,21 @@ pub enum ProtocolError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Invalid message type: {0}")]
-    InvalidMessageType(u8),
-
     #[error("Invalid payload size: {0}")]
     InvalidPayloadSize(u32),
 
-    #[error("Invalid string encoding")]
-    InvalidString,
+    #[error("UTF-8 encoding error: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
+
+    #[error("Invalid message type: {0}")]
+    InvalidMessageType(u8),
 }
 
 /// Consumer message types (Port 8080)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConsumerMessageType {
-    // Client → Audio Crate
-    Subscribe = 0x01,
-
     // Audio Crate → Client
-    Connected = 0x10,
     Error = 0x11,
     Audio = 0x12,
     WakewordDetected = 0x15,
@@ -33,10 +29,8 @@ pub enum ConsumerMessageType {
 impl TryFrom<u8> for ConsumerMessageType {
     type Error = ProtocolError;
 
-    fn try_from(value: u8) -> Result<Self, <ConsumerMessageType as TryFrom<u8>>::Error> {
+    fn try_from(value: u8) -> Result<Self, ProtocolError> {
         match value {
-            0x01 => Ok(ConsumerMessageType::Subscribe),
-            0x10 => Ok(ConsumerMessageType::Connected),
             0x11 => Ok(ConsumerMessageType::Error),
             0x12 => Ok(ConsumerMessageType::Audio),
             0x15 => Ok(ConsumerMessageType::WakewordDetected),
@@ -54,18 +48,16 @@ pub enum ProducerMessageType {
     Stop = 0x21,
 
     // Audio Crate → Client
-    Connected = 0x30,
     Error = 0x31,
 }
 
 impl TryFrom<u8> for ProducerMessageType {
     type Error = ProtocolError;
 
-    fn try_from(value: u8) -> Result<Self, <ProducerMessageType as TryFrom<u8>>::Error> {
+    fn try_from(value: u8) -> Result<Self, ProtocolError> {
         match value {
             0x20 => Ok(ProducerMessageType::Play),
             0x21 => Ok(ProducerMessageType::Stop),
-            0x30 => Ok(ProducerMessageType::Connected),
             0x31 => Ok(ProducerMessageType::Error),
             _ => Err(ProtocolError::InvalidMessageType(value)),
         }
@@ -75,17 +67,18 @@ impl TryFrom<u8> for ProducerMessageType {
 /// Consumer protocol messages
 #[derive(Debug, Clone)]
 pub enum ConsumerMessage {
-    // Client → Audio Crate
-    Subscribe { id: String },
-
     // Audio Crate → Client
-    Connected,
-    Error { message: String },
-    Audio { 
-        data: Vec<u8>, 
-        speech_detected: bool,  // VAD result for this chunk
+    Error {
+        message: String,
     },
-    WakewordDetected { model: String },
+    Audio {
+        data: Vec<u8>,
+        speech_detected: bool, // VAD result for this chunk
+    },
+    WakewordDetected {
+        model: String,
+        timestamp: u64,
+    },
 }
 
 /// Producer protocol messages
@@ -93,47 +86,51 @@ pub enum ConsumerMessage {
 pub enum ProducerMessage {
     // Client → Audio Crate
     Play { data: Vec<u8> },
-    Stop,
+    Stop { timestamp: u64 },
 
     // Audio Crate → Client
-    Connected,
     Error { message: String },
 }
 
 impl ConsumerMessage {
+    /// Get current timestamp in milliseconds since epoch
+    pub fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
     /// Serialize message to binary format: [MessageType: u8][PayloadLength: u32][Payload: bytes]
     pub fn to_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         let mut bytes = Vec::new();
 
         match self {
-            ConsumerMessage::Subscribe { id } => {
-                bytes.push(ConsumerMessageType::Subscribe as u8);
-                let id_bytes = id.as_bytes();
-                bytes.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
-                bytes.extend_from_slice(id_bytes);
-            }
-            ConsumerMessage::Connected => {
-                bytes.push(ConsumerMessageType::Connected as u8);
-                bytes.extend_from_slice(&0u32.to_le_bytes()); // No payload
-            }
             ConsumerMessage::Error { message } => {
                 bytes.push(ConsumerMessageType::Error as u8);
                 let msg_bytes = message.as_bytes();
                 bytes.extend_from_slice(&(msg_bytes.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(msg_bytes);
             }
-            ConsumerMessage::Audio { data, speech_detected } => {
+            ConsumerMessage::Audio {
+                data,
+                speech_detected,
+            } => {
                 bytes.push(ConsumerMessageType::Audio as u8);
                 // Payload: [speech_detected: u8][data_length: u32][data: bytes]
-                let payload_len = 1 + 4 + data.len(); // 1 byte for bool + 4 bytes for length + data
+                let payload_len = 1 + 4 + data.len();
                 bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
                 bytes.push(if *speech_detected { 1u8 } else { 0u8 });
                 bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(data);
             }
-            ConsumerMessage::WakewordDetected { model } => {
+            ConsumerMessage::WakewordDetected { model, timestamp } => {
                 bytes.push(ConsumerMessageType::WakewordDetected as u8);
+                // Payload: [timestamp: u64][model_len: u32][model: bytes]
                 let model_bytes = model.as_bytes();
+                let payload_len = 8 + 4 + model_bytes.len(); // u64 + u32 + string
+                bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                bytes.extend_from_slice(&timestamp.to_le_bytes());
                 bytes.extend_from_slice(&(model_bytes.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(model_bytes);
             }
@@ -148,44 +145,70 @@ impl ConsumerMessage {
         payload: &[u8],
     ) -> Result<Self, ProtocolError> {
         match msg_type {
-            ConsumerMessageType::Subscribe => {
-                let id = String::from_utf8(payload.to_vec())
-                    .map_err(|_| ProtocolError::InvalidString)?;
-                Ok(ConsumerMessage::Subscribe { id })
-            }
-            ConsumerMessageType::Connected => Ok(ConsumerMessage::Connected),
             ConsumerMessageType::Error => {
                 let message = String::from_utf8(payload.to_vec())
-                    .map_err(|_| ProtocolError::InvalidString)?;
+                    .map_err(|_| ProtocolError::Utf8(std::str::from_utf8(payload).unwrap_err()))?;
                 Ok(ConsumerMessage::Error { message })
             }
             ConsumerMessageType::Audio => {
                 if payload.len() < 5 {
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
-                
-                // Parse: [speech_detected: u8][data_length: u32][data: bytes]
+
                 let speech_detected = payload[0] != 0;
-                let data_length = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
-                
+                let data_length =
+                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+
                 if payload.len() < 5 + data_length {
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
-                
+
                 let data = payload[5..5 + data_length].to_vec();
-                Ok(ConsumerMessage::Audio { data, speech_detected })
-            },
+                Ok(ConsumerMessage::Audio {
+                    data,
+                    speech_detected,
+                })
+            }
             ConsumerMessageType::WakewordDetected => {
-                let model = String::from_utf8(payload.to_vec())
-                    .map_err(|_| ProtocolError::InvalidString)?;
-                Ok(ConsumerMessage::WakewordDetected { model })
+                if payload.len() < 12 {
+                    // minimum: u64 + u32
+                    return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
+                }
+
+                let timestamp = u64::from_le_bytes([
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
+                ]);
+                let model_len =
+                    u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+
+                if payload.len() < 12 + model_len {
+                    return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
+                }
+
+                let model =
+                    String::from_utf8(payload[12..12 + model_len].to_vec()).map_err(|_| {
+                        ProtocolError::Utf8(
+                            std::str::from_utf8(&payload[12..12 + model_len]).unwrap_err(),
+                        )
+                    })?;
+
+                Ok(ConsumerMessage::WakewordDetected { model, timestamp })
             }
         }
     }
 }
 
 impl ProducerMessage {
-    /// Serialize message to binary format
+    /// Get current timestamp in milliseconds since epoch
+    pub fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Serialize message to binary format: [MessageType: u8][PayloadLength: u32][Payload: bytes]
     pub fn to_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         let mut bytes = Vec::new();
 
@@ -195,13 +218,10 @@ impl ProducerMessage {
                 bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(data);
             }
-            ProducerMessage::Stop => {
+            ProducerMessage::Stop { timestamp } => {
                 bytes.push(ProducerMessageType::Stop as u8);
-                bytes.extend_from_slice(&0u32.to_le_bytes()); // No payload
-            }
-            ProducerMessage::Connected => {
-                bytes.push(ProducerMessageType::Connected as u8);
-                bytes.extend_from_slice(&0u32.to_le_bytes()); // No payload
+                bytes.extend_from_slice(&8u32.to_le_bytes()); // payload size: u64
+                bytes.extend_from_slice(&timestamp.to_le_bytes());
             }
             ProducerMessage::Error { message } => {
                 bytes.push(ProducerMessageType::Error as u8);
@@ -223,11 +243,21 @@ impl ProducerMessage {
             ProducerMessageType::Play => Ok(ProducerMessage::Play {
                 data: payload.to_vec(),
             }),
-            ProducerMessageType::Stop => Ok(ProducerMessage::Stop),
-            ProducerMessageType::Connected => Ok(ProducerMessage::Connected),
+            ProducerMessageType::Stop => {
+                if payload.len() != 8 {
+                    return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
+                }
+
+                let timestamp = u64::from_le_bytes([
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
+                ]);
+
+                Ok(ProducerMessage::Stop { timestamp })
+            }
             ProducerMessageType::Error => {
                 let message = String::from_utf8(payload.to_vec())
-                    .map_err(|_| ProtocolError::InvalidString)?;
+                    .map_err(|_| ProtocolError::Utf8(std::str::from_utf8(payload).unwrap_err()))?;
                 Ok(ProducerMessage::Error { message })
             }
         }
@@ -262,13 +292,13 @@ impl<T: Read + Write> ConsumerConnection<T> {
             return Err(ProtocolError::InvalidPayloadSize(payload_size));
         }
 
-        // Read payload
+        // Read binary payload
         let mut payload = vec![0u8; payload_size as usize];
         if payload_size > 0 {
             self.stream.read_exact(&mut payload)?;
         }
 
-        // Deserialize message
+        // Deserialize message from binary format
         ConsumerMessage::from_bytes(message_type, &payload)
     }
 
@@ -308,13 +338,13 @@ impl<T: Read + Write> ProducerConnection<T> {
             return Err(ProtocolError::InvalidPayloadSize(payload_size));
         }
 
-        // Read payload
+        // Read binary payload
         let mut payload = vec![0u8; payload_size as usize];
         if payload_size > 0 {
             self.stream.read_exact(&mut payload)?;
         }
 
-        // Deserialize message
+        // Deserialize message from binary format
         ProducerMessage::from_bytes(message_type, &payload)
     }
 
@@ -332,34 +362,55 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_consumer_message_serialization() {
-        let msg = ConsumerMessage::Subscribe {
-            id: "test-client".to_string(),
+    fn test_consumer_message_binary_serialization() {
+        let msg = ConsumerMessage::Error {
+            message: "Test error".to_string(),
         };
         let bytes = msg.to_bytes().unwrap();
 
-        // Should be: [0x01][11][test-client]
-        assert_eq!(bytes[0], 0x01);
-        assert_eq!(
-            u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]),
-            11
-        );
-        assert_eq!(&bytes[5..], b"test-client");
+        // Binary format: [message_type: u8][payload_len: u32][payload_data]
+        assert_eq!(bytes[0], ConsumerMessageType::Error as u8);
+
+        // Test round-trip
+        let mut cursor = Cursor::new(bytes);
+        let mut connection = ConsumerConnection::new(cursor);
+        let parsed_msg = connection.read_message().unwrap();
+
+        match parsed_msg {
+            ConsumerMessage::Error { message } => {
+                assert_eq!(message, "Test error");
+            }
+            _ => panic!("Expected Error message"),
+        }
     }
 
     #[test]
-    fn test_consumer_connection() {
-        let msg = ConsumerMessage::Connected;
+    fn test_wakeword_detected_binary() {
+        let msg = ConsumerMessage::WakewordDetected {
+            model: "hey-jarvis".to_string(),
+            timestamp: 1234567890,
+        };
         let bytes = msg.to_bytes().unwrap();
 
-        let mut connection = ConsumerConnection::new(Cursor::new(bytes));
-        let received_msg = connection.read_message().unwrap();
+        // Should start with WakewordDetected message type
+        assert_eq!(bytes[0], ConsumerMessageType::WakewordDetected as u8);
 
-        matches!(received_msg, ConsumerMessage::Connected);
+        // Test round-trip
+        let mut cursor = Cursor::new(bytes);
+        let mut connection = ConsumerConnection::new(cursor);
+        let parsed_msg = connection.read_message().unwrap();
+
+        match parsed_msg {
+            ConsumerMessage::WakewordDetected { model, timestamp } => {
+                assert_eq!(model, "hey-jarvis");
+                assert_eq!(timestamp, 1234567890);
+            }
+            _ => panic!("Expected WakewordDetected message"),
+        }
     }
 
     #[test]
-    fn test_audio_message_with_speech_detection() {
+    fn test_audio_message_binary() {
         let audio_data = vec![1, 2, 3, 4, 5, 6];
         let msg = ConsumerMessage::Audio {
             data: audio_data.clone(),
@@ -367,15 +418,19 @@ mod tests {
         };
         let bytes = msg.to_bytes().unwrap();
 
-        // Parse the message back
-        let message_type = ConsumerMessageType::try_from(bytes[0]).unwrap();
-        let payload_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        let payload = &bytes[5..5 + payload_len];
-        
-        let parsed_msg = ConsumerMessage::from_bytes(message_type, payload).unwrap();
-        
+        // Should start with Audio message type
+        assert_eq!(bytes[0], ConsumerMessageType::Audio as u8);
+
+        // Test round-trip
+        let mut cursor = Cursor::new(bytes);
+        let mut connection = ConsumerConnection::new(cursor);
+        let parsed_msg = connection.read_message().unwrap();
+
         match parsed_msg {
-            ConsumerMessage::Audio { data, speech_detected } => {
+            ConsumerMessage::Audio {
+                data,
+                speech_detected,
+            } => {
                 assert_eq!(data, audio_data);
                 assert_eq!(speech_detected, true);
             }
@@ -384,44 +439,82 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_message_without_speech() {
+    fn test_producer_message_binary() {
         let audio_data = vec![7, 8, 9, 10];
-        let msg = ConsumerMessage::Audio {
-            data: audio_data.clone(),
-            speech_detected: false,
-        };
-        let bytes = msg.to_bytes().unwrap();
-
-        // Parse the message back
-        let message_type = ConsumerMessageType::try_from(bytes[0]).unwrap();
-        let payload_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        let payload = &bytes[5..5 + payload_len];
-        
-        let parsed_msg = ConsumerMessage::from_bytes(message_type, payload).unwrap();
-        
-        match parsed_msg {
-            ConsumerMessage::Audio { data, speech_detected } => {
-                assert_eq!(data, audio_data);
-                assert_eq!(speech_detected, false);
-            }
-            _ => panic!("Expected Audio message"),
-        }
-    }
-
-    #[test]
-    fn test_producer_message_serialization() {
-        let audio_data = vec![1, 2, 3, 4];
         let msg = ProducerMessage::Play {
             data: audio_data.clone(),
         };
         let bytes = msg.to_bytes().unwrap();
 
-        // Should be: [0x20][4][1,2,3,4]
-        assert_eq!(bytes[0], 0x20);
+        // Should start with Play message type
+        assert_eq!(bytes[0], ProducerMessageType::Play as u8);
+
+        // Test round-trip
+        let mut cursor = Cursor::new(bytes);
+        let mut connection = ProducerConnection::new(cursor);
+        let parsed_msg = connection.read_message().unwrap();
+
+        match parsed_msg {
+            ProducerMessage::Play { data } => {
+                assert_eq!(data, audio_data);
+            }
+            _ => panic!("Expected Play message"),
+        }
+    }
+
+    #[test]
+    fn test_producer_stop_binary() {
+        let msg = ProducerMessage::Stop {
+            timestamp: 9876543210,
+        };
+        let bytes = msg.to_bytes().unwrap();
+
+        // Should start with Stop message type
+        assert_eq!(bytes[0], ProducerMessageType::Stop as u8);
+
+        // Test round-trip
+        let mut cursor = Cursor::new(bytes);
+        let mut connection = ProducerConnection::new(cursor);
+        let parsed_msg = connection.read_message().unwrap();
+
+        match parsed_msg {
+            ProducerMessage::Stop { timestamp } => {
+                assert_eq!(timestamp, 9876543210);
+            }
+            _ => panic!("Expected Stop message"),
+        }
+    }
+
+    #[test]
+    fn test_message_type_conversions() {
+        // Test ConsumerMessageType conversions
         assert_eq!(
-            u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]),
-            4
+            ConsumerMessageType::try_from(0x11).unwrap(),
+            ConsumerMessageType::Error
         );
-        assert_eq!(&bytes[5..], &audio_data);
+        assert_eq!(
+            ConsumerMessageType::try_from(0x12).unwrap(),
+            ConsumerMessageType::Audio
+        );
+        assert_eq!(
+            ConsumerMessageType::try_from(0x15).unwrap(),
+            ConsumerMessageType::WakewordDetected
+        );
+        assert!(ConsumerMessageType::try_from(0xFF).is_err());
+
+        // Test ProducerMessageType conversions
+        assert_eq!(
+            ProducerMessageType::try_from(0x20).unwrap(),
+            ProducerMessageType::Play
+        );
+        assert_eq!(
+            ProducerMessageType::try_from(0x21).unwrap(),
+            ProducerMessageType::Stop
+        );
+        assert_eq!(
+            ProducerMessageType::try_from(0x31).unwrap(),
+            ProducerMessageType::Error
+        );
+        assert!(ProducerMessageType::try_from(0xFF).is_err());
     }
 }

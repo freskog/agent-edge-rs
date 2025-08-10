@@ -27,6 +27,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     python3-dev \
     # Additional dependencies
     libclang-dev \
+    cmake \
     tar \
     gzip \
     jq \
@@ -92,6 +93,18 @@ RUN echo 'force_color_prompt=yes' >> ~/.bashrc && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 RUN . $HOME/.cargo/env && rustup target add aarch64-unknown-linux-gnu
 RUN echo 'source "$HOME/.cargo/env"' >> ~/.bashrc
+
+# Configure cargo for better container reliability
+RUN . $HOME/.cargo/env && \
+    cargo --version && \
+    # Pre-warm cargo registry with a simple build
+    cargo new --bin temp_project && \
+    cd temp_project && \
+    echo 'thiserror = "2.0"' >> Cargo.toml && \
+    echo 'anyhow = "1.0"' >> Cargo.toml && \
+    cargo fetch && \
+    cd .. && \
+    rm -rf temp_project
 
 # Environment for dev tools
 ENV PATH="/home/${USERNAME}/.cargo/bin:${PATH}"

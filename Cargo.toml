@@ -18,6 +18,7 @@ ctrlc = "3.4"
 samplerate = "0.2"
 hound = "3.5"                                     # For reading wave files
 
+
 # Wakeword detection dependencies
 voice_activity_detector = "0.2.0"        # VAD processing
 tflitec = { path = "./tflitec-rs-fork" } # TensorFlow Lite models

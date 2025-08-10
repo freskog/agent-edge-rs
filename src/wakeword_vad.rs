@@ -5,50 +5,29 @@ use voice_activity_detector::VoiceActivityDetector;
 /// Configuration for Voice Activity Detection
 #[derive(Debug, Clone)]
 pub struct VadConfig {
-    /// Minimum duration of speech to consider it started (ms)
-    pub speech_start_threshold_ms: u64,
-    /// Minimum duration of silence to consider speech ended (ms)
-    pub speech_end_threshold_ms: u64,
     /// Sample rate (should match audio chunks)
     pub sample_rate: u32,
-    /// Chunk size for VAD processing
+    /// Chunk size for VAD processing (must be 512 for Silero VAD)
     pub chunk_size: usize,
+    /// Speech detection threshold (0.0 to 1.0)
+    pub speech_threshold: f32,
 }
 
 impl Default for VadConfig {
     fn default() -> Self {
         Self {
-            speech_start_threshold_ms: 200, // 200ms of speech to start
-            speech_end_threshold_ms: 800,   // 800ms of silence to end
-            sample_rate: 16000,             // 16kHz sample rate
-            chunk_size: 512,                // 32ms chunks at 16kHz (required by Silero VAD)
+            sample_rate: 16000,    // 16kHz sample rate
+            chunk_size: 512,       // 32ms chunks at 16kHz (required by Silero VAD)
+            speech_threshold: 0.5, // Default threshold for speech detection
         }
     }
 }
 
-/// Audio event types for wakeword service
-#[derive(Debug, Clone, PartialEq)]
-pub enum AudioEvent {
-    StartedAudio, // User started speaking
-    Audio,        // User is speaking
-    StoppedAudio, // User stopped speaking (End of Speech)
-}
-
-/// State for tracking speech/silence transitions
-#[derive(Debug, Clone, PartialEq)]
-enum VadState {
-    Silence,
-    Speech,
-}
-
-/// Voice Activity Detector with state management for speech/silence transitions
+/// Voice Activity Detector with buffering for 1280→512 sample processing
 pub struct VadProcessor {
     detector: VoiceActivityDetector,
     config: VadConfig,
-    current_state: VadState,
-    state_duration_ms: u64,
-    chunk_duration_ms: u64, // Duration of each audio chunk
-    speech_threshold: f32,  // Threshold for speech detection
+    remainder_buffer: Vec<f32>, // Buffer for samples that don't fit in 512-sample chunks
 }
 
 impl VadProcessor {
@@ -72,108 +51,131 @@ impl VadProcessor {
         Ok(Self {
             detector,
             config,
-            current_state: VadState::Silence,
-            state_duration_ms: 0,
-            chunk_duration_ms,
-            speech_threshold: 0.5, // Default threshold for speech detection
+            remainder_buffer: Vec::new(),
         })
     }
 
-    /// Process an audio chunk and return the appropriate AudioEvent
+    /// Analyze a 1280-sample audio chunk and return whether any speech was detected
+    ///
+    /// This method buffers samples across chunk boundaries to ensure all audio is processed
+    /// by the VAD in proper 512-sample windows with no overlap and no data loss.
     ///
     /// # Arguments
-    /// * `samples` - Audio samples as f32 in range [-1.0, 1.0] (512 samples for 16kHz)
+    /// * `audio_data` - Raw audio bytes (1280 samples * 2 bytes = 2560 bytes)
     ///
     /// # Returns
-    /// * `AudioEvent` indicating the state transition
-    pub fn process_chunk(&mut self, samples: &[f32; 512]) -> Result<AudioEvent, VadError> {
-        // Run VAD detection - the predict method expects an iterator of samples
-        let speech_probability = self.detector.predict(samples.iter().copied());
-
-        // Determine if speech is present based on threshold
-        let has_speech = speech_probability >= self.speech_threshold;
+    /// * `bool` - true if any speech was detected in this chunk, false otherwise
+    pub fn analyze_chunk(&mut self, audio_data: &[u8]) -> Result<bool, VadError> {
+        // Convert audio data to f32 samples for VAD processing
+        let new_samples: Vec<f32> = audio_data
+            .chunks_exact(2)
+            .map(|chunk| {
+                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                sample as f32 / 32768.0 // Convert to [-1.0, 1.0] range
+            })
+            .collect();
 
         debug!(
-            "🎤 VAD: speech_prob={:.3}, has_speech={}, current_state={:?}, duration={}ms",
-            speech_probability, has_speech, self.current_state, self.state_duration_ms
+            "🎤 VAD analyze_chunk: {} new samples, {} buffered samples",
+            new_samples.len(),
+            self.remainder_buffer.len()
         );
 
-        // Update state duration
-        self.state_duration_ms += self.chunk_duration_ms;
-
-        // Determine the appropriate AudioEvent based on state transitions
-        let audio_event = match (self.current_state.clone(), has_speech) {
-            // Currently in silence
-            (VadState::Silence, true) => {
-                // Speech detected in silence
-                if self.state_duration_ms >= self.config.speech_start_threshold_ms {
-                    // Sufficient duration to confirm speech started
-                    self.transition_to_speech();
-                    AudioEvent::StartedAudio
-                } else {
-                    // Not enough duration yet, stay in silence but increment counter
-                    AudioEvent::Audio // Treat as ongoing until confirmed
-                }
-            }
-            (VadState::Silence, false) => {
-                // Still in silence
-                AudioEvent::Audio // During transcription, silence is still "audio"
-            }
-            // Currently in speech
-            (VadState::Speech, false) => {
-                // Silence detected in speech
-                if self.state_duration_ms >= self.config.speech_end_threshold_ms {
-                    // Sufficient silence duration to confirm speech ended
-                    self.transition_to_silence();
-                    AudioEvent::StoppedAudio
-                } else {
-                    // Not enough silence yet, continue as speech
-                    AudioEvent::Audio
-                }
-            }
-            (VadState::Speech, true) => {
-                // Continuing speech
-                self.reset_state_duration(); // Reset silence counter
-                AudioEvent::Audio
-            }
-        };
-
-        debug!("🎤 VAD result: {:?}", audio_event);
-        Ok(audio_event)
-    }
-
-    /// Transition to speech state
-    fn transition_to_speech(&mut self) {
-        info!("🗣️ VAD: Speech started");
-        self.current_state = VadState::Speech;
-        self.state_duration_ms = 0;
-    }
-
-    /// Transition to silence state
-    fn transition_to_silence(&mut self) {
-        info!(
-            "🔇 VAD: Speech ended ({}ms of silence)",
-            self.state_duration_ms
-        );
-        self.current_state = VadState::Silence;
-        self.state_duration_ms = 0;
-    }
-
-    /// Reset state duration (used when continuing in current state)
-    fn reset_state_duration(&mut self) {
-        self.state_duration_ms = 0;
-    }
-
-    /// Get current VAD state for debugging
-    pub fn current_state(&self) -> &str {
-        match self.current_state {
-            VadState::Speech => "speech",
-            VadState::Silence => "silence",
+        // Sanity check: we expect 1280 samples (2560 bytes / 2)
+        if new_samples.len() != 1280 {
+            debug!(
+                "⚠️ VAD unexpected chunk size: got {} samples, expected 1280",
+                new_samples.len()
+            );
         }
+
+        let mut any_speech = false;
+        let mut processed_offset = 0;
+
+        // If we have remainder from previous chunk, process it first
+        if !self.remainder_buffer.is_empty() {
+            // Calculate how many samples we need to complete a 512-sample chunk
+            let samples_needed = 512 - self.remainder_buffer.len();
+
+            // Check if we have enough new samples
+            if new_samples.len() >= samples_needed {
+                // We have enough samples to complete a full 512-sample chunk
+                let mut combined = self.remainder_buffer.clone();
+                combined.extend(&new_samples[0..samples_needed]);
+
+                debug!(
+                    "🎤 VAD processing combined chunk: {} remainder + {} new = 512 samples",
+                    self.remainder_buffer.len(),
+                    samples_needed
+                );
+
+                // Process the combined 512-sample chunk
+                let speech_prob = self.detector.predict(combined.iter().copied());
+                let has_speech = speech_prob >= self.config.speech_threshold;
+
+                debug!(
+                    "🎤 VAD combined chunk: speech_prob={:.3}, has_speech={}",
+                    speech_prob, has_speech
+                );
+
+                if has_speech {
+                    any_speech = true;
+                }
+
+                processed_offset = samples_needed; // Skip samples we just processed
+                self.remainder_buffer.clear(); // Buffer is now empty
+            } else {
+                // Not enough new samples to complete a chunk, just add them to the buffer
+                self.remainder_buffer.extend(&new_samples);
+                debug!(
+                    "🎤 VAD insufficient samples: {} remainder + {} new = {} total (need 512)",
+                    self.remainder_buffer.len() - new_samples.len(),
+                    new_samples.len(),
+                    self.remainder_buffer.len()
+                );
+
+                // All samples are now in the buffer, nothing more to process
+                return Ok(any_speech);
+            }
+        }
+
+        // Process remaining complete 512-sample chunks from new samples
+        let remaining_samples = &new_samples[processed_offset..];
+        for (i, chunk_512) in remaining_samples.chunks_exact(512).enumerate() {
+            let speech_prob = self.detector.predict(chunk_512.iter().copied());
+            let has_speech = speech_prob >= self.config.speech_threshold;
+
+            debug!(
+                "🎤 VAD chunk {}: speech_prob={:.3}, has_speech={}",
+                i, speech_prob, has_speech
+            );
+
+            if has_speech {
+                any_speech = true;
+            }
+        }
+
+        // Save any remainder for next chunk
+        let remainder = remaining_samples.chunks_exact(512).remainder();
+        if !remainder.is_empty() {
+            self.remainder_buffer = remainder.to_vec();
+            debug!(
+                "🎤 VAD buffering {} samples for next chunk",
+                remainder.len()
+            );
+        }
+
+        debug!(
+            "🎤 VAD result: any_speech={}, processed {} total samples",
+            any_speech,
+            new_samples.len()
+        );
+
+        Ok(any_speech)
     }
 
-    /// Get current state duration for debugging
-    pub fn state_duration_ms(&self) -> u64 {
-        self.state_duration_ms
+    /// Get current buffer state for debugging
+    pub fn buffer_samples(&self) -> usize {
+        self.remainder_buffer.len()
     }
 }
