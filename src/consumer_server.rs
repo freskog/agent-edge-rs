@@ -2,6 +2,7 @@ use crate::audio_source::{AudioCapture, AudioCaptureConfig};
 use crate::protocol::{ConsumerConnection, ConsumerMessage, ProtocolError};
 use crate::wakeword_model::Model as WakewordModel;
 use crate::wakeword_vad::{VadConfig, VadProcessor};
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,23 @@ pub enum ConsumerServerError {
 
     #[error("Consumer already connected")]
     ConsumerAlreadyConnected,
+}
+
+/// Paired audio chunk with detection results
+#[derive(Debug, Clone)]
+pub struct AudioDetectionPair {
+    pub audio_data: Vec<u8>,
+    pub speech_detected: bool,
+    pub wakeword_event: Option<WakewordEvent>,
+    pub timestamp: u64,
+}
+
+/// Wakeword detection event
+#[derive(Debug, Clone)]
+pub struct WakewordEvent {
+    pub model: String,
+    pub confidence: f32,
+    pub timestamp: u64,
 }
 
 /// Configuration for the consumer server
@@ -55,6 +73,7 @@ pub struct ConsumerServer {
     audio_capture: Arc<Mutex<Option<AudioCapture>>>,
     wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
     vad_processor: Arc<Mutex<Option<VadProcessor>>>,
+    detection_sender: Option<Sender<AudioDetectionPair>>,
 }
 
 impl ConsumerServer {
@@ -66,7 +85,42 @@ impl ConsumerServer {
             audio_capture: Arc::new(Mutex::new(None)),
             wakeword_model: Arc::new(Mutex::new(None)),
             vad_processor: Arc::new(Mutex::new(None)),
+            detection_sender: None,
         }
+    }
+
+    /// Start the detection thread and return the receiver for audio-detection pairs
+    fn start_detection_thread(&self) -> Result<Receiver<AudioDetectionPair>, ConsumerServerError> {
+        // Create bounded channel for audio-detection pairs (1-2 seconds of audio buffer)
+        let capacity = 100; // ~3 seconds at ~30 chunks/sec
+        let (sender, receiver) = crossbeam_channel::bounded(capacity);
+
+        // Clone resources for detection thread
+        let should_stop = Arc::clone(&self.should_stop);
+        let consumer_connected = Arc::clone(&self.consumer_connected);
+        let audio_capture = Arc::clone(&self.audio_capture);
+        let wakeword_model = Arc::clone(&self.wakeword_model);
+        let vad_processor = Arc::clone(&self.vad_processor);
+        let config = self.config.clone();
+
+        // Start detection thread
+        thread::spawn(move || {
+            let result = Self::detection_thread(
+                should_stop,
+                consumer_connected,
+                audio_capture,
+                wakeword_model,
+                vad_processor,
+                config,
+                sender,
+            );
+
+            if let Err(e) = result {
+                log::error!("❌ Detection thread failed: {}", e);
+            }
+        });
+
+        Ok(receiver)
     }
 
     /// Start the consumer server (blocking)
@@ -75,6 +129,10 @@ impl ConsumerServer {
             "🎯 Starting Consumer TCP server on {}",
             self.config.bind_address
         );
+
+        // Start detection thread first (runs independently)
+        let detection_receiver = self.start_detection_thread()?;
+        log::info!("✅ Detection thread started");
 
         let listener = TcpListener::bind(&self.config.bind_address)?;
         listener.set_nonblocking(true)?;
@@ -99,7 +157,7 @@ impl ConsumerServer {
                     }
 
                     // Handle the consumer connection
-                    self.handle_consumer(stream, addr.to_string());
+                    self.handle_consumer(stream, addr.to_string(), &detection_receiver);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No connection available, sleep and continue
@@ -132,18 +190,284 @@ impl ConsumerServer {
         // Connection will be dropped when this function returns
     }
 
+    /// Detection thread that processes audio and generates detection events
+    fn detection_thread(
+        should_stop: Arc<AtomicBool>,
+        consumer_connected: Arc<AtomicBool>,
+        audio_capture: Arc<Mutex<Option<AudioCapture>>>,
+        wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
+        vad_processor: Arc<Mutex<Option<VadProcessor>>>,
+        config: ConsumerServerConfig,
+        sender: Sender<AudioDetectionPair>,
+    ) -> Result<(), ConsumerServerError> {
+        // Initialize audio capture
+        {
+            let mut capture_guard = audio_capture.lock().unwrap();
+            if capture_guard.is_none() {
+                log::info!("🎤 Initializing audio capture for detection");
+                match AudioCapture::new(config.audio_capture_config.clone()) {
+                    Ok(capture) => {
+                        *capture_guard = Some(capture);
+                    }
+                    Err(e) => {
+                        return Err(ConsumerServerError::Audio(e.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Initialize wakeword model
+        {
+            let mut model_guard = wakeword_model.lock().unwrap();
+            if model_guard.is_none() {
+                log::info!("🎯 Initializing wakeword model for detection");
+                match WakewordModel::new(config.wakeword_models.clone(), vec![]) {
+                    Ok(model) => {
+                        *model_guard = Some(model);
+                        log::info!(
+                            "✅ Wakeword model loaded with {} models",
+                            config.wakeword_models.len()
+                        );
+                    }
+                    Err(e) => {
+                        return Err(ConsumerServerError::Audio(format!(
+                            "Wakeword model error: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Initialize VAD processor
+        {
+            let mut vad_guard = vad_processor.lock().unwrap();
+            if vad_guard.is_none() {
+                log::info!("🎤 Initializing VAD processor for detection");
+                match VadProcessor::new(config.vad_config.clone()) {
+                    Ok(vad) => {
+                        *vad_guard = Some(vad);
+                        log::info!("✅ VAD processor initialized");
+                    }
+                    Err(e) => {
+                        return Err(ConsumerServerError::Audio(format!("VAD error: {}", e)));
+                    }
+                }
+            }
+        }
+
+        log::info!("🎵 Starting audio detection processing");
+
+        // Audio processing buffers and performance tracking
+        let mut audio_buffer = VecDeque::new();
+        let mut last_detection_time = Instant::now();
+        let mut last_wakeword_time: Option<Instant> = None;
+        let mut detection_attempts = 0u64;
+        let mut audio_chunks_processed = 0u64;
+        let start_time = Instant::now();
+        let mut dropped_pairs = 0u64;
+
+        const DETECTION_WINDOW_SAMPLES: usize = 5120; // 320ms at 16kHz
+        const DETECTION_INTERVAL_MS: u64 = 160; // Run detection every 160ms
+        const MAX_BUFFER_SAMPLES: usize = 16000; // 1 second at 16kHz
+        const WAKEWORD_DEBOUNCE_MS: u64 = 3000; // Don't detect same wake word for 3 seconds
+
+        while !should_stop.load(Ordering::SeqCst) {
+            // Get next audio chunk
+            if let Some(audio_data) = {
+                let capture_guard = audio_capture.lock().unwrap();
+                capture_guard.as_ref().and_then(|c| c.try_next_chunk())
+            } {
+                // Convert audio data to i16 samples for processing
+                let samples: Vec<i16> = audio_data
+                    .chunks_exact(2)
+                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+
+                if !samples.is_empty() {
+                    audio_buffer.extend(samples.iter());
+                    audio_chunks_processed += 1;
+
+                    // Run wakeword detection
+                    let has_enough_samples = audio_buffer.len() >= DETECTION_WINDOW_SAMPLES;
+                    let enough_time_passed = last_detection_time.elapsed()
+                        >= Duration::from_millis(DETECTION_INTERVAL_MS);
+
+                    let mut wakeword_event = None;
+                    if has_enough_samples && enough_time_passed {
+                        let buffer_len = audio_buffer.len();
+                        let start_idx = buffer_len.saturating_sub(DETECTION_WINDOW_SAMPLES);
+                        let detection_samples: Vec<i16> =
+                            audio_buffer.range(start_idx..).copied().collect();
+
+                        detection_attempts += 1;
+
+                        // Log performance stats every 100 detection attempts
+                        if detection_attempts % 100 == 0 {
+                            let elapsed = start_time.elapsed();
+                            log::info!(
+                                "📊 [Detection] Performance stats: {} detections in {:.1}s, {} audio chunks, rate={:.1} detections/min, dropped={}",
+                                detection_attempts,
+                                elapsed.as_secs_f64(),
+                                audio_chunks_processed,
+                                (detection_attempts as f64) / elapsed.as_secs_f64() * 60.0,
+                                dropped_pairs
+                            );
+                        }
+
+                        if let Some(detection) = Self::process_wakeword_detection_standalone(
+                            &wakeword_model,
+                            &detection_samples,
+                            config.detection_threshold,
+                            &last_wakeword_time,
+                            WAKEWORD_DEBOUNCE_MS,
+                        )? {
+                            wakeword_event = Some(detection.0);
+                            last_wakeword_time = Some(detection.1);
+                        }
+                        last_detection_time = Instant::now();
+                    }
+
+                    // Keep buffer from growing too large
+                    while audio_buffer.len() > MAX_BUFFER_SAMPLES {
+                        audio_buffer.pop_front();
+                    }
+
+                    // Process audio through VAD
+                    let speech_detected = {
+                        let mut vad_guard = vad_processor.lock().unwrap();
+                        if let Some(ref mut vad) = vad_guard.as_mut() {
+                            match vad.analyze_chunk(&audio_data) {
+                                Ok(has_speech) => has_speech,
+                                Err(e) => {
+                                    log::warn!("⚠️ VAD processing error: {}", e);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    // Create audio-detection pair
+                    let pair = AudioDetectionPair {
+                        audio_data,
+                        speech_detected,
+                        wakeword_event,
+                        timestamp: ConsumerMessage::current_timestamp(),
+                    };
+
+                    // Send to consumer only if consumer is connected
+                    if consumer_connected.load(Ordering::SeqCst) {
+                        match sender.try_send(pair) {
+                            Ok(()) => {
+                                // Successfully sent
+                            }
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                dropped_pairs += 1;
+                                if dropped_pairs % 10 == 0 {
+                                    log::warn!("⚠️ [Detection] Backpressure: dropped {} audio pairs, consumer lagging", dropped_pairs);
+                                }
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                log::debug!(
+                                    "🔌 Detection thread: consumer disconnected during send"
+                                );
+                            }
+                        }
+                    } else {
+                        // No consumer connected - detection runs "into the void"
+                        // This is exactly what we want for testing isolation
+                        if dropped_pairs % 100 == 0 && dropped_pairs > 0 {
+                            log::debug!(
+                                "🔌 [Detection] Running without consumer (no backpressure)"
+                            );
+                        }
+                    }
+                }
+            } else {
+                // No audio available, sleep briefly
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        log::info!("🛑 Detection thread ended");
+        Ok(())
+    }
+
+    /// Process wakeword detection without consumer connection (standalone)
+    /// Returns (WakewordEvent, timestamp) if a wake word was detected
+    fn process_wakeword_detection_standalone(
+        wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
+        detection_samples: &[i16],
+        threshold: f32,
+        last_wakeword_time: &Option<Instant>,
+        debounce_ms: u64,
+    ) -> Result<Option<(WakewordEvent, Instant)>, ConsumerServerError> {
+        if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
+            match model.predict(detection_samples, None, 1.0) {
+                Ok(predictions) => {
+                    // Check predictions against threshold
+                    for (model_name, confidence) in predictions {
+                        if confidence >= threshold {
+                            // Check debouncing - don't send wake word if we sent one recently
+                            let now = Instant::now();
+                            let should_debounce = if let Some(last_time) = last_wakeword_time {
+                                now.duration_since(*last_time).as_millis() < debounce_ms as u128
+                            } else {
+                                false
+                            };
+
+                            if should_debounce {
+                                log::debug!(
+                                    "🔇 [Detection] Wake word '{}' debounced (confidence {:.6}) - last detection was {:.1}ms ago",
+                                    model_name,
+                                    confidence,
+                                    last_wakeword_time.unwrap().elapsed().as_millis()
+                                );
+                                continue;
+                            }
+
+                            log::info!(
+                                "🎯 [Detection] WAKEWORD DETECTED: '{}' with confidence {:.6}",
+                                model_name,
+                                confidence
+                            );
+
+                            let wakeword_event = WakewordEvent {
+                                model: model_name,
+                                confidence,
+                                timestamp: ConsumerMessage::current_timestamp(),
+                            };
+
+                            return Ok(Some((wakeword_event, now)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[Detection] Wakeword detection failed: {}", e);
+                }
+            }
+        }
+        Ok(None) // No wake word detected
+    }
+
     /// Handle a single consumer connection
-    fn handle_consumer(&self, stream: TcpStream, addr: String) {
+    fn handle_consumer(
+        &self,
+        stream: TcpStream,
+        addr: String,
+        detection_receiver: &Receiver<AudioDetectionPair>,
+    ) {
         // Mark consumer as connected
         self.consumer_connected.store(true, Ordering::SeqCst);
 
         // Spawn thread to handle this consumer
         let should_stop = Arc::clone(&self.should_stop);
         let consumer_connected = Arc::clone(&self.consumer_connected);
-        let audio_capture = Arc::clone(&self.audio_capture);
-        let wakeword_model = Arc::clone(&self.wakeword_model);
-        let vad_processor = Arc::clone(&self.vad_processor);
-        let config = self.config.clone();
+
+        // Clone the detection receiver for the consumer thread
+        let detection_receiver_clone = detection_receiver.clone();
 
         thread::spawn(move || {
             let result = Self::consumer_thread(
@@ -151,10 +475,7 @@ impl ConsumerServer {
                 addr.clone(),
                 should_stop.clone(),
                 consumer_connected.clone(),
-                audio_capture,
-                wakeword_model,
-                vad_processor,
-                config,
+                detection_receiver_clone,
             );
 
             // Always mark consumer as disconnected when thread exits
@@ -185,190 +506,104 @@ impl ConsumerServer {
         addr: String,
         should_stop: Arc<AtomicBool>,
         _consumer_connected: Arc<AtomicBool>,
-        audio_capture: Arc<Mutex<Option<AudioCapture>>>,
-        wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
-        vad_processor: Arc<Mutex<Option<VadProcessor>>>,
-        config: ConsumerServerConfig,
+        detection_receiver: Receiver<AudioDetectionPair>,
     ) -> Result<(), ConsumerServerError> {
         let mut connection = ConsumerConnection::new(stream);
 
         // No subscription needed - client can start receiving immediately
         log::info!("✅ Consumer {} connected successfully", addr);
 
-        // Initialize audio capture if not already running
-        {
-            let mut capture_guard = audio_capture.lock().unwrap();
-            if capture_guard.is_none() {
-                log::info!("🎤 Initializing audio capture for consumer");
-                match AudioCapture::new(config.audio_capture_config.clone()) {
-                    Ok(capture) => {
-                        *capture_guard = Some(capture);
-                    }
-                    Err(e) => {
-                        let error_msg = ConsumerMessage::Error {
-                            message: format!("Failed to initialize audio capture: {}", e),
-                        };
-                        connection.write_message(&error_msg)?;
-                        return Err(ConsumerServerError::Audio(e.to_string()));
-                    }
-                }
-            }
-        }
-
-        // Initialize wakeword model if not already running
-        {
-            let mut model_guard = wakeword_model.lock().unwrap();
-            if model_guard.is_none() {
-                log::info!("🎯 Initializing wakeword model for consumer");
-                match WakewordModel::new(config.wakeword_models.clone(), vec![]) {
-                    Ok(model) => {
-                        *model_guard = Some(model);
-                        log::info!(
-                            "✅ Wakeword model loaded with {} models",
-                            config.wakeword_models.len()
-                        );
-                    }
-                    Err(e) => {
-                        let error_msg = ConsumerMessage::Error {
-                            message: format!("Failed to initialize wakeword model: {}", e),
-                        };
-                        connection.write_message(&error_msg)?;
-                        return Err(ConsumerServerError::Audio(format!(
-                            "Wakeword model error: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Initialize VAD processor if not already running
-        {
-            let mut vad_guard = vad_processor.lock().unwrap();
-            if vad_guard.is_none() {
-                log::info!("🎤 Initializing VAD processor for consumer");
-                match VadProcessor::new(config.vad_config.clone()) {
-                    Ok(vad) => {
-                        *vad_guard = Some(vad);
-                        log::info!("✅ VAD processor initialized");
-                    }
-                    Err(e) => {
-                        let error_msg = ConsumerMessage::Error {
-                            message: format!("Failed to initialize VAD processor: {}", e),
-                        };
-                        connection.write_message(&error_msg)?;
-                        return Err(ConsumerServerError::Audio(format!("VAD error: {}", e)));
-                    }
-                }
-            }
-        }
-
-        // Stream audio chunks to consumer with wakeword detection and VAD processing
         log::info!(
-            "🎵 Starting audio stream with wakeword detection for consumer {}",
+            "🎵 Starting channel-based audio streaming for consumer {}",
             addr
         );
 
-        // Audio processing buffers (matching original wakeword logic)
-        let mut audio_buffer = VecDeque::new();
-        let mut last_detection_time = Instant::now();
-        let mut last_wakeword_time: Option<Instant> = None; // For debouncing
-        const DETECTION_WINDOW_SAMPLES: usize = 5120; // 320ms at 16kHz
-        const DETECTION_INTERVAL_MS: u64 = 160; // Run detection every 160ms
-        const MAX_BUFFER_SAMPLES: usize = 16000; // 1 second at 16kHz
-        const WAKEWORD_DEBOUNCE_MS: u64 = 2000; // Don't detect same wake word for 2 seconds
+        let mut received_pairs = 0u64;
+        let mut sent_audio = 0u64;
+        let mut sent_wakewords = 0u64;
+        let mut dropped_by_consumer = 0u64;
+        let start_time = Instant::now();
 
         while !should_stop.load(Ordering::SeqCst) {
-            // Get next audio chunk (blocking with timeout)
-            if let Some(audio_data) = {
-                let capture_guard = audio_capture.lock().unwrap();
-                capture_guard.as_ref().and_then(|c| c.try_next_chunk())
-            } {
-                // Convert audio data to i16 samples for processing
-                let samples: Vec<i16> = audio_data
-                    .chunks_exact(2)
-                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-                    .collect();
+            // Receive audio-detection pairs from detection thread
+            match detection_receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(pair) => {
+                    received_pairs += 1;
 
-                if !samples.is_empty() {
-                    // Add samples to processing buffer FIRST
-                    audio_buffer.extend(samples.iter());
+                    // Send audio chunk to consumer
+                    let audio_msg = ConsumerMessage::Audio {
+                        data: pair.audio_data,
+                        speech_detected: pair.speech_detected,
+                        timestamp: pair.timestamp,
+                    };
 
-                    // Run wakeword detection BEFORE forwarding audio
-                    let has_enough_samples = audio_buffer.len() >= DETECTION_WINDOW_SAMPLES;
-                    let enough_time_passed = last_detection_time.elapsed()
-                        >= Duration::from_millis(DETECTION_INTERVAL_MS);
-
-                    if has_enough_samples && enough_time_passed {
-                        // Run wakeword detection on recent window
-                        let detection_samples: Vec<i16> = audio_buffer
-                            .iter()
-                            .rev()
-                            .take(DETECTION_WINDOW_SAMPLES)
-                            .rev()
-                            .copied()
-                            .collect();
-
-                        if let Some(wakeword_timestamp) = Self::process_wakeword_detection(
-                            &wakeword_model,
-                            &detection_samples,
-                            config.detection_threshold,
-                            &mut connection,
-                            &addr.to_string(),
-                            &last_wakeword_time,
-                            WAKEWORD_DEBOUNCE_MS,
-                        )? {
-                            last_wakeword_time = Some(wakeword_timestamp);
+                    match connection.write_message(&audio_msg) {
+                        Ok(()) => {
+                            sent_audio += 1;
                         }
-                        last_detection_time = Instant::now();
+                        Err(e) => {
+                            log::error!("❌ Failed to send audio to consumer {}: {}", addr, e);
+                            break;
+                        }
                     }
 
-                    // Keep buffer from growing too large
-                    while audio_buffer.len() > MAX_BUFFER_SAMPLES {
-                        audio_buffer.pop_front();
-                    }
-                }
+                    // Send wakeword event if present
+                    if let Some(wakeword_event) = pair.wakeword_event {
+                        let wakeword_msg = ConsumerMessage::WakewordDetected {
+                            model: wakeword_event.model.clone(),
+                            timestamp: wakeword_event.timestamp,
+                        };
 
-                // Process audio through VAD and get speech detection result
-                let speech_detected = {
-                    let mut vad_guard = vad_processor.lock().unwrap();
-                    if let Some(ref mut vad) = vad_guard.as_mut() {
-                        match vad.analyze_chunk(&audio_data) {
-                            Ok(has_speech) => {
-                                if has_speech {
-                                    log::debug!("🗣️ [{}] Speech detected in chunk", addr);
-                                }
-                                has_speech
+                        match connection.write_message(&wakeword_msg) {
+                            Ok(()) => {
+                                sent_wakewords += 1;
+                                log::info!(
+                                    "🎯 [{}] Sent wakeword to consumer: {} (confidence: {:.6})",
+                                    addr,
+                                    wakeword_event.model,
+                                    wakeword_event.confidence
+                                );
                             }
                             Err(e) => {
-                                log::warn!("⚠️ [{}] VAD processing error: {}", addr, e);
-                                false // Default to no speech on error
+                                log::error!(
+                                    "❌ Failed to send wakeword to consumer {}: {}",
+                                    addr,
+                                    e
+                                );
+                                break;
                             }
                         }
-                    } else {
-                        log::warn!("⚠️ [{}] VAD processor not initialized", addr);
-                        false
                     }
-                };
 
-                // Forward the audio chunk to consumer with VAD result
-                // (wakeword detection has already run and sent any detection messages)
-                let audio_msg = ConsumerMessage::Audio {
-                    data: audio_data,
-                    speech_detected,
-                    timestamp: ConsumerMessage::current_timestamp(),
-                };
-                if let Err(e) = connection.write_message(&audio_msg) {
-                    log::warn!("❌ Failed to send audio to consumer {}: {}", addr, e);
+                    // Log consumer performance stats every 100 audio chunks
+                    if sent_audio % 100 == 0 {
+                        let elapsed = start_time.elapsed();
+                        log::info!(
+                            "📊 [{}] Consumer stats: received={} sent_audio={} sent_wakewords={} dropped={} in {:.1}s",
+                            addr,
+                            received_pairs,
+                            sent_audio,
+                            sent_wakewords,
+                            dropped_by_consumer,
+                            elapsed.as_secs_f64()
+                        );
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // No data available, continue loop to check should_stop
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    log::warn!(
+                        "🔌 [{}] Detection thread disconnected, ending consumer",
+                        addr
+                    );
                     break;
                 }
-            } else {
-                // No audio available, sleep briefly
-                thread::sleep(Duration::from_millis(10));
             }
         }
 
-        log::info!("🛑 Audio stream ended for consumer {}", addr);
+        log::info!("🛑 Consumer {} disconnected", addr);
         Ok(())
     }
 

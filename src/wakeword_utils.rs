@@ -20,10 +20,10 @@ pub struct AudioFeatures {
 
     // Streaming buffers (matching Python implementation)
     raw_data_buffer: VecDeque<i16>,
-    melspectrogram_buffer: Vec<Vec<f32>>, // [76, 32] buffer
+    melspectrogram_buffer: VecDeque<Vec<f32>>, // [76, 32] buffer
     accumulated_samples: usize,
     raw_data_remainder: Vec<i16>,
-    feature_buffer: Vec<Vec<f32>>, // Stores embeddings
+    feature_buffer: VecDeque<Vec<f32>>, // Stores embeddings
 
     // Configuration
     feature_buffer_max_len: usize, // 120 frames (~10 seconds)
@@ -120,17 +120,24 @@ impl AudioFeatures {
             melspec_model,
             embedding_model,
             raw_data_buffer: VecDeque::with_capacity(sr as usize * 10), // 10 seconds
-            melspectrogram_buffer: vec![vec![1.0; 32]; 76], // Initialize with ones like Python
+            melspectrogram_buffer: {
+                let mut buf = VecDeque::with_capacity(970);
+                // Initialize with ones like Python - preserve exact original logic
+                for _ in 0..76 {
+                    buf.push_back(vec![1.0; 32]);
+                }
+                buf
+            },
             accumulated_samples: 0,
             raw_data_remainder: Vec::new(),
-            feature_buffer: Vec::new(),
+            feature_buffer: VecDeque::new(),
             feature_buffer_max_len: 120, // ~10 seconds
             processed_chunks: 0,
         };
 
         // Initialize feature buffer with dummy embeddings to avoid tensor allocation issues
         // We'll populate this properly when we start processing real audio
-        instance.feature_buffer = vec![vec![0.0; 96]; 1]; // Start with one empty embedding
+        instance.feature_buffer.push_back(vec![0.0; 96]); // Start with one empty embedding
 
         Ok(instance)
     }
@@ -138,13 +145,17 @@ impl AudioFeatures {
     /// Reset the internal buffers
     pub fn reset(&mut self) -> Result<()> {
         self.raw_data_buffer.clear();
-        self.melspectrogram_buffer = vec![vec![1.0; 32]; 76];
+        self.melspectrogram_buffer.clear();
+        for _ in 0..76 {
+            self.melspectrogram_buffer.push_back(vec![1.0; 32]);
+        }
         self.accumulated_samples = 0;
         self.raw_data_remainder.clear();
         self.processed_chunks = 0; // Reset processed chunks counter
 
         // Reinitialize feature buffer with dummy embeddings
-        self.feature_buffer = vec![vec![0.0; 96]; 1]; // Start with one empty embedding
+        self.feature_buffer.clear();
+        self.feature_buffer.push_back(vec![0.0; 96]); // Start with one empty embedding
 
         Ok(())
     }
@@ -187,7 +198,8 @@ impl AudioFeatures {
             }
         } else {
             let end_ndx = (start_ndx as usize + n_feature_frames).min(buffer_len);
-            return self.feature_buffer[start_ndx as usize..end_ndx]
+            let buffer_vec: Vec<_> = self.feature_buffer.iter().collect();
+            return buffer_vec[start_ndx as usize..end_ndx]
                 .iter()
                 .flat_map(|frame| frame.iter().copied())
                 .collect();
@@ -196,8 +208,9 @@ impl AudioFeatures {
         // Extract frames from buffer
         let end_ndx = buffer_len; // Always go to end of buffer for negative indices
         let mut flattened = Vec::new();
+        let buffer_vec: Vec<_> = self.feature_buffer.iter().collect();
         for i in actual_start_ndx..end_ndx {
-            flattened.extend(&self.feature_buffer[i]);
+            flattened.extend(buffer_vec[i]);
         }
 
         // If we have more features than requested, take only the last n_feature_frames worth
@@ -392,6 +405,24 @@ impl AudioFeatures {
     /// Buffer raw audio data for streaming
     fn _buffer_raw_data(&mut self, x: &[i16]) {
         self.raw_data_buffer.extend(x.iter().copied());
+
+        // Trim buffer to prevent memory leak - keep only last 10 seconds of audio
+        // Each sample is 1/16000 second, so 10 seconds = 160,000 samples
+        const MAX_RAW_BUFFER_SAMPLES: usize = 160_000; // 10 seconds at 16kHz
+
+        if self.raw_data_buffer.len() > MAX_RAW_BUFFER_SAMPLES {
+            let excess = self.raw_data_buffer.len() - MAX_RAW_BUFFER_SAMPLES;
+            for _ in 0..excess {
+                self.raw_data_buffer.pop_front();
+            }
+            log::debug!(
+                "🔧 Trimmed raw_data_buffer: removed {} samples, now {} samples ({:.1}s)",
+                excess,
+                self.raw_data_buffer.len(),
+                self.raw_data_buffer.len() as f64 / 16000.0
+            );
+        }
+
         // Note: accumulated_samples is managed separately in _streaming_features
     }
 
@@ -482,7 +513,7 @@ impl AudioFeatures {
                         let frame = spec[start_idx..end_idx].to_vec();
 
                         // Add new frame to buffer (keep more frames for sliding windows)
-                        self.melspectrogram_buffer.push(frame);
+                        self.melspectrogram_buffer.push_back(frame);
 
                         // Calculate buffer size to match Python implementation exactly
                         // Python: melspectrogram_max_len = 10*97 = 970 frames (10 seconds)
@@ -495,7 +526,7 @@ impl AudioFeatures {
                                 "⚠️ MELSPEC BUFFER OVERFLOW: Dropping oldest frame ({}ms of data) - buffer was {} frames", 
                                 dropped_frame_ms, self.melspectrogram_buffer.len()
                             );
-                            self.melspectrogram_buffer.remove(0);
+                            self.melspectrogram_buffer.pop_front();
                             log::debug!(
                                 "🔧 Melspec buffer trimmed to {} frames (max: {})",
                                 self.melspectrogram_buffer.len(),
@@ -534,8 +565,10 @@ impl AudioFeatures {
 
                                 // Extract exactly 76 frames from melspectrogram buffer
                                 let mut melspec_window = Vec::new();
+                                let buffer_vec: Vec<_> =
+                                    self.melspectrogram_buffer.iter().collect();
                                 for frame_idx in start_idx..end_idx {
-                                    melspec_window.extend(&self.melspectrogram_buffer[frame_idx]);
+                                    melspec_window.extend(buffer_vec[frame_idx]);
                                 }
 
                                 // Compute embedding if we have exactly 76 frames (76 * 32 = 2432 elements)
@@ -549,7 +582,7 @@ impl AudioFeatures {
                                     );
 
                                     // Update feature buffer (FIFO)
-                                    self.feature_buffer.push(embedding);
+                                    self.feature_buffer.push_back(embedding);
                                     if self.feature_buffer.len() > self.feature_buffer_max_len {
                                         let dropped_embedding_ms =
                                             (8.0 * 160.0 / 16000.0 * 1000.0) as u32; // Each embedding represents ~80ms of audio
@@ -557,7 +590,7 @@ impl AudioFeatures {
                                             "⚠️ FEATURE BUFFER OVERFLOW: Dropping oldest embedding (~{}ms of detection data) - buffer was {} embeddings",
                                             dropped_embedding_ms, self.feature_buffer.len()
                                         );
-                                        self.feature_buffer.remove(0);
+                                        self.feature_buffer.pop_front();
                                         log::debug!(
                                             "🔧 Feature buffer trimmed to {} embeddings (max: {})",
                                             self.feature_buffer.len(),
