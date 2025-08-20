@@ -38,15 +38,15 @@ impl AudioPlatform {
     pub fn playback_config(self) -> PlatformPlaybackConfig {
         match self {
             AudioPlatform::RaspberryPi => PlatformPlaybackConfig {
-                // I2S DAC: 44.1kHz, i16, stereo
-                sample_rate: 44100,
+                // I2S DAC: 48kHz, i16, stereo (better scaling from 16kHz)
+                sample_rate: 48000,
                 format: PlatformSampleFormat::I16,
                 channels: 2, // Stereo output
                 description: "Raspberry Pi I2S DAC",
             },
             AudioPlatform::MacOS => PlatformPlaybackConfig {
-                // macOS speakers: 44.1kHz, f32, stereo
-                sample_rate: 44100,
+                // macOS speakers: 48kHz, f32, stereo (better scaling from 16kHz)
+                sample_rate: 48000,
                 format: PlatformSampleFormat::F32,
                 channels: 2, // Stereo output
                 description: "macOS built-in speakers",
@@ -56,9 +56,9 @@ impl AudioPlatform {
 
     /// Get the standard TTS output format (same for both platforms)
     pub fn tts_format(self) -> AudioFormatSpec {
-        // Standardized TTS output: 44.1kHz, i16, mono
+        // Standardized TTS output: 48kHz, i16, mono (better scaling from 16kHz)
         AudioFormatSpec {
-            sample_rate: 44100,
+            sample_rate: 48000,
             format: PlatformSampleFormat::I16,
             channels: 1, // TTS is mono
         }

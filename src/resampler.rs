@@ -1,16 +1,16 @@
 use samplerate::{convert, ConverterType};
 
-/// High-quality resampler using libsamplerate for converting 16kHz s16le audio to 44.1kHz s16le
+/// High-quality resampler using libsamplerate for converting 16kHz s16le audio to 48kHz s16le
 pub struct SimpleResampler {
     input_rate: u32,
     output_rate: u32,
 }
 
 impl SimpleResampler {
-    /// Create a new resampler for 16kHz → 44.1kHz conversion
+    /// Create a new resampler for 16kHz → 48kHz conversion
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let input_rate = 16000;
-        let output_rate = 44100;
+        let output_rate = 48000;
 
         Ok(Self {
             input_rate,
@@ -18,9 +18,9 @@ impl SimpleResampler {
         })
     }
 
-    /// Resample s16le bytes from 16kHz to 44.1kHz using high-quality libsamplerate
+    /// Resample s16le bytes from 16kHz to 48kHz using high-quality libsamplerate
     /// Input: mono 16kHz s16le bytes
-    /// Output: mono 44.1kHz s16le bytes  
+    /// Output: mono 48kHz s16le bytes  
     pub fn resample_s16le(
         &mut self,
         input_bytes: &[u8],
@@ -67,7 +67,7 @@ impl SimpleResampler {
     /// Get the expected output size for a given input size
     /// This is approximate due to resampling ratios
     pub fn expected_output_size(&self, input_sample_count: usize) -> usize {
-        // 44100/16000 ≈ 2.756 ratio
+        // 48000/16000 = 3.0 ratio (exact)
         let ratio = self.output_rate as f64 / self.input_rate as f64;
         (input_sample_count as f64 * ratio) as usize
     }

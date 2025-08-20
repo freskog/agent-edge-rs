@@ -23,7 +23,7 @@ CONSUMER INTERFACE (Port 8080):
 
 PRODUCER INTERFACE (Port 8081):
   - Single producer can send audio for playback
-  - Sends 44.1kHz mono s16le audio chunks
+  - Sends 48kHz mono s16le audio chunks
   - Can send Stop command to clear audio queue
 
 EXAMPLES:

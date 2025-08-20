@@ -74,7 +74,7 @@ impl Default for AudioSinkConfig {
 }
 
 enum AudioCommand {
-    WriteChunk(Vec<u8>),                // mono 44.1kHz s16le data to play
+    WriteChunk(Vec<u8>),                // mono 48kHz s16le data to play
     EndStreamAndWait(mpsc::Sender<()>), // Signal end and wait for completion
     Abort,                              // Abort current playback
 }
@@ -227,7 +227,7 @@ impl PlatformAudioBuffer {
 }
 
 /// Sync streaming audio sink
-/// Accepts mono 44.1kHz s16le and converts to hardware format (stereo)
+/// Accepts mono 48kHz s16le and converts to hardware format (stereo)
 pub struct AudioSink {
     command_tx: Sender<AudioCommand>,
     _handle: thread::JoinHandle<()>,
@@ -251,7 +251,7 @@ impl AudioSink {
         })
     }
 
-    /// Write mono 44.1kHz s16le audio chunk - returns immediately for low latency
+    /// Write mono 48kHz s16le audio chunk - returns immediately for low latency
     pub fn write_chunk(&self, s16le_data: Vec<u8>) -> Result<(), AudioError> {
         self.command_tx
             .send(AudioCommand::WriteChunk(s16le_data))

@@ -46,9 +46,11 @@ pub enum ProducerMessageType {
     // Client → Audio Crate
     Play = 0x20,
     Stop = 0x21,
+    EndOfStream = 0x22,
 
     // Audio Crate → Client
     Error = 0x31,
+    PlaybackComplete = 0x32,
 }
 
 impl TryFrom<u8> for ProducerMessageType {
@@ -58,7 +60,9 @@ impl TryFrom<u8> for ProducerMessageType {
         match value {
             0x20 => Ok(ProducerMessageType::Play),
             0x21 => Ok(ProducerMessageType::Stop),
+            0x22 => Ok(ProducerMessageType::EndOfStream),
             0x31 => Ok(ProducerMessageType::Error),
+            0x32 => Ok(ProducerMessageType::PlaybackComplete),
             _ => Err(ProtocolError::InvalidMessageType(value)),
         }
     }
@@ -88,9 +92,11 @@ pub enum ProducerMessage {
     // Client → Audio Crate
     Play { data: Vec<u8> },
     Stop { timestamp: u64 },
+    EndOfStream { timestamp: u64 },
 
     // Audio Crate → Client
     Error { message: String },
+    PlaybackComplete { timestamp: u64 },
 }
 
 impl ConsumerMessage {
@@ -233,11 +239,21 @@ impl ProducerMessage {
                 bytes.extend_from_slice(&8u32.to_le_bytes()); // payload size: u64
                 bytes.extend_from_slice(&timestamp.to_le_bytes());
             }
+            ProducerMessage::EndOfStream { timestamp } => {
+                bytes.push(ProducerMessageType::EndOfStream as u8);
+                bytes.extend_from_slice(&8u32.to_le_bytes()); // payload size: u64
+                bytes.extend_from_slice(&timestamp.to_le_bytes());
+            }
             ProducerMessage::Error { message } => {
                 bytes.push(ProducerMessageType::Error as u8);
                 let msg_bytes = message.as_bytes();
                 bytes.extend_from_slice(&(msg_bytes.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(msg_bytes);
+            }
+            ProducerMessage::PlaybackComplete { timestamp } => {
+                bytes.push(ProducerMessageType::PlaybackComplete as u8);
+                bytes.extend_from_slice(&8u32.to_le_bytes()); // payload size: u64
+                bytes.extend_from_slice(&timestamp.to_le_bytes());
             }
         }
 
@@ -265,10 +281,34 @@ impl ProducerMessage {
 
                 Ok(ProducerMessage::Stop { timestamp })
             }
+            ProducerMessageType::EndOfStream => {
+                if payload.len() != 8 {
+                    return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
+                }
+
+                let timestamp = u64::from_le_bytes([
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
+                ]);
+
+                Ok(ProducerMessage::EndOfStream { timestamp })
+            }
             ProducerMessageType::Error => {
                 let message = String::from_utf8(payload.to_vec())
                     .map_err(|_| ProtocolError::Utf8(std::str::from_utf8(payload).unwrap_err()))?;
                 Ok(ProducerMessage::Error { message })
+            }
+            ProducerMessageType::PlaybackComplete => {
+                if payload.len() != 8 {
+                    return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
+                }
+
+                let timestamp = u64::from_le_bytes([
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
+                ]);
+
+                Ok(ProducerMessage::PlaybackComplete { timestamp })
             }
         }
     }
@@ -525,9 +565,63 @@ mod tests {
             ProducerMessageType::Stop
         );
         assert_eq!(
+            ProducerMessageType::try_from(0x22).unwrap(),
+            ProducerMessageType::EndOfStream
+        );
+        assert_eq!(
             ProducerMessageType::try_from(0x31).unwrap(),
             ProducerMessageType::Error
         );
+        assert_eq!(
+            ProducerMessageType::try_from(0x32).unwrap(),
+            ProducerMessageType::PlaybackComplete
+        );
         assert!(ProducerMessageType::try_from(0xFF).is_err());
+    }
+
+    #[test]
+    fn test_producer_end_of_stream_binary() {
+        let msg = ProducerMessage::EndOfStream {
+            timestamp: 1234567890,
+        };
+        let bytes = msg.to_bytes().unwrap();
+
+        // Should start with EndOfStream message type
+        assert_eq!(bytes[0], ProducerMessageType::EndOfStream as u8);
+
+        // Test round-trip
+        let mut cursor = Cursor::new(bytes);
+        let mut connection = ProducerConnection::new(cursor);
+        let parsed_msg = connection.read_message().unwrap();
+
+        match parsed_msg {
+            ProducerMessage::EndOfStream { timestamp } => {
+                assert_eq!(timestamp, 1234567890);
+            }
+            _ => panic!("Expected EndOfStream message"),
+        }
+    }
+
+    #[test]
+    fn test_producer_playback_complete_binary() {
+        let msg = ProducerMessage::PlaybackComplete {
+            timestamp: 9876543210,
+        };
+        let bytes = msg.to_bytes().unwrap();
+
+        // Should start with PlaybackComplete message type
+        assert_eq!(bytes[0], ProducerMessageType::PlaybackComplete as u8);
+
+        // Test round-trip
+        let mut cursor = Cursor::new(bytes);
+        let mut connection = ProducerConnection::new(cursor);
+        let parsed_msg = connection.read_message().unwrap();
+
+        match parsed_msg {
+            ProducerMessage::PlaybackComplete { timestamp } => {
+                assert_eq!(timestamp, 9876543210);
+            }
+            _ => panic!("Expected PlaybackComplete message"),
+        }
     }
 }
