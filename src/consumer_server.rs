@@ -483,20 +483,17 @@ impl ConsumerServer {
 
             match result {
                 Ok(()) => {
-                    log::info!("✅ Consumer {} disconnected cleanly - triggering server shutdown for clean restart", addr);
+                    log::info!("✅ Consumer {} disconnected cleanly", addr);
                 }
                 Err(e) => {
-                    log::error!(
-                        "❌ Consumer {} error: {} - triggering server shutdown for clean restart",
-                        addr,
-                        e
-                    );
+                    log::error!("❌ Consumer {} error: {}", addr, e);
                 }
             }
 
-            // Trigger server shutdown so systemd can restart with clean state
-            log::info!("🔄 Stopping server to allow systemd restart with fresh state");
-            should_stop.store(true, Ordering::SeqCst);
+            log::info!(
+                "🔌 Consumer {} connection ended, server remains available for new connections",
+                addr
+            );
         });
     }
 

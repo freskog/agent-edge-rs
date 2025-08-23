@@ -187,9 +187,6 @@ impl ProducerServer {
         // Handle producer messages
         log::info!("🔊 Ready to receive audio from producer {}", addr);
 
-        // Track end-of-stream state for playback completion detection
-        let mut end_of_stream_received = false;
-
         while !should_stop.load(Ordering::SeqCst) {
             match connection.read_message() {
                 Ok(message) => {
@@ -238,9 +235,61 @@ impl ProducerServer {
                                 addr,
                                 timestamp
                             );
-                            end_of_stream_received = true;
-                            // Break out of message loop to handle playback completion
-                            break;
+
+                            // Handle playback completion immediately, then continue message loop
+                            log::info!(
+                                "⏳ Waiting for audio playback to complete for producer {}",
+                                addr
+                            );
+
+                            // Check if sink is available, then call end_stream_and_wait
+                            let sink_guard = audio_sink.lock().unwrap();
+                            if let Some(sink) = sink_guard.as_ref() {
+                                match sink.end_stream_and_wait() {
+                                    Ok(()) => {
+                                        log::info!(
+                                            "✅ Audio playback completed for producer {}",
+                                            addr
+                                        );
+                                        let complete_msg = ProducerMessage::PlaybackComplete {
+                                            timestamp: ProducerMessage::current_timestamp(),
+                                        };
+                                        if let Err(e) = connection.write_message(&complete_msg) {
+                                            log::error!(
+                                                "❌ Failed to send PlaybackComplete to producer {}: {}",
+                                                addr,
+                                                e
+                                            );
+                                            break; // Exit on connection error
+                                        } else {
+                                            log::info!(
+                                                "📤 Sent PlaybackComplete notification to producer {}, ready for next session",
+                                                addr
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "❌ Audio playback error for producer {}: {}",
+                                            addr,
+                                            e
+                                        );
+                                        let error_msg = ProducerMessage::Error {
+                                            message: format!("Playback completion error: {}", e),
+                                        };
+                                        if let Err(e) = connection.write_message(&error_msg) {
+                                            log::error!(
+                                                "❌ Failed to send error message to producer {}: {}",
+                                                addr,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                log::warn!("⚠️  Audio sink not available for completion check");
+                            }
+                            // Continue message loop for next session
                         }
                         ProducerMessage::Error { .. }
                         | ProducerMessage::PlaybackComplete { .. } => {
@@ -270,55 +319,6 @@ impl ProducerServer {
                     break;
                 }
             }
-        }
-
-        // If end-of-stream was received, wait for playback completion and notify client
-        if end_of_stream_received {
-            log::info!(
-                "⏳ Waiting for audio playback to complete for producer {}",
-                addr
-            );
-
-            // Check if sink is available, then call end_stream_and_wait
-            let sink_guard = audio_sink.lock().unwrap();
-            if let Some(sink) = sink_guard.as_ref() {
-                match sink.end_stream_and_wait() {
-                    Ok(()) => {
-                        log::info!("✅ Audio playback completed for producer {}", addr);
-                        let complete_msg = ProducerMessage::PlaybackComplete {
-                            timestamp: ProducerMessage::current_timestamp(),
-                        };
-                        if let Err(e) = connection.write_message(&complete_msg) {
-                            log::error!(
-                                "❌ Failed to send PlaybackComplete to producer {}: {}",
-                                addr,
-                                e
-                            );
-                        } else {
-                            log::info!(
-                                "📤 Sent PlaybackComplete notification to producer {}",
-                                addr
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("❌ Audio playback error for producer {}: {}", addr, e);
-                        let error_msg = ProducerMessage::Error {
-                            message: format!("Playback completion error: {}", e),
-                        };
-                        if let Err(e) = connection.write_message(&error_msg) {
-                            log::error!(
-                                "❌ Failed to send error message to producer {}: {}",
-                                addr,
-                                e
-                            );
-                        }
-                    }
-                }
-            } else {
-                log::warn!("⚠️  Audio sink not available for completion check");
-            }
-            // sink_guard is automatically dropped here
         }
 
         log::info!("🛑 Producer connection ended for {}", addr);
