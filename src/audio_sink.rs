@@ -236,7 +236,9 @@ pub struct AudioSink {
 impl AudioSink {
     /// Create a new audio sink using build-time detected platform
     pub fn new(config: AudioSinkConfig) -> Result<Self, AudioError> {
-        let (command_tx, command_rx) = bounded(100);
+        // Reduced from 100 to 20 for more responsive barge-in
+        // At 48kHz with typical chunk sizes, 20 slots is still ~200-400ms of buffering
+        let (command_tx, command_rx) = bounded(20);
 
         // Start CPAL thread
         let handle = thread::spawn(move || {
@@ -382,11 +384,49 @@ impl AudioSink {
                                 let mut buffer = audio_buffer.lock().unwrap();
                                 buffer.extend_from_s16le(&s16le_data, hardware_channels)?;
                             }
+                            
+                            // CRITICAL FIX: Check completion signals after EVERY chunk
+                            // This prevents buffering 1-2 minutes of audio before checking drain status
+                            if !completion_signals.is_empty() {
+                                let buffer_len = {
+                                    let buffer = audio_buffer.lock().unwrap();
+                                    buffer.len()
+                                };
+                                
+                                // If buffer is below threshold, signal completion
+                                if buffer_len < hardware_sample_rate as usize / 50 {
+                                    for tx in completion_signals.drain(..) {
+                                        let _ = tx.send(());
+                                    }
+                                }
+                            }
                         }
                         AudioCommand::EndStreamAndWait(tx) => {
                             completion_signals.push(tx);
                         }
                         AudioCommand::Abort => {
+                            // PRIORITY HANDLING: Drain all pending commands when abort is received
+                            // This prevents buffered WriteChunk commands from adding more audio
+                            let mut drained_count = 0;
+                            while let Ok(cmd) = command_rx.try_recv() {
+                                match cmd {
+                                    AudioCommand::WriteChunk(_) => {
+                                        drained_count += 1;
+                                        // Drop the chunk, don't add to buffer
+                                    }
+                                    AudioCommand::EndStreamAndWait(tx) => {
+                                        completion_signals.push(tx);
+                                    }
+                                    AudioCommand::Abort => {
+                                        // Another abort command, continue draining
+                                    }
+                                }
+                            }
+                            
+                            if drained_count > 0 {
+                                log::info!("🗑️  Drained {} buffered audio chunks during abort", drained_count);
+                            }
+                            
                             // Clear buffer and signal completion for any pending operations
                             {
                                 let mut buffer = audio_buffer.lock().unwrap();
@@ -406,9 +446,10 @@ impl AudioSink {
                             buffer.len()
                         };
 
-                        // If buffer is small, consider playback complete
-                        if buffer_len < hardware_sample_rate as usize / 10 {
-                            // Less than 100ms of audio
+                        // Reduced threshold from 100ms to 20ms for more responsive barge-in
+                        // 20ms = hardware_sample_rate / 50
+                        if buffer_len < hardware_sample_rate as usize / 50 {
+                            // Less than 20ms of audio remaining
                             for tx in completion_signals.drain(..) {
                                 let _ = tx.send(());
                             }

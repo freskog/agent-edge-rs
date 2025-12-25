@@ -83,6 +83,7 @@ pub enum ConsumerMessage {
     WakewordDetected {
         model: String,
         timestamp: u64,
+        spotify_was_paused: bool, // NEW: Whether Spotify was paused for this wakeword
     },
 }
 
@@ -133,13 +134,18 @@ impl ConsumerMessage {
                 bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(data);
             }
-            ConsumerMessage::WakewordDetected { model, timestamp } => {
+            ConsumerMessage::WakewordDetected {
+                model,
+                timestamp,
+                spotify_was_paused,
+            } => {
                 bytes.push(ConsumerMessageType::WakewordDetected as u8);
-                // Payload: [timestamp: u64][model_len: u32][model: bytes]
+                // Payload: [timestamp: u64][spotify_was_paused: u8][model_len: u32][model: bytes]
                 let model_bytes = model.as_bytes();
-                let payload_len = 8 + 4 + model_bytes.len(); // u64 + u32 + string
+                let payload_len = 8 + 1 + 4 + model_bytes.len(); // u64 + u8 + u32 + string
                 bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
                 bytes.extend_from_slice(&timestamp.to_le_bytes());
+                bytes.push(if *spotify_was_paused { 1u8 } else { 0u8 });
                 bytes.extend_from_slice(&(model_bytes.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(model_bytes);
             }
@@ -186,8 +192,8 @@ impl ConsumerMessage {
                 })
             }
             ConsumerMessageType::WakewordDetected => {
-                if payload.len() < 12 {
-                    // minimum: u64 + u32
+                if payload.len() < 13 {
+                    // minimum: u64 + u8 + u32
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
 
@@ -195,21 +201,29 @@ impl ConsumerMessage {
                     payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
                     payload[6], payload[7],
                 ]);
-                let model_len =
-                    u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
 
-                if payload.len() < 12 + model_len {
+                let spotify_was_paused = payload[8] != 0;
+
+                let model_len =
+                    u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]])
+                        as usize;
+
+                if payload.len() < 13 + model_len {
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
 
                 let model =
-                    String::from_utf8(payload[12..12 + model_len].to_vec()).map_err(|_| {
+                    String::from_utf8(payload[13..13 + model_len].to_vec()).map_err(|_| {
                         ProtocolError::Utf8(
-                            std::str::from_utf8(&payload[12..12 + model_len]).unwrap_err(),
+                            std::str::from_utf8(&payload[13..13 + model_len]).unwrap_err(),
                         )
                     })?;
 
-                Ok(ConsumerMessage::WakewordDetected { model, timestamp })
+                Ok(ConsumerMessage::WakewordDetected {
+                    model,
+                    timestamp,
+                    spotify_was_paused,
+                })
             }
         }
     }
@@ -439,6 +453,7 @@ mod tests {
         let msg = ConsumerMessage::WakewordDetected {
             model: "hey-jarvis".to_string(),
             timestamp: 1234567890,
+            spotify_was_paused: true,
         };
         let bytes = msg.to_bytes().unwrap();
 
@@ -451,9 +466,14 @@ mod tests {
         let parsed_msg = connection.read_message().unwrap();
 
         match parsed_msg {
-            ConsumerMessage::WakewordDetected { model, timestamp } => {
+            ConsumerMessage::WakewordDetected {
+                model,
+                timestamp,
+                spotify_was_paused,
+            } => {
                 assert_eq!(model, "hey-jarvis");
                 assert_eq!(timestamp, 1234567890);
+                assert_eq!(spotify_was_paused, true);
             }
             _ => panic!("Expected WakewordDetected message"),
         }

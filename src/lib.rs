@@ -6,6 +6,7 @@ pub mod platform;
 pub mod producer_server;
 pub mod protocol;
 pub mod resampler;
+pub mod spotify_controller;
 pub mod types;
 
 // Wakeword detection modules

@@ -1,5 +1,6 @@
 use crate::audio_source::{AudioCapture, AudioCaptureConfig};
 use crate::protocol::{ConsumerConnection, ConsumerMessage, ProtocolError};
+use crate::spotify_controller::SpotifyController;
 use crate::wakeword_model::Model as WakewordModel;
 use crate::wakeword_vad::{VadConfig, VadProcessor};
 use crossbeam_channel::{Receiver, Sender};
@@ -41,6 +42,7 @@ pub struct WakewordEvent {
     pub model: String,
     pub confidence: f32,
     pub timestamp: u64,
+    pub spotify_was_paused: bool, // Whether Spotify was paused for this wakeword
 }
 
 /// Configuration for the consumer server
@@ -48,9 +50,11 @@ pub struct WakewordEvent {
 pub struct ConsumerServerConfig {
     pub bind_address: String,
     pub audio_capture_config: AudioCaptureConfig,
+    pub wakeword_channel: u32, // Channel for wakeword detection (0-based)
     pub wakeword_models: Vec<String>, // Models to load (e.g., ["hey_mycroft"])
-    pub detection_threshold: f32,     // Wakeword detection threshold
-    pub vad_config: VadConfig,        // VAD configuration
+    pub detection_threshold: f32, // Wakeword detection threshold
+    pub vad_config: VadConfig, // VAD configuration
+    pub spotify_player: Option<String>, // Optional Spotify player name for playerctl
 }
 
 impl Default for ConsumerServerConfig {
@@ -58,9 +62,11 @@ impl Default for ConsumerServerConfig {
         Self {
             bind_address: "127.0.0.1:8080".to_string(),
             audio_capture_config: AudioCaptureConfig::default(),
+            wakeword_channel: 0, // Default to channel 0
             wakeword_models: vec!["hey_mycroft".to_string()], // Default model
-            detection_threshold: 0.5,                         // Default threshold
-            vad_config: VadConfig::default(),                 // Default VAD config
+            detection_threshold: 0.5, // Default threshold
+            vad_config: VadConfig::default(), // Default VAD config
+            spotify_player: None,
         }
     }
 }
@@ -74,10 +80,17 @@ pub struct ConsumerServer {
     wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
     vad_processor: Arc<Mutex<Option<VadProcessor>>>,
     detection_sender: Option<Sender<AudioDetectionPair>>,
+    spotify_controller: Option<SpotifyController>,
 }
 
 impl ConsumerServer {
     pub fn new(config: ConsumerServerConfig) -> Self {
+        // Create Spotify controller if player specified
+        let spotify_controller = config
+            .spotify_player
+            .as_ref()
+            .map(|player| SpotifyController::new_with_player(player.clone()));
+
         Self {
             config,
             should_stop: Arc::new(AtomicBool::new(false)),
@@ -86,6 +99,7 @@ impl ConsumerServer {
             wakeword_model: Arc::new(Mutex::new(None)),
             vad_processor: Arc::new(Mutex::new(None)),
             detection_sender: None,
+            spotify_controller,
         }
     }
 
@@ -102,6 +116,7 @@ impl ConsumerServer {
         let wakeword_model = Arc::clone(&self.wakeword_model);
         let vad_processor = Arc::clone(&self.vad_processor);
         let config = self.config.clone();
+        let spotify_controller = self.spotify_controller.clone();
 
         // Start detection thread
         thread::spawn(move || {
@@ -113,6 +128,7 @@ impl ConsumerServer {
                 vad_processor,
                 config,
                 sender,
+                spotify_controller,
             );
 
             if let Err(e) = result {
@@ -199,12 +215,16 @@ impl ConsumerServer {
         vad_processor: Arc<Mutex<Option<VadProcessor>>>,
         config: ConsumerServerConfig,
         sender: Sender<AudioDetectionPair>,
+        spotify_controller: Option<SpotifyController>,
     ) -> Result<(), ConsumerServerError> {
-        // Initialize audio capture
+        // Initialize audio capture for streaming
         {
             let mut capture_guard = audio_capture.lock().unwrap();
             if capture_guard.is_none() {
-                log::info!("🎤 Initializing audio capture for detection");
+                log::info!(
+                    "🎤 Initializing audio capture for streaming (channel {})",
+                    config.audio_capture_config.channel
+                );
                 match AudioCapture::new(config.audio_capture_config.clone()) {
                     Ok(capture) => {
                         *capture_guard = Some(capture);
@@ -215,6 +235,31 @@ impl ConsumerServer {
                 }
             }
         }
+
+        // Initialize separate wakeword audio capture if using different channel
+        let wakeword_capture = if config.wakeword_channel != config.audio_capture_config.channel {
+            log::info!(
+                "🎯 Initializing separate wakeword capture (channel {})",
+                config.wakeword_channel
+            );
+            let wakeword_config = AudioCaptureConfig {
+                device_id: config.audio_capture_config.device_id.clone(),
+                channel: config.wakeword_channel,
+            };
+            match AudioCapture::new(wakeword_config) {
+                Ok(capture) => Some(capture),
+                Err(e) => {
+                    log::error!("❌ Failed to initialize wakeword audio capture: {}", e);
+                    return Err(ConsumerServerError::Audio(e.to_string()));
+                }
+            }
+        } else {
+            log::info!(
+                "🎯 Using same channel ({}) for both streaming and wakeword detection",
+                config.wakeword_channel
+            );
+            None
+        };
 
         // Initialize wakeword model
         {
@@ -273,13 +318,28 @@ impl ConsumerServer {
         const WAKEWORD_DEBOUNCE_MS: u64 = 3000; // Don't detect same wake word for 3 seconds
 
         while !should_stop.load(Ordering::SeqCst) {
-            // Get next audio chunk
-            if let Some(audio_data) = {
-                let capture_guard = audio_capture.lock().unwrap();
-                capture_guard.as_ref().and_then(|c| c.try_next_chunk())
-            } {
-                // Convert audio data to i16 samples for processing
-                let samples: Vec<i16> = audio_data
+            // Get next audio chunk from appropriate source
+            let (streaming_audio, wakeword_audio) = if let Some(ref ww_capture) = wakeword_capture {
+                // Using separate channels - get audio from both
+                let streaming = {
+                    let capture_guard = audio_capture.lock().unwrap();
+                    capture_guard.as_ref().and_then(|c| c.try_next_chunk())
+                };
+                let wakeword = ww_capture.try_next_chunk();
+                (streaming, wakeword)
+            } else {
+                // Using same channel - use same audio for both
+                let audio = {
+                    let capture_guard = audio_capture.lock().unwrap();
+                    capture_guard.as_ref().and_then(|c| c.try_next_chunk())
+                };
+                (audio.clone(), audio)
+            };
+
+            // Process wakeword audio for detection
+            if let Some(wakeword_data) = wakeword_audio {
+                // Convert wakeword audio data to i16 samples for processing
+                let samples: Vec<i16> = wakeword_data
                     .chunks_exact(2)
                     .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect();
@@ -321,6 +381,7 @@ impl ConsumerServer {
                             config.detection_threshold,
                             &last_wakeword_time,
                             WAKEWORD_DEBOUNCE_MS,
+                            &spotify_controller,
                         )? {
                             wakeword_event = Some(detection.0);
                             last_wakeword_time = Some(detection.1);
@@ -333,46 +394,61 @@ impl ConsumerServer {
                         audio_buffer.pop_front();
                     }
 
-                    // Process audio through VAD
-                    let speech_detected = {
-                        let mut vad_guard = vad_processor.lock().unwrap();
-                        if let Some(ref mut vad) = vad_guard.as_mut() {
-                            match vad.analyze_chunk(&audio_data) {
-                                Ok(has_speech) => has_speech,
-                                Err(e) => {
-                                    log::warn!("⚠️ VAD processing error: {}", e);
-                                    false
+                    // Process streaming audio through VAD and create pair for consumers
+                    let pair = if let Some(streaming_data) = streaming_audio {
+                        let speech_detected = {
+                            let mut vad_guard = vad_processor.lock().unwrap();
+                            if let Some(ref mut vad) = vad_guard.as_mut() {
+                                match vad.analyze_chunk(&streaming_data) {
+                                    Ok(has_speech) => has_speech,
+                                    Err(e) => {
+                                        log::warn!("⚠️ VAD processing error: {}", e);
+                                        false
+                                    }
                                 }
+                            } else {
+                                false
                             }
+                        };
+
+                        Some(AudioDetectionPair {
+                            audio_data: streaming_data,
+                            speech_detected,
+                            wakeword_event,
+                            timestamp: ConsumerMessage::current_timestamp(),
+                        })
+                    } else {
+                        // No streaming audio available, create minimal pair with wakeword event only
+                        if wakeword_event.is_some() {
+                            Some(AudioDetectionPair {
+                                audio_data: vec![], // Empty audio data
+                                speech_detected: false,
+                                wakeword_event,
+                                timestamp: ConsumerMessage::current_timestamp(),
+                            })
                         } else {
-                            false
+                            None
                         }
                     };
 
-                    // Create audio-detection pair
-                    let pair = AudioDetectionPair {
-                        audio_data,
-                        speech_detected,
-                        wakeword_event,
-                        timestamp: ConsumerMessage::current_timestamp(),
-                    };
-
-                    // Send to consumer only if consumer is connected
-                    if consumer_connected.load(Ordering::SeqCst) {
-                        match sender.try_send(pair) {
-                            Ok(()) => {
-                                // Successfully sent
-                            }
-                            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                                dropped_pairs += 1;
-                                if dropped_pairs % 10 == 0 {
-                                    log::warn!("⚠️ [Detection] Backpressure: dropped {} audio pairs, consumer lagging", dropped_pairs);
+                    // Send to consumer only if consumer is connected and we have a pair
+                    if let Some(audio_pair) = pair {
+                        if consumer_connected.load(Ordering::SeqCst) {
+                            match sender.try_send(audio_pair) {
+                                Ok(()) => {
+                                    // Successfully sent
                                 }
-                            }
-                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                                log::debug!(
-                                    "🔌 Detection thread: consumer disconnected during send"
-                                );
+                                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                    dropped_pairs += 1;
+                                    if dropped_pairs % 10 == 0 {
+                                        log::warn!("⚠️ [Detection] Backpressure: dropped {} audio pairs, consumer lagging", dropped_pairs);
+                                    }
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    log::debug!(
+                                        "🔌 Detection thread: consumer disconnected during send"
+                                    );
+                                }
                             }
                         }
                     } else {
@@ -403,6 +479,7 @@ impl ConsumerServer {
         threshold: f32,
         last_wakeword_time: &Option<Instant>,
         debounce_ms: u64,
+        spotify_controller: &Option<SpotifyController>,
     ) -> Result<Option<(WakewordEvent, Instant)>, ConsumerServerError> {
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
             match model.predict(detection_samples, None, 1.0) {
@@ -434,10 +511,24 @@ impl ConsumerServer {
                                 confidence
                             );
 
+                            // Try to pause Spotify if controller is available
+                            let spotify_was_paused = if let Some(controller) = spotify_controller {
+                                match controller.pause_for_wakeword() {
+                                    Ok(was_paused) => was_paused,
+                                    Err(e) => {
+                                        log::warn!("Failed to pause Spotify: {}", e);
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            };
+
                             let wakeword_event = WakewordEvent {
                                 model: model_name,
                                 confidence,
                                 timestamp: ConsumerMessage::current_timestamp(),
+                                spotify_was_paused,
                             };
 
                             return Ok(Some((wakeword_event, now)));
@@ -549,6 +640,7 @@ impl ConsumerServer {
                         let wakeword_msg = ConsumerMessage::WakewordDetected {
                             model: wakeword_event.model.clone(),
                             timestamp: wakeword_event.timestamp,
+                            spotify_was_paused: wakeword_event.spotify_was_paused,
                         };
 
                         match connection.write_message(&wakeword_msg) {
@@ -619,6 +711,7 @@ impl ConsumerServer {
         client_id: &str,
         last_wakeword_time: &Option<Instant>,
         debounce_ms: u64,
+        spotify_controller: &Option<SpotifyController>,
     ) -> Result<Option<Instant>, ConsumerServerError> {
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
             match model.predict(detection_samples, None, 1.0) {
@@ -652,9 +745,23 @@ impl ConsumerServer {
                                 confidence
                             );
 
+                            // Try to pause Spotify if controller is available
+                            let spotify_was_paused = if let Some(controller) = spotify_controller {
+                                match controller.pause_for_wakeword() {
+                                    Ok(was_paused) => was_paused,
+                                    Err(e) => {
+                                        log::warn!("Failed to pause Spotify: {}", e);
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            };
+
                             let wakeword_msg = ConsumerMessage::WakewordDetected {
                                 model: model_name,
                                 timestamp: ConsumerMessage::current_timestamp(),
+                                spotify_was_paused,
                             };
                             if let Err(e) = connection.write_message(&wakeword_msg) {
                                 log::warn!(
