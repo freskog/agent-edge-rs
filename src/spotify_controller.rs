@@ -29,12 +29,44 @@ impl SpotifyController {
         }
     }
 
-    fn get_player_args(&self) -> Vec<String> {
+    fn get_player_args(&self) -> Result<Vec<String>, SpotifyControlError> {
         if let Some(ref player) = self.preferred_player {
-            vec!["--player".to_string(), player.clone()]
+            // If player name contains a wildcard pattern or is just a prefix like "spotifyd",
+            // find the actual instance
+            let actual_player = if player.contains('*') || !player.contains('.') {
+                self.find_player_instance(player)?
+            } else {
+                player.clone()
+            };
+            Ok(vec!["--player".to_string(), actual_player])
         } else {
-            vec![]
+            Ok(vec![])
         }
+    }
+
+    /// Find actual player instance matching a pattern (e.g., "spotifyd" finds "spotifyd.instance12345")
+    fn find_player_instance(&self, pattern: &str) -> Result<String, SpotifyControlError> {
+        let output = Command::new("playerctl")
+            .arg("--list-all")
+            .output()
+            .map_err(|e| SpotifyControlError::ExecutionError(e.to_string()))?;
+
+        if !output.status.success() {
+            return Err(SpotifyControlError::NoPlayerFound);
+        }
+
+        let players = String::from_utf8_lossy(&output.stdout);
+
+        // Find first player matching the pattern
+        for line in players.lines() {
+            let player = line.trim();
+            if player.starts_with(pattern) {
+                log::debug!("Found player instance: {} (pattern: {})", player, pattern);
+                return Ok(player.to_string());
+            }
+        }
+
+        Err(SpotifyControlError::NoPlayerFound)
     }
 
     /// Pause music if currently playing. Returns true if music was paused, false if nothing was playing.
@@ -45,7 +77,7 @@ impl SpotifyController {
             return Ok(false);
         }
 
-        let mut args = self.get_player_args();
+        let mut args = self.get_player_args()?;
         args.push("pause".to_string());
 
         let output = Command::new("playerctl")
@@ -63,7 +95,13 @@ impl SpotifyController {
     }
 
     fn is_playing(&self) -> Result<bool, SpotifyControlError> {
-        let mut args = self.get_player_args();
+        let mut args = match self.get_player_args() {
+            Ok(args) => args,
+            Err(_) => {
+                // No player found
+                return Ok(false);
+            }
+        };
         args.push("status".to_string());
 
         let output = Command::new("playerctl")

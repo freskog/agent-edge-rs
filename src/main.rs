@@ -110,9 +110,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    // Create servers wrapped in Arc for sharing
-    let consumer_server = Arc::new(ConsumerServer::new(consumer_config));
-    let producer_server = Arc::new(ProducerServer::new(producer_config));
+    // Create barge-in channel for automatic server-side interruption
+    // When consumer detects wakeword during playback, producer aborts immediately
+    let (barge_in_tx, barge_in_rx) = crossbeam::channel::unbounded();
+
+    // Create servers
+    let mut consumer_server = ConsumerServer::new(consumer_config);
+    let mut producer_server = ProducerServer::new(producer_config);
+
+    // Connect barge-in channel
+    consumer_server.set_barge_in_sender(barge_in_tx);
+    producer_server.set_barge_in_receiver(barge_in_rx);
+
+    // Wrap in Arc for sharing
+    let consumer_server = Arc::new(consumer_server);
+    let producer_server = Arc::new(producer_server);
 
     // Shared shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));

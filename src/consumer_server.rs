@@ -81,6 +81,7 @@ pub struct ConsumerServer {
     vad_processor: Arc<Mutex<Option<VadProcessor>>>,
     detection_sender: Option<Sender<AudioDetectionPair>>,
     spotify_controller: Option<SpotifyController>,
+    barge_in_tx: Option<Sender<()>>, // Sends barge-in signal to producer when wakeword detected during playback
 }
 
 impl ConsumerServer {
@@ -100,7 +101,13 @@ impl ConsumerServer {
             vad_processor: Arc::new(Mutex::new(None)),
             detection_sender: None,
             spotify_controller,
+            barge_in_tx: None,
         }
+    }
+
+    /// Set the barge-in sender (call before run())
+    pub fn set_barge_in_sender(&mut self, tx: Sender<()>) {
+        self.barge_in_tx = Some(tx);
     }
 
     /// Start the detection thread and return the receiver for audio-detection pairs
@@ -117,6 +124,7 @@ impl ConsumerServer {
         let vad_processor = Arc::clone(&self.vad_processor);
         let config = self.config.clone();
         let spotify_controller = self.spotify_controller.clone();
+        let barge_in_tx = self.barge_in_tx.clone();
 
         // Start detection thread
         thread::spawn(move || {
@@ -129,6 +137,7 @@ impl ConsumerServer {
                 config,
                 sender,
                 spotify_controller,
+                barge_in_tx,
             );
 
             if let Err(e) = result {
@@ -216,6 +225,7 @@ impl ConsumerServer {
         config: ConsumerServerConfig,
         sender: Sender<AudioDetectionPair>,
         spotify_controller: Option<SpotifyController>,
+        barge_in_tx: Option<Sender<()>>,
     ) -> Result<(), ConsumerServerError> {
         // Initialize audio capture for streaming
         {
@@ -382,6 +392,7 @@ impl ConsumerServer {
                             &last_wakeword_time,
                             WAKEWORD_DEBOUNCE_MS,
                             &spotify_controller,
+                            &barge_in_tx,
                         )? {
                             wakeword_event = Some(detection.0);
                             last_wakeword_time = Some(detection.1);
@@ -480,6 +491,7 @@ impl ConsumerServer {
         last_wakeword_time: &Option<Instant>,
         debounce_ms: u64,
         spotify_controller: &Option<SpotifyController>,
+        barge_in_tx: &Option<Sender<()>>,
     ) -> Result<Option<(WakewordEvent, Instant)>, ConsumerServerError> {
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
             match model.predict(detection_samples, None, 1.0) {
@@ -510,6 +522,18 @@ impl ConsumerServer {
                                 model_name,
                                 confidence
                             );
+
+                            // Send barge-in signal to producer (automatic server-side barge-in)
+                            if let Some(ref barge_in) = barge_in_tx {
+                                match barge_in.try_send(()) {
+                                    Ok(()) => {
+                                        log::info!("🔥 Sent barge-in signal to producer (automatic interruption)");
+                                    }
+                                    Err(e) => {
+                                        log::debug!("Barge-in signal not sent (producer may not be playing): {}", e);
+                                    }
+                                }
+                            }
 
                             // Try to pause Spotify if controller is available
                             let spotify_was_paused = if let Some(controller) = spotify_controller {

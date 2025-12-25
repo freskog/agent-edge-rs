@@ -87,15 +87,39 @@ All messages now follow the zio-json sum type convention:
 }
 ```
 
-#### Stop
+#### Stop (Immediate Interruption)
+**Use for barge-in / interruptions**
 ```json
-"Stop"
+{
+  "Stop": {
+    "timestamp": 1234567890
+  }
+}
 ```
+**Behavior**: Immediately aborts audio playback and clears all buffered audio. Returns instantly.
+**Use case**: User interrupts the assistant (barge-in), emergency stop.
 
-#### Connected
+#### EndOfStream (Graceful Completion)
+**Use for normal end of response**
 ```json
-"Connected"
+{
+  "EndOfStream": {
+    "timestamp": 1234567890
+  }
+}
 ```
+**Behavior**: Waits for all buffered audio to finish playing naturally, then sends `PlaybackComplete`.
+**Use case**: Normal end of assistant response when you want all audio to play.
+
+#### PlaybackComplete (Server Response)
+```json
+{
+  "PlaybackComplete": {
+    "timestamp": 1234567890
+  }
+}
+```
+**Behavior**: Server sends this after `EndOfStream` when all audio has finished playing.
 
 #### Error
 ```json

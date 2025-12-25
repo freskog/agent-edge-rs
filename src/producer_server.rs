@@ -1,7 +1,9 @@
 use crate::audio_sink::{AudioSink, AudioSinkConfig};
 use crate::protocol::{ProducerConnection, ProducerMessage, ProtocolError};
+use crossbeam::channel::Receiver;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -44,6 +46,7 @@ pub struct ProducerServer {
     should_stop: Arc<AtomicBool>,
     producer_connected: Arc<AtomicBool>,
     audio_sink: Arc<Mutex<Option<AudioSink>>>,
+    barge_in_rx: Option<Receiver<()>>, // Receives barge-in signals from consumer
 }
 
 impl ProducerServer {
@@ -53,7 +56,13 @@ impl ProducerServer {
             should_stop: Arc::new(AtomicBool::new(false)),
             producer_connected: Arc::new(AtomicBool::new(false)),
             audio_sink: Arc::new(Mutex::new(None)),
+            barge_in_rx: None,
         }
+    }
+
+    /// Set the barge-in receiver (call before run())
+    pub fn set_barge_in_receiver(&mut self, rx: Receiver<()>) {
+        self.barge_in_rx = Some(rx);
     }
 
     /// Start the producer server (blocking)
@@ -129,6 +138,7 @@ impl ProducerServer {
         let producer_connected = Arc::clone(&self.producer_connected);
         let audio_sink = Arc::clone(&self.audio_sink);
         let sink_config = self.config.audio_sink_config.clone();
+        let barge_in_rx = self.barge_in_rx.clone();
 
         thread::spawn(move || {
             let result = Self::producer_thread(
@@ -138,6 +148,7 @@ impl ProducerServer {
                 producer_connected.clone(),
                 audio_sink,
                 sink_config,
+                barge_in_rx,
             );
 
             // Always mark producer as disconnected when thread exits
@@ -158,6 +169,7 @@ impl ProducerServer {
         _producer_connected: Arc<AtomicBool>,
         audio_sink: Arc<Mutex<Option<AudioSink>>>,
         sink_config: AudioSinkConfig,
+        barge_in_rx: Option<Receiver<()>>,
     ) -> Result<(), ProducerServerError> {
         let mut connection = ProducerConnection::new(stream);
 
@@ -187,7 +199,73 @@ impl ProducerServer {
         // Handle producer messages
         log::info!("🔊 Ready to receive audio from producer {}", addr);
 
+        // Track pending completion
+        let mut pending_completion: Option<mpsc::Receiver<()>> = None;
+
         while !should_stop.load(Ordering::SeqCst) {
+            // Check for barge-in signal from consumer (wakeword detected during playback)
+            if let Some(ref barge_in) = barge_in_rx {
+                match barge_in.try_recv() {
+                    Ok(()) => {
+                        log::info!("🔥 Barge-in detected (wakeword during playback) for producer {}", addr);
+                        
+                        // Cancel pending completion
+                        let was_waiting = pending_completion.is_some();
+                        pending_completion = None;
+                        
+                        // Abort playback
+                        let sink_guard = audio_sink.lock().unwrap();
+                        if let Some(sink) = sink_guard.as_ref() {
+                            if let Err(e) = sink.abort() {
+                                log::error!("❌ Failed to abort audio during barge-in: {}", e);
+                            } else {
+                                log::info!("✅ Audio playback stopped due to barge-in");
+                                
+                                // Send PlaybackComplete if client was waiting
+                                if was_waiting {
+                                    let complete_msg = ProducerMessage::PlaybackComplete {
+                                        timestamp: ProducerMessage::current_timestamp(),
+                                    };
+                                    if let Err(e) = connection.write_message(&complete_msg) {
+                                        log::error!("❌ Failed to send PlaybackComplete after barge-in: {}", e);
+                                        break;
+                                    }
+                                    log::info!("📤 Sent PlaybackComplete after barge-in (unblocking client)");
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // No barge-in signal, continue
+                    }
+                }
+            }
+            
+            // Check if playback completion is ready (non-blocking)
+            if let Some(ref completion_rx) = pending_completion {
+                match completion_rx.try_recv() {
+                    Ok(()) => {
+                        log::info!("✅ Audio playback completed for producer {}", addr);
+                        let complete_msg = ProducerMessage::PlaybackComplete {
+                            timestamp: ProducerMessage::current_timestamp(),
+                        };
+                        if let Err(e) = connection.write_message(&complete_msg) {
+                            log::error!("❌ Failed to send PlaybackComplete: {}", e);
+                            break;
+                        }
+                        log::info!("📤 Sent PlaybackComplete, ready for next session");
+                        pending_completion = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // Still waiting for playback to complete
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        log::error!("❌ Completion signal lost");
+                        pending_completion = None;
+                    }
+                }
+            }
+
             match connection.read_message() {
                 Ok(message) => {
                     match message {
@@ -215,6 +293,13 @@ impl ProducerServer {
                         ProducerMessage::Stop { .. } => {
                             log::info!("🛑 Producer {} requested stop (abort playback)", addr);
 
+                            // Cancel any pending completion
+                            let was_waiting_for_completion = pending_completion.is_some();
+                            if was_waiting_for_completion {
+                                log::info!("🔥 Canceling pending playback completion due to Stop");
+                                pending_completion = None;
+                            }
+
                             // Abort current playback and clear queue
                             let sink_guard = audio_sink.lock().unwrap();
                             if let Some(sink) = sink_guard.as_ref() {
@@ -226,6 +311,18 @@ impl ProducerServer {
                                     connection.write_message(&error_msg)?;
                                 } else {
                                     log::info!("✅ Audio playback stopped for producer {}", addr);
+                                    
+                                    // CRITICAL: Send PlaybackComplete to unblock waiting client
+                                    if was_waiting_for_completion {
+                                        let complete_msg = ProducerMessage::PlaybackComplete {
+                                            timestamp: ProducerMessage::current_timestamp(),
+                                        };
+                                        if let Err(e) = connection.write_message(&complete_msg) {
+                                            log::error!("❌ Failed to send PlaybackComplete after Stop: {}", e);
+                                            break;
+                                        }
+                                        log::info!("📤 Sent PlaybackComplete after Stop (unblocking client)");
+                                    }
                                 }
                             }
                         }
@@ -236,60 +333,29 @@ impl ProducerServer {
                                 timestamp
                             );
 
-                            // Handle playback completion immediately, then continue message loop
-                            log::info!(
-                                "⏳ Waiting for audio playback to complete for producer {}",
-                                addr
-                            );
-
-                            // Check if sink is available, then call end_stream_and_wait
+                            // Start non-blocking completion wait (continues reading messages)
                             let sink_guard = audio_sink.lock().unwrap();
                             if let Some(sink) = sink_guard.as_ref() {
-                                match sink.end_stream_and_wait() {
-                                    Ok(()) => {
+                                match sink.end_stream() {
+                                    Ok(completion_rx) => {
                                         log::info!(
-                                            "✅ Audio playback completed for producer {}",
+                                            "⏳ Monitoring audio playback completion for producer {} (non-blocking)",
                                             addr
                                         );
-                                        let complete_msg = ProducerMessage::PlaybackComplete {
-                                            timestamp: ProducerMessage::current_timestamp(),
-                                        };
-                                        if let Err(e) = connection.write_message(&complete_msg) {
-                                            log::error!(
-                                                "❌ Failed to send PlaybackComplete to producer {}: {}",
-                                                addr,
-                                                e
-                                            );
-                                            break; // Exit on connection error
-                                        } else {
-                                            log::info!(
-                                                "📤 Sent PlaybackComplete notification to producer {}, ready for next session",
-                                                addr
-                                            );
-                                        }
+                                        pending_completion = Some(completion_rx);
                                     }
                                     Err(e) => {
-                                        log::error!(
-                                            "❌ Audio playback error for producer {}: {}",
-                                            addr,
-                                            e
-                                        );
+                                        log::error!("❌ Failed to signal end of stream: {}", e);
                                         let error_msg = ProducerMessage::Error {
-                                            message: format!("Playback completion error: {}", e),
+                                            message: format!("End of stream error: {}", e),
                                         };
-                                        if let Err(e) = connection.write_message(&error_msg) {
-                                            log::error!(
-                                                "❌ Failed to send error message to producer {}: {}",
-                                                addr,
-                                                e
-                                            );
-                                        }
+                                        connection.write_message(&error_msg)?;
                                     }
                                 }
                             } else {
                                 log::warn!("⚠️  Audio sink not available for completion check");
                             }
-                            // Continue message loop for next session
+                            // Continue message loop (can now receive Stop to interrupt)
                         }
                         ProducerMessage::Error { .. }
                         | ProducerMessage::PlaybackComplete { .. } => {

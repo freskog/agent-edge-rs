@@ -274,6 +274,15 @@ impl AudioSink {
         Ok(())
     }
 
+    /// Signal end of stream (non-blocking) - returns a receiver to check completion
+    pub fn end_stream(&self) -> Result<mpsc::Receiver<()>, AudioError> {
+        let (completion_tx, completion_rx) = mpsc::channel();
+        self.command_tx
+            .send(AudioCommand::EndStreamAndWait(completion_tx))
+            .map_err(|_| AudioError::WriteError("Audio thread disconnected".to_string()))?;
+        Ok(completion_rx)
+    }
+
     /// Abort current playback immediately
     pub fn abort(&self) -> Result<(), AudioError> {
         self.command_tx
@@ -384,17 +393,26 @@ impl AudioSink {
                                 let mut buffer = audio_buffer.lock().unwrap();
                                 buffer.extend_from_s16le(&s16le_data, hardware_channels)?;
                             }
-                            
+
                             // CRITICAL FIX: Check completion signals after EVERY chunk
                             // This prevents buffering 1-2 minutes of audio before checking drain status
                             if !completion_signals.is_empty() {
+                                // Check BOTH command queue AND playback buffer
+                                let queue_is_empty = command_rx.is_empty();
                                 let buffer_len = {
                                     let buffer = audio_buffer.lock().unwrap();
                                     buffer.len()
                                 };
-                                
-                                // If buffer is below threshold, signal completion
-                                if buffer_len < hardware_sample_rate as usize / 50 {
+
+                                // Only signal completion if:
+                                // 1. No more commands in queue (all audio sent)
+                                // 2. Playback buffer is nearly empty (< 20ms remaining)
+                                if queue_is_empty && buffer_len < hardware_sample_rate as usize / 50
+                                {
+                                    log::debug!(
+                                        "✅ Playback complete: queue empty, buffer={} samples (< 20ms)",
+                                        buffer_len
+                                    );
                                     for tx in completion_signals.drain(..) {
                                         let _ = tx.send(());
                                     }
@@ -422,11 +440,14 @@ impl AudioSink {
                                     }
                                 }
                             }
-                            
+
                             if drained_count > 0 {
-                                log::info!("🗑️  Drained {} buffered audio chunks during abort", drained_count);
+                                log::info!(
+                                    "🗑️  Drained {} buffered audio chunks during abort",
+                                    drained_count
+                                );
                             }
-                            
+
                             // Clear buffer and signal completion for any pending operations
                             {
                                 let mut buffer = audio_buffer.lock().unwrap();
@@ -441,15 +462,21 @@ impl AudioSink {
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                     // Check if we need to signal completion
                     if !completion_signals.is_empty() {
+                        // Check BOTH command queue AND playback buffer
+                        let queue_is_empty = command_rx.is_empty();
                         let buffer_len = {
                             let buffer = audio_buffer.lock().unwrap();
                             buffer.len()
                         };
 
-                        // Reduced threshold from 100ms to 20ms for more responsive barge-in
-                        // 20ms = hardware_sample_rate / 50
-                        if buffer_len < hardware_sample_rate as usize / 50 {
-                            // Less than 20ms of audio remaining
+                        // Only signal completion if:
+                        // 1. No more commands in queue (all audio sent)
+                        // 2. Playback buffer is nearly empty (< 20ms remaining)
+                        if queue_is_empty && buffer_len < hardware_sample_rate as usize / 50 {
+                            log::debug!(
+                                "✅ Playback complete (timeout check): queue empty, buffer={} samples (< 20ms)",
+                                buffer_len
+                            );
                             for tx in completion_signals.drain(..) {
                                 let _ = tx.send(());
                             }
