@@ -69,6 +69,7 @@ struct Args {
     wakeword_channel: Option<u32>,
 
     /// Spotify player name for playerctl (e.g., "spotify", "spotifyd")
+    /// If not specified, will auto-detect any available music player
     #[arg(long)]
     spotify_player: Option<String>,
 }
@@ -112,7 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create barge-in channel for automatic server-side interruption
     // When consumer detects wakeword during playback, producer aborts immediately
-    let (barge_in_tx, barge_in_rx) = crossbeam::channel::unbounded();
+    // Bounded channel (size 1) so old barge-in signals are dropped if not consumed
+    // This prevents stale wakeword detections from aborting future audio
+    let (barge_in_tx, barge_in_rx) = crossbeam::channel::bounded(1);
 
     // Create servers
     let mut consumer_server = ConsumerServer::new(consumer_config);
@@ -121,6 +124,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect barge-in channel
     consumer_server.set_barge_in_sender(barge_in_tx);
     producer_server.set_barge_in_receiver(barge_in_rx);
+
+    // Pre-initialize audio sink to prevent audio loss on first connection
+    if let Err(e) = producer_server.initialize_sink() {
+        error!("Failed to pre-initialize audio sink: {}", e);
+        error!("Audio playback may have issues on first connection");
+    }
 
     // Wrap in Arc for sharing
     let consumer_server = Arc::new(consumer_server);

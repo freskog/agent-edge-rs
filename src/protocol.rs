@@ -45,7 +45,7 @@ impl TryFrom<u8> for ConsumerMessageType {
 pub enum ProducerMessageType {
     // Client → Audio Crate
     Play = 0x20,
-    Stop = 0x21,
+    // Stop = 0x21,  // REMOVED: Barge-in only stops server-side
     EndOfStream = 0x22,
 
     // Audio Crate → Client
@@ -59,7 +59,7 @@ impl TryFrom<u8> for ProducerMessageType {
     fn try_from(value: u8) -> Result<Self, ProtocolError> {
         match value {
             0x20 => Ok(ProducerMessageType::Play),
-            0x21 => Ok(ProducerMessageType::Stop),
+            // 0x21 Stop removed
             0x22 => Ok(ProducerMessageType::EndOfStream),
             0x31 => Ok(ProducerMessageType::Error),
             0x32 => Ok(ProducerMessageType::PlaybackComplete),
@@ -91,13 +91,23 @@ pub enum ConsumerMessage {
 #[derive(Debug, Clone)]
 pub enum ProducerMessage {
     // Client → Audio Crate
-    Play { data: Vec<u8> },
-    Stop { timestamp: u64 },
-    EndOfStream { timestamp: u64 },
+    Play {
+        data: Vec<u8>,
+        stream_id: u64, // Unique stream identifier (e.g., Unix timestamp)
+    },
+    // Stop removed - barge-in only stops server-side
+    EndOfStream {
+        timestamp: u64,
+        stream_id: u64, // Must match stream_id from Play messages
+    },
 
     // Audio Crate → Client
-    Error { message: String },
-    PlaybackComplete { timestamp: u64 },
+    Error {
+        message: String,
+    },
+    PlaybackComplete {
+        timestamp: u64,
+    },
 }
 
 impl ConsumerMessage {
@@ -243,20 +253,23 @@ impl ProducerMessage {
         let mut bytes = Vec::new();
 
         match self {
-            ProducerMessage::Play { data } => {
+            ProducerMessage::Play { data, stream_id } => {
                 bytes.push(ProducerMessageType::Play as u8);
-                bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                // Payload: [stream_id: u64][data: bytes]
+                let payload_len = 8 + data.len();
+                bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                bytes.extend_from_slice(&stream_id.to_le_bytes());
                 bytes.extend_from_slice(data);
             }
-            ProducerMessage::Stop { timestamp } => {
-                bytes.push(ProducerMessageType::Stop as u8);
-                bytes.extend_from_slice(&8u32.to_le_bytes()); // payload size: u64
-                bytes.extend_from_slice(&timestamp.to_le_bytes());
-            }
-            ProducerMessage::EndOfStream { timestamp } => {
+            ProducerMessage::EndOfStream {
+                timestamp,
+                stream_id,
+            } => {
                 bytes.push(ProducerMessageType::EndOfStream as u8);
-                bytes.extend_from_slice(&8u32.to_le_bytes()); // payload size: u64
+                // Payload: [timestamp: u64][stream_id: u64]
+                bytes.extend_from_slice(&16u32.to_le_bytes()); // payload size: 2x u64
                 bytes.extend_from_slice(&timestamp.to_le_bytes());
+                bytes.extend_from_slice(&stream_id.to_le_bytes());
             }
             ProducerMessage::Error { message } => {
                 bytes.push(ProducerMessageType::Error as u8);
@@ -280,23 +293,24 @@ impl ProducerMessage {
         payload: &[u8],
     ) -> Result<Self, ProtocolError> {
         match msg_type {
-            ProducerMessageType::Play => Ok(ProducerMessage::Play {
-                data: payload.to_vec(),
-            }),
-            ProducerMessageType::Stop => {
-                if payload.len() != 8 {
+            ProducerMessageType::Play => {
+                // Payload: [stream_id: u64][data: bytes]
+                if payload.len() < 8 {
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
 
-                let timestamp = u64::from_le_bytes([
+                let stream_id = u64::from_le_bytes([
                     payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
                     payload[6], payload[7],
                 ]);
 
-                Ok(ProducerMessage::Stop { timestamp })
+                let data = payload[8..].to_vec();
+
+                Ok(ProducerMessage::Play { data, stream_id })
             }
             ProducerMessageType::EndOfStream => {
-                if payload.len() != 8 {
+                // Payload: [timestamp: u64][stream_id: u64]
+                if payload.len() != 16 {
                     return Err(ProtocolError::InvalidPayloadSize(payload.len() as u32));
                 }
 
@@ -305,7 +319,21 @@ impl ProducerMessage {
                     payload[6], payload[7],
                 ]);
 
-                Ok(ProducerMessage::EndOfStream { timestamp })
+                let stream_id = u64::from_le_bytes([
+                    payload[8],
+                    payload[9],
+                    payload[10],
+                    payload[11],
+                    payload[12],
+                    payload[13],
+                    payload[14],
+                    payload[15],
+                ]);
+
+                Ok(ProducerMessage::EndOfStream {
+                    timestamp,
+                    stream_id,
+                })
             }
             ProducerMessageType::Error => {
                 let message = String::from_utf8(payload.to_vec())
@@ -514,8 +542,10 @@ mod tests {
     #[test]
     fn test_producer_message_binary() {
         let audio_data = vec![7, 8, 9, 10];
+        let stream_id = 1234567890u64;
         let msg = ProducerMessage::Play {
             data: audio_data.clone(),
+            stream_id,
         };
         let bytes = msg.to_bytes().unwrap();
 
@@ -528,33 +558,14 @@ mod tests {
         let parsed_msg = connection.read_message().unwrap();
 
         match parsed_msg {
-            ProducerMessage::Play { data } => {
+            ProducerMessage::Play {
+                data,
+                stream_id: parsed_stream_id,
+            } => {
                 assert_eq!(data, audio_data);
+                assert_eq!(parsed_stream_id, stream_id);
             }
             _ => panic!("Expected Play message"),
-        }
-    }
-
-    #[test]
-    fn test_producer_stop_binary() {
-        let msg = ProducerMessage::Stop {
-            timestamp: 9876543210,
-        };
-        let bytes = msg.to_bytes().unwrap();
-
-        // Should start with Stop message type
-        assert_eq!(bytes[0], ProducerMessageType::Stop as u8);
-
-        // Test round-trip
-        let mut cursor = Cursor::new(bytes);
-        let mut connection = ProducerConnection::new(cursor);
-        let parsed_msg = connection.read_message().unwrap();
-
-        match parsed_msg {
-            ProducerMessage::Stop { timestamp } => {
-                assert_eq!(timestamp, 9876543210);
-            }
-            _ => panic!("Expected Stop message"),
         }
     }
 
@@ -580,10 +591,7 @@ mod tests {
             ProducerMessageType::try_from(0x20).unwrap(),
             ProducerMessageType::Play
         );
-        assert_eq!(
-            ProducerMessageType::try_from(0x21).unwrap(),
-            ProducerMessageType::Stop
-        );
+        // 0x21 (Stop) removed
         assert_eq!(
             ProducerMessageType::try_from(0x22).unwrap(),
             ProducerMessageType::EndOfStream
@@ -597,12 +605,16 @@ mod tests {
             ProducerMessageType::PlaybackComplete
         );
         assert!(ProducerMessageType::try_from(0xFF).is_err());
+        assert!(ProducerMessageType::try_from(0x21).is_err()); // Stop no longer valid
     }
 
     #[test]
     fn test_producer_end_of_stream_binary() {
+        let timestamp = 1234567890u64;
+        let stream_id = 9876543210u64;
         let msg = ProducerMessage::EndOfStream {
-            timestamp: 1234567890,
+            timestamp,
+            stream_id,
         };
         let bytes = msg.to_bytes().unwrap();
 
@@ -615,8 +627,12 @@ mod tests {
         let parsed_msg = connection.read_message().unwrap();
 
         match parsed_msg {
-            ProducerMessage::EndOfStream { timestamp } => {
-                assert_eq!(timestamp, 1234567890);
+            ProducerMessage::EndOfStream {
+                timestamp: parsed_timestamp,
+                stream_id: parsed_stream_id,
+            } => {
+                assert_eq!(parsed_timestamp, timestamp);
+                assert_eq!(parsed_stream_id, stream_id);
             }
             _ => panic!("Expected EndOfStream message"),
         }

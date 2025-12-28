@@ -55,9 +55,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const CHUNK_SIZE: usize = 1024 * 2; // 1024 samples = 2048 bytes
     let mut total_sent = 0;
 
+    // Generate stream ID for this playback session
+    let stream_id = ProducerMessage::current_timestamp();
+    println!("🆔 Stream ID: {}", stream_id);
+
     for chunk in audio_data.chunks(CHUNK_SIZE) {
         let play_msg = ProducerMessage::Play {
             data: chunk.to_vec(),
+            stream_id,
         };
 
         connection.write_message(&play_msg)?;
@@ -81,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🏁 Sending end-of-stream signal...");
     let end_msg = ProducerMessage::EndOfStream {
         timestamp: ProducerMessage::current_timestamp(),
+        stream_id,
     };
     connection.write_message(&end_msg)?;
 

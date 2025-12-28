@@ -74,9 +74,9 @@ impl Default for AudioSinkConfig {
 }
 
 enum AudioCommand {
-    WriteChunk(Vec<u8>),                // mono 48kHz s16le data to play
-    EndStreamAndWait(mpsc::Sender<()>), // Signal end and wait for completion
-    Abort,                              // Abort current playback
+    WriteChunk { data: Vec<u8>, stream_id: u64 }, // mono 48kHz s16le data to play with stream ID
+    EndStreamAndWait(mpsc::Sender<()>),           // Signal end and wait for completion
+    Abort,                                        // Abort current playback
 }
 
 /// Platform-aware audio buffer that avoids unnecessary conversions
@@ -254,9 +254,12 @@ impl AudioSink {
     }
 
     /// Write mono 48kHz s16le audio chunk - returns immediately for low latency
-    pub fn write_chunk(&self, s16le_data: Vec<u8>) -> Result<(), AudioError> {
+    pub fn write_chunk(&self, s16le_data: Vec<u8>, stream_id: u64) -> Result<(), AudioError> {
         self.command_tx
-            .send(AudioCommand::WriteChunk(s16le_data))
+            .send(AudioCommand::WriteChunk {
+                data: s16le_data,
+                stream_id,
+            })
             .map_err(|_| AudioError::WriteError("Audio thread disconnected".to_string()))?;
         Ok(())
     }
@@ -378,17 +381,78 @@ impl AudioSink {
 
         stream.play()?;
 
-        // Process commands
+        // Process commands with stream ID tracking
         let mut completion_signals: Vec<mpsc::Sender<()>> = Vec::new();
+        let mut current_stream_id: u64 = 0; // Track which stream is currently playing
 
         loop {
             // Use timeout to periodically check for completion
             match command_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(command) => {
                     match command {
-                        AudioCommand::WriteChunk(s16le_data) => {
-                            // Add to platform-appropriate buffer
-                            // Let the bounded channel provide natural backpressure instead of dropping samples
+                        AudioCommand::WriteChunk {
+                            data: s16le_data,
+                            stream_id,
+                        } => {
+                            // Check for stream switch - drop old chunks atomically!
+                            if stream_id != current_stream_id {
+                                if current_stream_id != 0 {
+                                    log::info!(
+                                        "🔄 Stream switch: {} → {} (dropping old audio)",
+                                        current_stream_id,
+                                        stream_id
+                                    );
+
+                                    // Drain command queue of old stream chunks
+                                    let mut drained_from_queue = 0;
+                                    while let Ok(cmd) = command_rx.try_recv() {
+                                        match cmd {
+                                            AudioCommand::WriteChunk {
+                                                stream_id: cmd_sid, ..
+                                            } => {
+                                                if cmd_sid == current_stream_id {
+                                                    drained_from_queue += 1;
+                                                } else {
+                                                    // Put it back if it's for new stream (shouldn't happen but be safe)
+                                                    // Actually can't put back, so we need to handle in order
+                                                    // Better approach: just break when we see new stream
+                                                    break;
+                                                }
+                                            }
+                                            AudioCommand::EndStreamAndWait(tx) => {
+                                                completion_signals.push(tx);
+                                            }
+                                            AudioCommand::Abort => {
+                                                // Keep processing abort
+                                            }
+                                        }
+                                    }
+
+                                    // Clear playback buffer
+                                    {
+                                        let mut buffer = audio_buffer.lock().unwrap();
+                                        buffer.clear();
+                                    }
+
+                                    if drained_from_queue > 0 {
+                                        log::info!(
+                                            "🗑️  Dropped {} old chunks from stream {}",
+                                            drained_from_queue,
+                                            current_stream_id
+                                        );
+                                    }
+
+                                    // Signal completion for old stream
+                                    for tx in completion_signals.drain(..) {
+                                        let _ = tx.send(());
+                                    }
+                                } else {
+                                    log::info!("🆕 First stream started: {}", stream_id);
+                                }
+                                current_stream_id = stream_id;
+                            }
+
+                            // Add to platform-appropriate buffer (only if same stream)
                             {
                                 let mut buffer = audio_buffer.lock().unwrap();
                                 buffer.extend_from_s16le(&s16le_data, hardware_channels)?;
@@ -428,7 +492,7 @@ impl AudioSink {
                             let mut drained_count = 0;
                             while let Ok(cmd) = command_rx.try_recv() {
                                 match cmd {
-                                    AudioCommand::WriteChunk(_) => {
+                                    AudioCommand::WriteChunk { .. } => {
                                         drained_count += 1;
                                         // Drop the chunk, don't add to buffer
                                     }
@@ -453,6 +517,10 @@ impl AudioSink {
                                 let mut buffer = audio_buffer.lock().unwrap();
                                 buffer.clear();
                             }
+
+                            // Reset stream tracking on abort
+                            current_stream_id = 0;
+
                             for tx in completion_signals.drain(..) {
                                 let _ = tx.send(());
                             }

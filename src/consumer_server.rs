@@ -79,18 +79,19 @@ pub struct ConsumerServer {
     audio_capture: Arc<Mutex<Option<AudioCapture>>>,
     wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
     vad_processor: Arc<Mutex<Option<VadProcessor>>>,
-    detection_sender: Option<Sender<AudioDetectionPair>>,
     spotify_controller: Option<SpotifyController>,
     barge_in_tx: Option<Sender<()>>, // Sends barge-in signal to producer when wakeword detected during playback
 }
 
 impl ConsumerServer {
     pub fn new(config: ConsumerServerConfig) -> Self {
-        // Create Spotify controller if player specified
-        let spotify_controller = config
-            .spotify_player
-            .as_ref()
-            .map(|player| SpotifyController::new_with_player(player.clone()));
+        // Create Spotify controller (with optional preferred player)
+        // If no player specified, it will auto-detect any available music player
+        let spotify_controller = if let Some(player) = config.spotify_player.as_ref() {
+            Some(SpotifyController::new_with_player(player.clone()))
+        } else {
+            Some(SpotifyController::new()) // Auto-detect mode
+        };
 
         Self {
             config,
@@ -99,7 +100,6 @@ impl ConsumerServer {
             audio_capture: Arc::new(Mutex::new(None)),
             wakeword_model: Arc::new(Mutex::new(None)),
             vad_processor: Arc::new(Mutex::new(None)),
-            detection_sender: None,
             spotify_controller,
             barge_in_tx: None,
         }
@@ -524,6 +524,7 @@ impl ConsumerServer {
                             );
 
                             // Send barge-in signal to producer (automatic server-side barge-in)
+                            // Use try_send - non-blocking, stale signals will be drained by producer
                             if let Some(ref barge_in) = barge_in_tx {
                                 match barge_in.try_send(()) {
                                     Ok(()) => {
@@ -633,7 +634,7 @@ impl ConsumerServer {
         let mut received_pairs = 0u64;
         let mut sent_audio = 0u64;
         let mut sent_wakewords = 0u64;
-        let mut dropped_by_consumer = 0u64;
+        let dropped_by_consumer = 0u64;
         let start_time = Instant::now();
 
         while !should_stop.load(Ordering::SeqCst) {
@@ -723,88 +724,5 @@ impl ConsumerServer {
     /// Stop the server
     pub fn stop(&self) {
         self.should_stop.store(true, Ordering::SeqCst);
-    }
-
-    /// Process audio through wakeword detection and emit wakeword events
-    /// Returns Some(timestamp) if a wake word was detected and sent
-    fn process_wakeword_detection(
-        wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
-        detection_samples: &[i16],
-        threshold: f32,
-        connection: &mut ConsumerConnection<TcpStream>,
-        client_id: &str,
-        last_wakeword_time: &Option<Instant>,
-        debounce_ms: u64,
-        spotify_controller: &Option<SpotifyController>,
-    ) -> Result<Option<Instant>, ConsumerServerError> {
-        if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
-            match model.predict(detection_samples, None, 1.0) {
-                Ok(predictions) => {
-                    // Check predictions against threshold
-                    for (model_name, confidence) in predictions {
-                        if confidence >= threshold {
-                            // Check debouncing - don't send wake word if we sent one recently
-                            let now = Instant::now();
-                            let should_debounce = if let Some(last_time) = last_wakeword_time {
-                                now.duration_since(*last_time).as_millis() < debounce_ms as u128
-                            } else {
-                                false
-                            };
-
-                            if should_debounce {
-                                log::debug!(
-                                    "🔇 [{}] Wake word '{}' debounced (confidence {:.6}) - last detection was {:.1}ms ago",
-                                    client_id,
-                                    model_name,
-                                    confidence,
-                                    last_wakeword_time.unwrap().elapsed().as_millis()
-                                );
-                                continue;
-                            }
-
-                            log::info!(
-                                "🎯 [{}] WAKEWORD DETECTED: '{}' with confidence {:.6}",
-                                client_id,
-                                model_name,
-                                confidence
-                            );
-
-                            // Try to pause Spotify if controller is available
-                            let spotify_was_paused = if let Some(controller) = spotify_controller {
-                                match controller.pause_for_wakeword() {
-                                    Ok(was_paused) => was_paused,
-                                    Err(e) => {
-                                        log::warn!("Failed to pause Spotify: {}", e);
-                                        false
-                                    }
-                                }
-                            } else {
-                                false
-                            };
-
-                            let wakeword_msg = ConsumerMessage::WakewordDetected {
-                                model: model_name,
-                                timestamp: ConsumerMessage::current_timestamp(),
-                                spotify_was_paused,
-                            };
-                            if let Err(e) = connection.write_message(&wakeword_msg) {
-                                log::warn!(
-                                    "❌ Failed to send WakewordDetected to {}: {}",
-                                    client_id,
-                                    e
-                                );
-                            } else {
-                                // Successfully sent wake word event
-                                return Ok(Some(now));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("[{}] Wakeword detection failed: {}", client_id, e);
-                }
-            }
-        }
-        Ok(None) // No wake word detected or sent
     }
 }
