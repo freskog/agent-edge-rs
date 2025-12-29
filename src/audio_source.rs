@@ -125,9 +125,18 @@ impl AudioCapture {
 
         log::info!("🎤 Using input device: {:?}", device.name());
 
-        let supported_config = device
-            .default_input_config()
-            .map_err(|e| AudioCaptureError::Config(e.to_string()))?;
+        let supported_config = match Self::select_input_config(&device, config.channel) {
+            Ok(config) => config,
+            Err(err) => {
+                log::warn!(
+                    "⚠️  Failed to select preferred input config: {}. Falling back to default input config.",
+                    err
+                );
+                device
+                    .default_input_config()
+                    .map_err(|e| AudioCaptureError::Config(e.to_string()))?
+            }
+        };
 
         // Verify channel selection is valid
         if config.channel >= u32::from(supported_config.channels()) {
@@ -232,6 +241,60 @@ impl AudioCapture {
         }
 
         Ok(())
+    }
+
+    fn select_input_config(
+        device: &Device,
+        channel: u32,
+    ) -> Result<cpal::SupportedStreamConfig, AudioCaptureError> {
+        let configs = device
+            .supported_input_configs()
+            .map_err(|e| AudioCaptureError::Config(e.to_string()))?;
+
+        let mut best_config: Option<cpal::SupportedStreamConfig> = None;
+        let mut best_format_rank = u8::MAX;
+        let mut best_rate_diff = u32::MAX;
+
+        for config_range in configs {
+            let channels = config_range.channels() as u32;
+            if channel >= channels {
+                continue;
+            }
+
+            let format_rank = match config_range.sample_format() {
+                SampleFormat::I16 => 0,
+                SampleFormat::F32 => 1,
+                SampleFormat::U16 => 2,
+                _ => 3,
+            };
+
+            let min_rate = config_range.min_sample_rate().0;
+            let max_rate = config_range.max_sample_rate().0;
+            let target_rate = 16000;
+
+            let chosen_rate = if target_rate < min_rate {
+                min_rate
+            } else if target_rate > max_rate {
+                max_rate
+            } else {
+                target_rate
+            };
+
+            let rate_diff = chosen_rate.abs_diff(target_rate);
+            let config = config_range.with_sample_rate(cpal::SampleRate(chosen_rate));
+
+            if format_rank < best_format_rank
+                || (format_rank == best_format_rank && rate_diff < best_rate_diff)
+            {
+                best_format_rank = format_rank;
+                best_rate_diff = rate_diff;
+                best_config = Some(config);
+            }
+        }
+
+        best_config.ok_or_else(|| {
+            AudioCaptureError::Config("No supported input configs found".to_string())
+        })
     }
 
     fn create_input_stream<T>(
