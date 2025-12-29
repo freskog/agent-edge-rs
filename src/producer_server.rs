@@ -77,12 +77,10 @@ impl ProducerServer {
                     log::info!("✅ Audio sink pre-initialized successfully");
                     Ok(())
                 }
-                Err(e) => {
-                    Err(ProducerServerError::Audio(format!(
-                        "Failed to pre-initialize audio sink: {}",
-                        e
-                    )))
-                }
+                Err(e) => Err(ProducerServerError::Audio(format!(
+                    "Failed to pre-initialize audio sink: {}",
+                    e
+                ))),
             }
         } else {
             Ok(())
@@ -268,7 +266,9 @@ impl ProducerServer {
                                 }
                             }
                         } else {
-                            log::debug!("🔇 Barge-in signal received but no audio playing (ignored)");
+                            log::debug!(
+                                "🔇 Barge-in signal received but no audio playing (ignored)"
+                            );
                         }
                     }
                     Err(_) => {
@@ -276,7 +276,7 @@ impl ProducerServer {
                     }
                 }
             }
-            
+
             // Check if playback completion is ready (non-blocking)
             if let Some(ref completion_rx) = pending_completion {
                 match completion_rx.try_recv() {
