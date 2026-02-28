@@ -234,18 +234,29 @@ pub struct AudioSink {
 }
 
 impl AudioSink {
-    /// Create a new audio sink using build-time detected platform
+    /// Create a new audio sink using build-time detected platform.
+    /// Blocks until the ALSA output device is fully configured so that
+    /// other devices on the same card can be opened safely afterward.
     pub fn new(config: AudioSinkConfig) -> Result<Self, AudioError> {
-        // Reduced from 100 to 20 for more responsive barge-in
-        // At 48kHz with typical chunk sizes, 20 slots is still ~200-400ms of buffering
         let (command_tx, command_rx) = bounded(20);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), AudioError>>(1);
 
-        // Start CPAL thread
         let handle = thread::spawn(move || {
-            if let Err(e) = Self::run_cpal_thread(command_rx, config) {
+            if let Err(e) = Self::run_cpal_thread(command_rx, config, ready_tx) {
                 log::error!("CPAL thread failed: {}", e);
             }
         });
+
+        // Wait for the CPAL thread to finish opening the device.
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(AudioError::DeviceError(
+                    "Audio thread died during initialization".to_string(),
+                ))
+            }
+        }
 
         Ok(Self {
             command_tx,
@@ -297,89 +308,123 @@ impl AudioSink {
     fn run_cpal_thread(
         command_rx: Receiver<AudioCommand>,
         config: AudioSinkConfig,
+        ready_tx: mpsc::SyncSender<Result<(), AudioError>>,
     ) -> Result<(), AudioError> {
         let host = cpal::default_host();
         let platform = PLATFORM;
         let platform_config = platform.playback_config();
 
-        // Get the device
+        // Helper: if device setup fails, notify the caller before returning.
+        macro_rules! bail {
+            ($e:expr) => {{
+                let err: AudioError = $e;
+                let _ = ready_tx.send(Err(err.clone()));
+                return Err(err);
+            }};
+        }
+
         let device = if let Some(name) = &config.device_name {
-            // List all available output devices
             log::info!("AudioSink: Available output devices:");
             let mut found_device = None;
-            for device in host.output_devices()? {
-                let device_name = device.name()?;
-                log::info!("  - {}", device_name);
-                if device_name == *name {
-                    found_device = Some(device);
+            match host.output_devices() {
+                Ok(devices) => {
+                    for device in devices {
+                        match device.name() {
+                            Ok(device_name) => {
+                                log::info!("  - {}", device_name);
+                                if device_name == *name {
+                                    found_device = Some(device);
+                                }
+                            }
+                            Err(e) => bail!(AudioError::from(e)),
+                        }
+                    }
                 }
+                Err(e) => bail!(AudioError::from(e)),
             }
-            found_device.ok_or_else(|| {
-                AudioError::DeviceError(format!("Output device '{}' not found", name))
-            })?
+            match found_device {
+                Some(d) => d,
+                None => bail!(AudioError::DeviceError(format!(
+                    "Output device '{}' not found",
+                    name
+                ))),
+            }
         } else {
-            host.default_output_device()
-                .ok_or_else(|| AudioError::DeviceError("No output device available".to_string()))?
+            match host.default_output_device() {
+                Some(d) => d,
+                None => bail!(AudioError::DeviceError(
+                    "No output device available".to_string()
+                )),
+            }
         };
 
         log::info!("🔊 Using output device: {:?}", device.name());
 
-        let supported_config = device
-            .default_output_config()
-            .map_err(|e| AudioError::DeviceError(e.to_string()))?;
+        let target_format = match platform_config.format {
+            PlatformSampleFormat::I16 => SampleFormat::I16,
+            PlatformSampleFormat::F32 => SampleFormat::F32,
+        };
+        let target_rate = platform_config.sample_rate;
+        let target_channels = platform_config.channels as u16;
+
+        let supported_config = Self::select_output_config(
+            &device,
+            target_format,
+            target_rate,
+            target_channels,
+        )
+        .unwrap_or_else(|e| {
+            log::warn!(
+                "⚠️  Preferred output config not found ({}), using device default",
+                e
+            );
+            device.default_output_config().expect("no output config")
+        });
 
         let stream_config = supported_config.config();
         let hardware_sample_rate = stream_config.sample_rate.0;
         let hardware_channels = stream_config.channels;
-        let hardware_format = supported_config.sample_format();
+        let use_format = supported_config.sample_format();
 
         log::info!(
-            "🔊 Platform: {} wants {:?}, Hardware: {}Hz, {}ch, {:?}",
-            platform,
-            platform_config.format,
+            "🔊 Selected output: {}Hz, {}ch, {:?} (platform wanted: {}Hz, {}ch, {:?})",
             hardware_sample_rate,
             hardware_channels,
-            hardware_format
+            use_format,
+            target_rate,
+            target_channels,
+            target_format,
         );
 
-        // Choose optimal format based on platform preference and hardware support
-        let use_format = match (&platform_config.format, hardware_format) {
-            (PlatformSampleFormat::I16, SampleFormat::I16) => {
-                log::info!("✅ Perfect match: using I16 format (no conversions)");
-                SampleFormat::I16
-            }
-            (PlatformSampleFormat::F32, _) => {
-                log::info!("✅ Using F32 format as preferred by platform");
-                SampleFormat::F32
-            }
-            (PlatformSampleFormat::I16, _) => {
-                log::warn!("⚠️  Hardware doesn't support I16, falling back to F32");
-                SampleFormat::F32
-            }
-        };
-
-        // Create platform-appropriate buffer
         let audio_buffer = Arc::new(Mutex::new(PlatformAudioBuffer::new_with_stream_format(
             use_format,
         )));
 
-        // Create stream based on chosen format
         let stream = match use_format {
             SampleFormat::I16 => {
-                Self::create_i16_stream(&device, &stream_config, Arc::clone(&audio_buffer))?
+                Self::create_i16_stream(&device, &stream_config, Arc::clone(&audio_buffer))
             }
             SampleFormat::F32 => {
-                Self::create_f32_stream(&device, &stream_config, Arc::clone(&audio_buffer))?
+                Self::create_f32_stream(&device, &stream_config, Arc::clone(&audio_buffer))
             }
-            _ => {
-                return Err(AudioError::DeviceError(format!(
-                    "Unsupported sample format: {:?}",
-                    use_format
-                )));
-            }
-        };
+            _ => Err(AudioError::DeviceError(format!(
+                "Unsupported sample format: {:?}",
+                use_format
+            ))),
+        }
+        .map_err(|e| {
+            let _ = ready_tx.send(Err(e.clone()));
+            e
+        })?;
 
-        stream.play()?;
+        stream.play().map_err(|e| {
+            let err = AudioError::from(e);
+            let _ = ready_tx.send(Err(err.clone()));
+            err
+        })?;
+
+        // Device is fully configured and playing — safe for other devices on this card.
+        let _ = ready_tx.send(Ok(()));
 
         // Process commands with stream ID tracking
         let mut completion_signals: Vec<mpsc::Sender<()>> = Vec::new();
@@ -558,6 +603,50 @@ impl AudioSink {
         }
 
         Ok(())
+    }
+
+    /// Pick the best output config, preferring the given format/rate/channels.
+    fn select_output_config(
+        device: &cpal::Device,
+        target_format: SampleFormat,
+        target_rate: u32,
+        target_channels: u16,
+    ) -> Result<cpal::SupportedStreamConfig, AudioError> {
+        let configs = device
+            .supported_output_configs()
+            .map_err(|e| AudioError::DeviceError(e.to_string()))?;
+
+        let mut best: Option<cpal::SupportedStreamConfig> = None;
+        let mut best_score = u32::MAX;
+
+        for range in configs {
+            let ch = range.channels();
+            // Skip configs that don't have the right channel count
+            if ch != target_channels {
+                continue;
+            }
+
+            let format_penalty: u32 = if range.sample_format() == target_format {
+                0
+            } else {
+                100
+            };
+
+            let min = range.min_sample_rate().0;
+            let max = range.max_sample_rate().0;
+            let rate = target_rate.clamp(min, max);
+            let rate_penalty = rate.abs_diff(target_rate);
+
+            let score = format_penalty + rate_penalty;
+            if score < best_score {
+                best_score = score;
+                best = Some(range.with_sample_rate(cpal::SampleRate(rate)));
+            }
+        }
+
+        best.ok_or_else(|| {
+            AudioError::DeviceError("No matching output config found".to_string())
+        })
     }
 
     /// Create I16 CPAL stream (optimal for Raspberry Pi)

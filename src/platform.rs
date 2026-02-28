@@ -16,12 +16,12 @@ impl AudioPlatform {
     pub fn capture_config(self) -> PlatformCaptureConfig {
         match self {
             AudioPlatform::RaspberryPi => PlatformCaptureConfig {
-                // RespeakerPi 4-mic array: 6 channels, 16kHz, i16
+                // XVF3800 via ALSA plugin chain: 16kHz, i16, mono
                 preferred_sample_rate: 16000,
                 preferred_format: PlatformSampleFormat::I16,
-                channel_count: 6,
-                target_channel: 0, // Extract channel 0
-                description: "RespeakerPi 4-mic USB array",
+                channel_count: 1,
+                target_channel: 0,
+                description: "XVF3800 capture (via xvf_cap_stt16)",
             },
             AudioPlatform::MacOS => PlatformCaptureConfig {
                 // macOS built-in: typically f32, 44.1kHz, mono
@@ -38,11 +38,11 @@ impl AudioPlatform {
     pub fn playback_config(self) -> PlatformPlaybackConfig {
         match self {
             AudioPlatform::RaspberryPi => PlatformPlaybackConfig {
-                // I2S DAC: 48kHz, i16, stereo (better scaling from 16kHz)
+                // XVF3800 playback: 48kHz, i16, stereo (hw is 2ch only)
                 sample_rate: 48000,
                 format: PlatformSampleFormat::I16,
-                channels: 2, // Stereo output
-                description: "Raspberry Pi I2S DAC",
+                channels: 2,
+                description: "XVF3800 playback (hw:XVF3800,0)",
             },
             AudioPlatform::MacOS => PlatformPlaybackConfig {
                 // macOS speakers: 48kHz, f32, stereo (better scaling from 16kHz)

@@ -112,12 +112,22 @@ impl AudioCapture {
         let host = cpal::default_host();
         log::info!("🎤 Initializing audio capture with host: {:?}", host.id());
 
-        // Get the device
+        // Get the device — use default_input_device() directly for "default" to avoid
+        // host.devices() which opens both playback+capture handles for every device,
+        // causing contention on shared cards like XVF3800.
         let device = if let Some(id) = &config.device_id {
-            host.devices()
-                .map_err(|e| AudioCaptureError::Device(e.to_string()))?
-                .find(|d| d.name().map(|n| n == *id).unwrap_or(false))
-                .ok_or_else(|| AudioCaptureError::Device(format!("Device not found: {}", id)))?
+            if id == "default" {
+                host.default_input_device().ok_or_else(|| {
+                    AudioCaptureError::Device("No default input device found".into())
+                })?
+            } else {
+                host.devices()
+                    .map_err(|e| AudioCaptureError::Device(e.to_string()))?
+                    .find(|d| d.name().map(|n| n == *id).unwrap_or(false))
+                    .ok_or_else(|| {
+                        AudioCaptureError::Device(format!("Device not found: {}", id))
+                    })?
+            }
         } else {
             host.default_input_device()
                 .ok_or_else(|| AudioCaptureError::Device("No default input device found".into()))?
@@ -125,11 +135,38 @@ impl AudioCapture {
 
         log::info!("🎤 Using input device: {:?}", device.name());
 
-        let supported_config = match Self::select_input_config(&device, config.channel) {
-            Ok(config) => config,
+        let (stream, _hardware_sample_rate) =
+            Self::try_open_stream(&device, &config, &sender)?;
+
+        stream
+            .play()
+            .map_err(|e| AudioCaptureError::Stream(e.to_string()))?;
+
+        let _stream = stream;
+        let _host = host;
+
+        loop {
+            if stop_receiver.try_recv().is_ok() {
+                log::info!("Audio capture thread received stop signal. Exiting.");
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        Ok(())
+    }
+
+    /// Attempt to open the audio stream once, returning (stream, sample_rate).
+    fn try_open_stream(
+        device: &Device,
+        config: &AudioCaptureConfig,
+        sender: &Sender<Vec<u8>>,
+    ) -> Result<(CpalStream, u32), AudioCaptureError> {
+        let supported_config = match Self::select_input_config(device, config.channel) {
+            Ok(cfg) => cfg,
             Err(err) => {
                 log::warn!(
-                    "⚠️  Failed to select preferred input config: {}. Falling back to default input config.",
+                    "⚠️  Failed to select preferred input config: {}. Falling back to default.",
                     err
                 );
                 device
@@ -138,7 +175,6 @@ impl AudioCapture {
             }
         };
 
-        // Verify channel selection is valid
         if config.channel >= u32::from(supported_config.channels()) {
             return Err(AudioCaptureError::Config(format!(
                 "Selected channel {} is not available (device has {} channels)",
@@ -158,7 +194,6 @@ impl AudioCapture {
             supported_config.sample_format()
         );
 
-        // Create resampler if needed (macOS will need this)
         let resampler = if hardware_sample_rate != 16000 {
             let ratio = 16000.0 / hardware_sample_rate as f64;
             let params = SincInterpolationParameters {
@@ -187,10 +222,10 @@ impl AudioCapture {
             log::error!("Audio stream error: {}", err);
         };
 
-        // Build the stream with the appropriate sample format
+        let sender = sender.clone();
         let stream = match supported_config.sample_format() {
             SampleFormat::I16 => Self::create_input_stream::<i16>(
-                &device,
+                device,
                 &stream_config,
                 config.channel,
                 channels,
@@ -199,7 +234,7 @@ impl AudioCapture {
                 err_fn,
             )?,
             SampleFormat::U16 => Self::create_input_stream::<u16>(
-                &device,
+                device,
                 &stream_config,
                 config.channel,
                 channels,
@@ -208,7 +243,7 @@ impl AudioCapture {
                 err_fn,
             )?,
             SampleFormat::F32 => Self::create_input_stream::<f32>(
-                &device,
+                device,
                 &stream_config,
                 config.channel,
                 channels,
@@ -223,24 +258,7 @@ impl AudioCapture {
             }
         };
 
-        stream
-            .play()
-            .map_err(|e| AudioCaptureError::Stream(e.to_string()))?;
-
-        // Keep the stream and host alive by holding them in this thread
-        let _stream = stream;
-        let _host = host;
-
-        // Keep the thread alive to maintain the audio capture
-        loop {
-            if stop_receiver.try_recv().is_ok() {
-                log::info!("Audio capture thread received stop signal. Exiting.");
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        Ok(())
+        Ok((stream, hardware_sample_rate))
     }
 
     fn select_input_config(
