@@ -13,22 +13,10 @@ log = "0.4"
 env_logger = "0.11"
 clap = { version = "4.0", features = ["derive"] }
 crossbeam = "0.8"
-crossbeam-channel = "0.5"
-rubato = "0.16.2"
 ctrlc = "3.4"
-samplerate = "0.2"
-hound = "3.5"                                     # For reading wave files
-
 
 # Wakeword detection dependencies
 voice_activity_detector = "0.2.0"        # VAD processing
 tflitec = { path = "./tflitec-rs-fork" } # TensorFlow Lite models
-ndarray = "0.16"                         # Array operations
-anyhow = "1.0"                           # Error handling
-
-[features]
-audio_available = []
 
 [build-dependencies]
-cpal = "0.16.0"
-cc = "1.0"      # For wakeword native code

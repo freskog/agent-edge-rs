@@ -29,15 +29,18 @@ PRODUCER INTERFACE (Port 8081):
 EXAMPLES:
   # Start service with default ports
   audio_service
-  
-  # Start with custom ports  
-  audio_service --consumer-port 9080 --producer-port 9081
-  
+
+  # Start with custom ports
+  audio_service --consumer-bind 0.0.0.0:9080 --producer-bind 0.0.0.0:9081
+
   # List available audio devices
   audio_service --list-devices
-  
+
   # Use specific audio devices
   audio_service --input-device \"ReSpeaker 4 Mic Array\" --output-device \"Built-in Audio\"
+
+  # Pause spotifyd on wakeword detection
+  audio_service --spotify-player spotifyd
 ")]
 struct Args {
     /// Consumer server bind address (for audio streaming)
@@ -64,12 +67,8 @@ struct Args {
     #[arg(long, default_value = "0")]
     input_channel: u32,
 
-    /// Wakeword detection channel (0-based index, defaults to same as input_channel)
-    #[arg(long)]
-    wakeword_channel: Option<u32>,
-
-    /// Spotify player name for playerctl (e.g., "spotify", "spotifyd")
-    /// If not specified, will auto-detect any available music player
+    /// Spotify/media player name for playerctl (e.g., "spotifyd")
+    /// When specified, pauses the player on wakeword detection
     #[arg(long)]
     spotify_player: Option<String>,
 }
@@ -88,20 +87,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🎯 Consumer server: {}", args.consumer_bind);
     info!("🔊 Producer server: {}", args.producer_bind);
 
-    // Prepare configurations
-    let wakeword_channel = args.wakeword_channel.unwrap_or(args.input_channel);
-
     let consumer_config = ConsumerServerConfig {
         bind_address: args.consumer_bind,
         audio_capture_config: AudioCaptureConfig {
             device_id: args.input_device.clone(),
             channel: args.input_channel,
         },
-        wakeword_channel, // Wakeword detection channel
-        wakeword_models: vec!["hey_mycroft".to_string()], // Default wakeword model
-        detection_threshold: 0.5, // Default detection threshold
-        vad_config: VadConfig::default(), // Default VAD configuration
-        spotify_player: args.spotify_player.clone(), // Spotify player for playerctl
+        wakeword_models: vec!["hey_mycroft".to_string()],
+        detection_threshold: 0.5,
+        vad_config: VadConfig::default(),
+        spotify_player: args.spotify_player.clone(),
     };
 
     let producer_config = ProducerServerConfig {

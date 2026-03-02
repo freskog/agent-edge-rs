@@ -1,15 +1,13 @@
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, FromSample, Sample, SampleFormat, SizedSample, Stream as CpalStream,
+    Device, SampleFormat, Stream as CpalStream,
 };
 use crossbeam::channel::{bounded, Receiver, Sender};
-use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
+
+pub use crate::types::AudioDeviceInfo;
 
 pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size (in samples)
 
@@ -23,8 +21,6 @@ pub enum AudioCaptureError {
     Stream(String),
     #[error("Configuration error: {0}")]
     Config(String),
-    #[error("Resampling error: {0}")]
-    Resampling(String),
 }
 
 /// Audio capture configuration
@@ -32,7 +28,7 @@ pub enum AudioCaptureError {
 pub struct AudioCaptureConfig {
     /// Device ID to capture from (None = default device)
     pub device_id: Option<String>,
-    /// Channel to capture (0-based index) - we always use channel 0
+    /// Channel to capture (0-based index)
     pub channel: u32,
 }
 
@@ -45,17 +41,8 @@ impl Default for AudioCaptureConfig {
     }
 }
 
-/// Audio device information
-#[derive(Debug, Clone)]
-pub struct AudioDeviceInfo {
-    pub name: String,
-    pub id: String,
-    pub is_default: bool,
-    pub channel_count: u32,
-}
-
-/// Sync audio capture that outputs mono 16kHz s16le chunks
-/// Handles platform-specific resampling automatically
+/// Sync audio capture that outputs mono 16kHz s16le chunks.
+/// Assumes hardware delivers I16 at 16kHz (XVF3800).
 pub struct AudioCapture {
     receiver: Receiver<Vec<u8>>,
     stop_sender: Sender<()>,
@@ -63,20 +50,16 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    /// Create a new audio capture
-    /// Output is always mono 16kHz s16le regardless of hardware
     pub fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
         let (sender, receiver) = bounded(100);
         let (stop_sender, stop_receiver) = bounded(1);
 
-        // Spawn thread to manage CPAL resources
         let handle = thread::spawn(move || {
             if let Err(e) = Self::run_capture_thread(config, sender, stop_receiver) {
                 log::error!("Audio capture thread failed: {}", e);
             }
         });
 
-        // Give the thread a moment to initialize
         thread::sleep(Duration::from_millis(50));
 
         Ok(Self {
@@ -86,24 +69,20 @@ impl AudioCapture {
         })
     }
 
-    /// Stop the audio capture and release the device
     pub fn stop(&self) {
         let _ = self.stop_sender.send(());
     }
 
-    /// Get the next audio chunk as s16le bytes (blocking)
-    /// Returns None if the capture stream has ended
+    /// Get the next audio chunk as s16le bytes (blocking).
     pub fn next_chunk(&self) -> Option<Vec<u8>> {
         self.receiver.recv().ok()
     }
 
-    /// Try to get the next audio chunk without blocking
-    /// Returns None if no chunk is available or stream has ended
+    /// Try to get the next audio chunk without blocking.
     pub fn try_next_chunk(&self) -> Option<Vec<u8>> {
         self.receiver.try_recv().ok()
     }
 
-    /// Internal function that runs in the CPAL thread
     fn run_capture_thread(
         config: AudioCaptureConfig,
         sender: Sender<Vec<u8>>,
@@ -112,9 +91,6 @@ impl AudioCapture {
         let host = cpal::default_host();
         log::info!("🎤 Initializing audio capture with host: {:?}", host.id());
 
-        // Get the device — use default_input_device() directly for "default" to avoid
-        // host.devices() which opens both playback+capture handles for every device,
-        // causing contention on shared cards like XVF3800.
         let device = if let Some(id) = &config.device_id {
             if id == "default" {
                 host.default_input_device().ok_or_else(|| {
@@ -156,7 +132,6 @@ impl AudioCapture {
         Ok(())
     }
 
-    /// Attempt to open the audio stream once, returning (stream, sample_rate).
     fn try_open_stream(
         device: &Device,
         config: &AudioCaptureConfig,
@@ -187,80 +162,39 @@ impl AudioCapture {
         let hardware_sample_rate = stream_config.sample_rate.0;
         let channels = stream_config.channels as usize;
 
+        if supported_config.sample_format() != SampleFormat::I16 {
+            return Err(AudioCaptureError::Config(format!(
+                "Expected I16 sample format, got {:?}",
+                supported_config.sample_format()
+            )));
+        }
+        if hardware_sample_rate != 16000 {
+            return Err(AudioCaptureError::Config(format!(
+                "Expected 16kHz sample rate, got {}Hz",
+                hardware_sample_rate
+            )));
+        }
+
         log::info!(
-            "🎤 Hardware: {}Hz, {} channels, {:?} → Output: 16kHz mono s16le",
+            "🎤 Hardware: {}Hz, {} channels, I16 → Output: 16kHz mono s16le (zero-copy)",
             hardware_sample_rate,
             channels,
-            supported_config.sample_format()
         );
 
-        let resampler = if hardware_sample_rate != 16000 {
-            let ratio = 16000.0 / hardware_sample_rate as f64;
-            let params = SincInterpolationParameters {
-                sinc_len: 32,
-                f_cutoff: 0.95,
-                interpolation: SincInterpolationType::Linear,
-                oversampling_factor: 128,
-                window: WindowFunction::BlackmanHarris2,
-            };
-
-            let resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, CHUNK_SIZE, 1)
-                .map_err(|e| AudioCaptureError::Resampling(e.to_string()))?;
-
-            log::info!(
-                "🔄 Created resampler: {}Hz → 16kHz (ratio: {:.3})",
-                hardware_sample_rate,
-                ratio
-            );
-            Some(Arc::new(Mutex::new(resampler)))
-        } else {
-            log::info!("🔄 No resampling needed (hardware is 16kHz)");
-            None
-        };
-
-        let err_fn = move |err| {
-            log::error!("Audio stream error: {}", err);
-        };
-
         let sender = sender.clone();
-        let stream = match supported_config.sample_format() {
-            SampleFormat::I16 => Self::create_input_stream::<i16>(
-                device,
-                &stream_config,
-                config.channel,
-                channels,
-                sender,
-                resampler,
-                err_fn,
-            )?,
-            SampleFormat::U16 => Self::create_input_stream::<u16>(
-                device,
-                &stream_config,
-                config.channel,
-                channels,
-                sender,
-                resampler,
-                err_fn,
-            )?,
-            SampleFormat::F32 => Self::create_input_stream::<f32>(
-                device,
-                &stream_config,
-                config.channel,
-                channels,
-                sender,
-                resampler,
-                err_fn,
-            )?,
-            _ => {
-                return Err(AudioCaptureError::Config(
-                    "Unsupported sample format".into(),
-                ))
-            }
-        };
+        let stream = Self::create_native_i16_stream(
+            device,
+            &stream_config,
+            config.channel,
+            channels,
+            sender,
+            move |err| log::error!("Audio stream error: {}", err),
+        )?;
 
         Ok((stream, hardware_sample_rate))
     }
 
+    /// Prefer I16 at 16kHz; reject anything else.
     fn select_input_config(
         device: &Device,
         channel: u32,
@@ -281,8 +215,6 @@ impl AudioCapture {
 
             let format_rank = match config_range.sample_format() {
                 SampleFormat::I16 => 0,
-                SampleFormat::F32 => 1,
-                SampleFormat::U16 => 2,
                 _ => 3,
             };
 
@@ -290,14 +222,7 @@ impl AudioCapture {
             let max_rate = config_range.max_sample_rate().0;
             let target_rate = 16000;
 
-            let chosen_rate = if target_rate < min_rate {
-                min_rate
-            } else if target_rate > max_rate {
-                max_rate
-            } else {
-                target_rate
-            };
-
+            let chosen_rate = target_rate.clamp(min_rate, max_rate);
             let rate_diff = chosen_rate.abs_diff(target_rate);
             let config = config_range.with_sample_rate(cpal::SampleRate(chosen_rate));
 
@@ -315,61 +240,31 @@ impl AudioCapture {
         })
     }
 
-    fn create_input_stream<T>(
+    /// Zero-copy I16 path: copies raw i16 bytes directly without any f32 conversion.
+    fn create_native_i16_stream(
         device: &Device,
         config: &cpal::StreamConfig,
         channel: u32,
         channels: usize,
         sender: Sender<Vec<u8>>,
-        resampler: Option<Arc<Mutex<SincFixedIn<f32>>>>,
         err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
-    ) -> Result<CpalStream, AudioCaptureError>
-    where
-        T: Sample + SizedSample + Send + Sync + 'static,
-        f32: FromSample<T>,
-    {
-        let mut f32_buffer = Vec::new();
+    ) -> Result<CpalStream, AudioCaptureError> {
+        let mut byte_buffer: Vec<u8> = Vec::new();
+        let chunk_bytes = CHUNK_SIZE * 2;
 
         device
             .build_input_stream(
                 config,
-                move |data: &[T], _| {
-                    // Extract channel 0 and convert to f32
+                move |data: &[i16], _| {
                     for frame in data.chunks(channels) {
-                        if let Some(s) = frame.get(channel as usize) {
-                            f32_buffer.push(f32::from_sample(*s));
+                        if let Some(&s) = frame.get(channel as usize) {
+                            byte_buffer.extend_from_slice(&s.to_le_bytes());
                         }
                     }
 
-                    // Process complete chunks
-                    while f32_buffer.len() >= CHUNK_SIZE {
-                        let chunk: Vec<f32> = f32_buffer.drain(..CHUNK_SIZE).collect();
-
-                        // Apply resampling if needed
-                        let output_samples = if let Some(ref resampler) = resampler {
-                            match resampler.lock() {
-                                Ok(mut r) => match r.process(&[chunk], None) {
-                                    Ok(output_channels) => output_channels[0].clone(),
-                                    Err(e) => {
-                                        log::error!("Resampling error: {}", e);
-                                        continue;
-                                    }
-                                },
-                                Err(_) => {
-                                    log::error!("Failed to lock resampler");
-                                    continue;
-                                }
-                            }
-                        } else {
-                            chunk
-                        };
-
-                        // Convert to s16le bytes
-                        let s16le_bytes = Self::f32_to_s16le_bytes(&output_samples);
-
-                        // Send to receiver (non-blocking)
-                        if sender.try_send(s16le_bytes).is_err() {
-                            // Channel is full or closed, drop the chunk
+                    while byte_buffer.len() >= chunk_bytes {
+                        let chunk: Vec<u8> = byte_buffer.drain(..chunk_bytes).collect();
+                        if sender.try_send(chunk).is_err() {
                             break;
                         }
                     }
@@ -380,22 +275,6 @@ impl AudioCapture {
             .map_err(|e| AudioCaptureError::Stream(e.to_string()))
     }
 
-    /// Convert f32 samples to s16le bytes
-    fn f32_to_s16le_bytes(f32_samples: &[f32]) -> Vec<u8> {
-        let mut s16le_bytes = Vec::with_capacity(f32_samples.len() * 2);
-
-        for &sample in f32_samples {
-            // Clamp to [-1.0, 1.0] and convert to i16 using symmetric scaling
-            let clamped = sample.clamp(-1.0, 1.0);
-            // Use 32768.0 for proper symmetric conversion (matches STT service expectation)
-            let i16_sample = (clamped * 32768.0).clamp(-32768.0, 32767.0) as i16;
-            s16le_bytes.extend_from_slice(&i16_sample.to_le_bytes());
-        }
-
-        s16le_bytes
-    }
-
-    /// List available audio devices
     pub fn list_devices() -> Result<Vec<AudioDeviceInfo>, AudioCaptureError> {
         let host = cpal::default_host();
         let devices = host
@@ -431,7 +310,6 @@ impl Drop for AudioCapture {
     fn drop(&mut self) {
         log::debug!("🎤 Dropping AudioCapture - sending stop signal");
         let _ = self.stop_sender.send(());
-        // Give the thread a moment to clean up
         thread::sleep(Duration::from_millis(10));
     }
 }

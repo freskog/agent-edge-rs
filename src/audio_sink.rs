@@ -4,20 +4,15 @@ use cpal::{
     SupportedStreamConfigsError,
 };
 use crossbeam::channel::{bounded, Receiver, Sender};
-use log::error;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
-// Use the existing platform infrastructure
-use crate::platform::{AudioPlatform, PlatformSampleFormat};
+pub use crate::types::AudioDeviceInfo;
 
-// Build-time platform detection using existing types
-#[cfg(target_os = "macos")]
-const PLATFORM: AudioPlatform = AudioPlatform::MacOS;
-#[cfg(target_os = "linux")]
-const PLATFORM: AudioPlatform = AudioPlatform::RaspberryPi;
+const TARGET_SAMPLE_RATE: u32 = 48000;
+const TARGET_CHANNELS: u16 = 1;
 
 #[derive(Error, Debug, Clone)]
 pub enum AudioError {
@@ -63,7 +58,6 @@ impl From<DeviceNameError> for AudioError {
 
 #[derive(Clone)]
 pub struct AudioSinkConfig {
-    /// Optional output device name
     pub device_name: Option<String>,
 }
 
@@ -74,167 +68,46 @@ impl Default for AudioSinkConfig {
 }
 
 enum AudioCommand {
-    WriteChunk { data: Vec<u8>, stream_id: u64 }, // mono 48kHz s16le data to play with stream ID
-    EndStreamAndWait(mpsc::Sender<()>),           // Signal end and wait for completion
-    Abort,                                        // Abort current playback
+    WriteChunk { data: Vec<u8>, stream_id: u64 },
+    EndStreamAndWait(mpsc::Sender<()>),
+    Abort,
 }
 
-/// Platform-aware audio buffer that avoids unnecessary conversions
-enum PlatformAudioBuffer {
-    I16(Vec<i16>), // For Raspberry Pi - stays in integer domain
-    F32(Vec<f32>), // For macOS - uses floating point
+/// Parse s16le bytes into the i16 playback buffer.
+fn extend_buffer_from_s16le(buffer: &mut Vec<i16>, s16le_data: &[u8]) -> Result<(), AudioError> {
+    if s16le_data.len() % 2 != 0 {
+        return Err(AudioError::WriteError(
+            "S16LE data length not aligned to 16-bit samples".to_string(),
+        ));
+    }
+    buffer.reserve(s16le_data.len() / 2);
+    for chunk in s16le_data.chunks_exact(2) {
+        buffer.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    Ok(())
 }
 
-impl PlatformAudioBuffer {
-    /// Create buffer based on actual stream format (fixes cross-platform format mismatch)
-    fn new_with_stream_format(stream_format: SampleFormat) -> Self {
-        match stream_format {
-            SampleFormat::I16 => {
-                log::info!("🔊 Using I16 audio buffer (matches stream format)");
-                Self::I16(Vec::new())
-            }
-            SampleFormat::F32 => {
-                log::info!("🔊 Using F32 audio buffer (matches stream format)");
-                Self::F32(Vec::new())
-            }
-            _ => {
-                log::warn!(
-                    "⚠️  Unsupported stream format {:?}, defaulting to F32 buffer",
-                    stream_format
-                );
-                Self::F32(Vec::new())
-            }
-        }
-    }
-
-    /// Add s16le data to buffer with platform-optimized conversion
-    fn extend_from_s16le(
-        &mut self,
-        s16le_data: &[u8],
-        target_channels: u16,
-    ) -> Result<(), AudioError> {
-        if s16le_data.len() % 2 != 0 {
-            return Err(AudioError::WriteError(
-                "S16LE data length not aligned to 16-bit samples".to_string(),
-            ));
-        }
-
-        match self {
-            Self::I16(buffer) => {
-                // Raspberry Pi path: s16le → s16 → stereo s16 (no f32 conversion!)
-                let mono_samples: Vec<i16> = s16le_data
-                    .chunks_exact(2)
-                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-                    .collect();
-
-                if target_channels == 2 {
-                    // Convert mono to stereo in integer domain
-                    for sample in mono_samples {
-                        buffer.push(sample); // Left channel
-                        buffer.push(sample); // Right channel
-                    }
-                } else if target_channels == 1 {
-                    buffer.extend_from_slice(&mono_samples);
-                } else {
-                    return Err(AudioError::WriteError(format!(
-                        "Unsupported channel count: {}",
-                        target_channels
-                    )));
-                }
-            }
-            Self::F32(buffer) => {
-                // macOS path: s16le → f32 → stereo f32 (conversion needed for hardware)
-                let mono_samples: Vec<f32> = s16le_data
-                    .chunks_exact(2)
-                    .map(|chunk| {
-                        let i16_sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                        i16_sample as f32 / 32768.0 // Scale to [-1.0, 1.0]
-                    })
-                    .collect();
-
-                if target_channels == 2 {
-                    // Convert mono to stereo
-                    for sample in mono_samples {
-                        buffer.push(sample); // Left channel
-                        buffer.push(sample); // Right channel
-                    }
-                } else if target_channels == 1 {
-                    buffer.extend_from_slice(&mono_samples);
-                } else {
-                    return Err(AudioError::WriteError(format!(
-                        "Unsupported channel count: {}",
-                        target_channels
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::I16(buffer) => buffer.len(),
-            Self::F32(buffer) => buffer.len(),
-        }
-    }
-
-    fn clear(&mut self) {
-        match self {
-            Self::I16(buffer) => buffer.clear(),
-            Self::F32(buffer) => buffer.clear(),
-        }
-    }
-
-    /// Extract samples for I16 stream callback
-    fn extract_i16_samples(&mut self, count: usize) -> (Vec<i16>, bool) {
-        match self {
-            Self::I16(buffer) => {
-                let available = buffer.len();
-                if available >= count {
-                    let samples = buffer.drain(..count).collect();
-                    (samples, false) // No underrun
-                } else {
-                    let samples = buffer.drain(..).collect();
-                    (samples, available < count) // Underrun if we don't have enough
-                }
-            }
-            Self::F32(_) => {
-                log::error!("Attempted to extract I16 samples from F32 buffer!");
-                (vec![0; count], true)
-            }
-        }
-    }
-
-    /// Extract samples for F32 stream callback
-    fn extract_f32_samples(&mut self, count: usize) -> (Vec<f32>, bool) {
-        match self {
-            Self::F32(buffer) => {
-                let available = buffer.len();
-                if available >= count {
-                    let samples = buffer.drain(..count).collect();
-                    (samples, false) // No underrun
-                } else {
-                    let samples = buffer.drain(..).collect();
-                    (samples, available < count) // Underrun if we don't have enough
-                }
-            }
-            Self::I16(_) => {
-                log::error!("Attempted to extract F32 samples from I16 buffer!");
-                (vec![0.0; count], true)
-            }
-        }
+/// Drain up to `count` samples from the buffer.
+/// Returns (samples, underrun).
+fn drain_samples(buffer: &mut Vec<i16>, count: usize) -> (Vec<i16>, bool) {
+    let available = buffer.len();
+    if available >= count {
+        let samples = buffer.drain(..count).collect();
+        (samples, false)
+    } else {
+        let samples = buffer.drain(..).collect();
+        (samples, available < count)
     }
 }
 
-/// Sync streaming audio sink
-/// Accepts mono 48kHz s16le and converts to hardware format (stereo)
+/// Sync streaming audio sink.
+/// Accepts mono 48kHz s16le and feeds directly to I16 ALSA hardware.
 pub struct AudioSink {
     command_tx: Sender<AudioCommand>,
     _handle: thread::JoinHandle<()>,
 }
 
 impl AudioSink {
-    /// Create a new audio sink using build-time detected platform.
     /// Blocks until the ALSA output device is fully configured so that
     /// other devices on the same card can be opened safely afterward.
     pub fn new(config: AudioSinkConfig) -> Result<Self, AudioError> {
@@ -247,7 +120,6 @@ impl AudioSink {
             }
         });
 
-        // Wait for the CPAL thread to finish opening the device.
         match ready_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
@@ -264,7 +136,7 @@ impl AudioSink {
         })
     }
 
-    /// Write mono 48kHz s16le audio chunk - returns immediately for low latency
+    /// Write mono 48kHz s16le audio chunk -- returns immediately for low latency.
     pub fn write_chunk(&self, s16le_data: Vec<u8>, stream_id: u64) -> Result<(), AudioError> {
         self.command_tx
             .send(AudioCommand::WriteChunk {
@@ -275,7 +147,7 @@ impl AudioSink {
         Ok(())
     }
 
-    /// Signal end of stream and wait for completion (blocking)
+    /// Signal end of stream and wait for completion (blocking).
     pub fn end_stream_and_wait(&self) -> Result<(), AudioError> {
         let (completion_tx, completion_rx) = mpsc::channel();
         self.command_tx
@@ -288,7 +160,7 @@ impl AudioSink {
         Ok(())
     }
 
-    /// Signal end of stream (non-blocking) - returns a receiver to check completion
+    /// Signal end of stream (non-blocking) -- returns a receiver to check completion.
     pub fn end_stream(&self) -> Result<mpsc::Receiver<()>, AudioError> {
         let (completion_tx, completion_rx) = mpsc::channel();
         self.command_tx
@@ -297,7 +169,7 @@ impl AudioSink {
         Ok(completion_rx)
     }
 
-    /// Abort current playback immediately
+    /// Abort current playback immediately.
     pub fn abort(&self) -> Result<(), AudioError> {
         self.command_tx
             .send(AudioCommand::Abort)
@@ -311,10 +183,7 @@ impl AudioSink {
         ready_tx: mpsc::SyncSender<Result<(), AudioError>>,
     ) -> Result<(), AudioError> {
         let host = cpal::default_host();
-        let platform = PLATFORM;
-        let platform_config = platform.playback_config();
 
-        // Helper: if device setup fails, notify the caller before returning.
         macro_rules! bail {
             ($e:expr) => {{
                 let err: AudioError = $e;
@@ -360,20 +229,7 @@ impl AudioSink {
 
         log::info!("🔊 Using output device: {:?}", device.name());
 
-        let target_format = match platform_config.format {
-            PlatformSampleFormat::I16 => SampleFormat::I16,
-            PlatformSampleFormat::F32 => SampleFormat::F32,
-        };
-        let target_rate = platform_config.sample_rate;
-        let target_channels = platform_config.channels as u16;
-
-        let supported_config = Self::select_output_config(
-            &device,
-            target_format,
-            target_rate,
-            target_channels,
-        )
-        .unwrap_or_else(|e| {
+        let supported_config = Self::select_output_config(&device).unwrap_or_else(|e| {
             log::warn!(
                 "⚠️  Preferred output config not found ({}), using device default",
                 e
@@ -384,38 +240,21 @@ impl AudioSink {
         let stream_config = supported_config.config();
         let hardware_sample_rate = stream_config.sample_rate.0;
         let hardware_channels = stream_config.channels;
-        let use_format = supported_config.sample_format();
 
         log::info!(
-            "🔊 Selected output: {}Hz, {}ch, {:?} (platform wanted: {}Hz, {}ch, {:?})",
+            "🔊 Output: {}Hz, {}ch, {:?}",
             hardware_sample_rate,
             hardware_channels,
-            use_format,
-            target_rate,
-            target_channels,
-            target_format,
+            supported_config.sample_format(),
         );
 
-        let audio_buffer = Arc::new(Mutex::new(PlatformAudioBuffer::new_with_stream_format(
-            use_format,
-        )));
+        let audio_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = match use_format {
-            SampleFormat::I16 => {
-                Self::create_i16_stream(&device, &stream_config, Arc::clone(&audio_buffer))
-            }
-            SampleFormat::F32 => {
-                Self::create_f32_stream(&device, &stream_config, Arc::clone(&audio_buffer))
-            }
-            _ => Err(AudioError::DeviceError(format!(
-                "Unsupported sample format: {:?}",
-                use_format
-            ))),
-        }
-        .map_err(|e| {
-            let _ = ready_tx.send(Err(e.clone()));
-            e
-        })?;
+        let stream = Self::build_i16_stream(&device, &stream_config, Arc::clone(&audio_buffer))
+            .map_err(|e| {
+                let _ = ready_tx.send(Err(e.clone()));
+                e
+            })?;
 
         stream.play().map_err(|e| {
             let err = AudioError::from(e);
@@ -423,15 +262,12 @@ impl AudioSink {
             err
         })?;
 
-        // Device is fully configured and playing — safe for other devices on this card.
         let _ = ready_tx.send(Ok(()));
 
-        // Process commands with stream ID tracking
         let mut completion_signals: Vec<mpsc::Sender<()>> = Vec::new();
-        let mut current_stream_id: u64 = 0; // Track which stream is currently playing
+        let mut current_stream_id: u64 = 0;
 
         loop {
-            // Use timeout to periodically check for completion
             match command_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(command) => {
                     match command {
@@ -439,7 +275,6 @@ impl AudioSink {
                             data: s16le_data,
                             stream_id,
                         } => {
-                            // Check for stream switch - drop old chunks atomically!
                             if stream_id != current_stream_id {
                                 if current_stream_id != 0 {
                                     log::info!(
@@ -448,32 +283,26 @@ impl AudioSink {
                                         stream_id
                                     );
 
-                                    // Drain command queue of old stream chunks
                                     let mut drained_from_queue = 0;
                                     while let Ok(cmd) = command_rx.try_recv() {
                                         match cmd {
                                             AudioCommand::WriteChunk {
-                                                stream_id: cmd_sid, ..
+                                                stream_id: cmd_sid,
+                                                ..
                                             } => {
                                                 if cmd_sid == current_stream_id {
                                                     drained_from_queue += 1;
                                                 } else {
-                                                    // Put it back if it's for new stream (shouldn't happen but be safe)
-                                                    // Actually can't put back, so we need to handle in order
-                                                    // Better approach: just break when we see new stream
                                                     break;
                                                 }
                                             }
                                             AudioCommand::EndStreamAndWait(tx) => {
                                                 completion_signals.push(tx);
                                             }
-                                            AudioCommand::Abort => {
-                                                // Keep processing abort
-                                            }
+                                            AudioCommand::Abort => {}
                                         }
                                     }
 
-                                    // Clear playback buffer
                                     {
                                         let mut buffer = audio_buffer.lock().unwrap();
                                         buffer.clear();
@@ -487,7 +316,6 @@ impl AudioSink {
                                         );
                                     }
 
-                                    // Signal completion for old stream
                                     for tx in completion_signals.drain(..) {
                                         let _ = tx.send(());
                                     }
@@ -497,26 +325,20 @@ impl AudioSink {
                                 current_stream_id = stream_id;
                             }
 
-                            // Add to platform-appropriate buffer (only if same stream)
                             {
                                 let mut buffer = audio_buffer.lock().unwrap();
-                                buffer.extend_from_s16le(&s16le_data, hardware_channels)?;
+                                extend_buffer_from_s16le(&mut buffer, &s16le_data)?;
                             }
 
-                            // CRITICAL FIX: Check completion signals after EVERY chunk
-                            // This prevents buffering 1-2 minutes of audio before checking drain status
                             if !completion_signals.is_empty() {
-                                // Check BOTH command queue AND playback buffer
                                 let queue_is_empty = command_rx.is_empty();
                                 let buffer_len = {
                                     let buffer = audio_buffer.lock().unwrap();
                                     buffer.len()
                                 };
 
-                                // Only signal completion if:
-                                // 1. No more commands in queue (all audio sent)
-                                // 2. Playback buffer is nearly empty (< 20ms remaining)
-                                if queue_is_empty && buffer_len < hardware_sample_rate as usize / 50
+                                if queue_is_empty
+                                    && buffer_len < hardware_sample_rate as usize / 50
                                 {
                                     log::debug!(
                                         "✅ Playback complete: queue empty, buffer={} samples (< 20ms)",
@@ -532,21 +354,16 @@ impl AudioSink {
                             completion_signals.push(tx);
                         }
                         AudioCommand::Abort => {
-                            // PRIORITY HANDLING: Drain all pending commands when abort is received
-                            // This prevents buffered WriteChunk commands from adding more audio
                             let mut drained_count = 0;
                             while let Ok(cmd) = command_rx.try_recv() {
                                 match cmd {
                                     AudioCommand::WriteChunk { .. } => {
                                         drained_count += 1;
-                                        // Drop the chunk, don't add to buffer
                                     }
                                     AudioCommand::EndStreamAndWait(tx) => {
                                         completion_signals.push(tx);
                                     }
-                                    AudioCommand::Abort => {
-                                        // Another abort command, continue draining
-                                    }
+                                    AudioCommand::Abort => {}
                                 }
                             }
 
@@ -557,13 +374,11 @@ impl AudioSink {
                                 );
                             }
 
-                            // Clear buffer and signal completion for any pending operations
                             {
                                 let mut buffer = audio_buffer.lock().unwrap();
                                 buffer.clear();
                             }
 
-                            // Reset stream tracking on abort
                             current_stream_id = 0;
 
                             for tx in completion_signals.drain(..) {
@@ -573,18 +388,13 @@ impl AudioSink {
                     }
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                    // Check if we need to signal completion
                     if !completion_signals.is_empty() {
-                        // Check BOTH command queue AND playback buffer
                         let queue_is_empty = command_rx.is_empty();
                         let buffer_len = {
                             let buffer = audio_buffer.lock().unwrap();
                             buffer.len()
                         };
 
-                        // Only signal completion if:
-                        // 1. No more commands in queue (all audio sent)
-                        // 2. Playback buffer is nearly empty (< 20ms remaining)
                         if queue_is_empty && buffer_len < hardware_sample_rate as usize / 50 {
                             log::debug!(
                                 "✅ Playback complete (timeout check): queue empty, buffer={} samples (< 20ms)",
@@ -605,12 +415,9 @@ impl AudioSink {
         Ok(())
     }
 
-    /// Pick the best output config, preferring the given format/rate/channels.
+    /// Find best I16 output config at 48kHz mono.
     fn select_output_config(
         device: &cpal::Device,
-        target_format: SampleFormat,
-        target_rate: u32,
-        target_channels: u16,
     ) -> Result<cpal::SupportedStreamConfig, AudioError> {
         let configs = device
             .supported_output_configs()
@@ -620,13 +427,10 @@ impl AudioSink {
         let mut best_score = u32::MAX;
 
         for range in configs {
-            let ch = range.channels();
-            // Skip configs that don't have the right channel count
-            if ch != target_channels {
+            if range.channels() != TARGET_CHANNELS {
                 continue;
             }
-
-            let format_penalty: u32 = if range.sample_format() == target_format {
+            let format_penalty: u32 = if range.sample_format() == SampleFormat::I16 {
                 0
             } else {
                 100
@@ -634,8 +438,8 @@ impl AudioSink {
 
             let min = range.min_sample_rate().0;
             let max = range.max_sample_rate().0;
-            let rate = target_rate.clamp(min, max);
-            let rate_penalty = rate.abs_diff(target_rate);
+            let rate = TARGET_SAMPLE_RATE.clamp(min, max);
+            let rate_penalty = rate.abs_diff(TARGET_SAMPLE_RATE);
 
             let score = format_penalty + rate_penalty;
             if score < best_score {
@@ -649,24 +453,21 @@ impl AudioSink {
         })
     }
 
-    /// Create I16 CPAL stream (optimal for Raspberry Pi)
-    fn create_i16_stream(
+    fn build_i16_stream(
         device: &cpal::Device,
         config: &cpal::StreamConfig,
-        audio_buffer: Arc<Mutex<PlatformAudioBuffer>>,
+        audio_buffer: Arc<Mutex<Vec<i16>>>,
     ) -> Result<Stream, AudioError> {
         device
             .build_output_stream(
                 config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     let mut buffer = audio_buffer.lock().unwrap();
-                    let (samples, underrun) = buffer.extract_i16_samples(data.len());
+                    let (samples, underrun) = drain_samples(&mut buffer, data.len());
 
-                    // Copy available samples
                     let copy_len = samples.len().min(data.len());
                     data[..copy_len].copy_from_slice(&samples[..copy_len]);
 
-                    // Fill remainder with silence if underrun
                     if underrun && copy_len < data.len() {
                         for sample in data.iter_mut().skip(copy_len) {
                             *sample = 0;
@@ -679,37 +480,6 @@ impl AudioSink {
             .map_err(AudioError::from)
     }
 
-    /// Create F32 CPAL stream (for macOS)
-    fn create_f32_stream(
-        device: &cpal::Device,
-        config: &cpal::StreamConfig,
-        audio_buffer: Arc<Mutex<PlatformAudioBuffer>>,
-    ) -> Result<Stream, AudioError> {
-        device
-            .build_output_stream(
-                config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut buffer = audio_buffer.lock().unwrap();
-                    let (samples, underrun) = buffer.extract_f32_samples(data.len());
-
-                    // Copy available samples
-                    let copy_len = samples.len().min(data.len());
-                    data[..copy_len].copy_from_slice(&samples[..copy_len]);
-
-                    // Fill remainder with silence if underrun
-                    if underrun && copy_len < data.len() {
-                        for sample in data.iter_mut().skip(copy_len) {
-                            *sample = 0.0;
-                        }
-                    }
-                },
-                |err| log::error!("CPAL F32 stream error: {}", err),
-                None,
-            )
-            .map_err(AudioError::from)
-    }
-
-    /// List available audio devices
     pub fn list_devices() -> Result<Vec<AudioDeviceInfo>, AudioError> {
         let host = cpal::default_host();
         let devices = host
@@ -741,87 +511,37 @@ impl AudioSink {
     }
 }
 
-/// Audio device information
-#[derive(Debug, Clone)]
-pub struct AudioDeviceInfo {
-    pub name: String,
-    pub id: String,
-    pub is_default: bool,
-    pub channel_count: u32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_platform_buffer_optimization() {
-        // Test data: 4 samples of s16le (8 bytes)
+    fn test_s16le_buffer_passthrough() {
         let s16le_data = vec![
-            0x00, 0x10, // Sample 1: 4096
-            0x00, 0x20, // Sample 2: 8192
-            0x00, 0x30, // Sample 3: 12288
-            0x00, 0x40, // Sample 4: 16384
+            0x00, 0x10, // 4096
+            0x00, 0x20, // 8192
+            0x00, 0x30, // 12288
+            0x00, 0x40, // 16384
         ];
 
-        // Test Raspberry Pi (I16) - should stay in integer domain
-        let mut pi_buffer = PlatformAudioBuffer::I16(Vec::new());
-        pi_buffer.extend_from_s16le(&s16le_data, 2).unwrap(); // Stereo
+        let mut buffer = Vec::new();
+        extend_buffer_from_s16le(&mut buffer, &s16le_data).unwrap();
 
-        if let PlatformAudioBuffer::I16(samples) = pi_buffer {
-            // Should have 8 samples (4 mono → 8 stereo)
-            assert_eq!(samples.len(), 8);
-            // Values should be unchanged (no f32 conversion)
-            assert_eq!(samples[0], 4096); // Left
-            assert_eq!(samples[1], 4096); // Right (duplicated)
-            assert_eq!(samples[2], 8192); // Left
-            assert_eq!(samples[3], 8192); // Right (duplicated)
-            println!("✅ Raspberry Pi: No unnecessary conversions! s16le → i16 → stereo i16");
-        } else {
-            panic!("Expected I16 buffer for Raspberry Pi");
-        }
-
-        // Test macOS (F32) - conversion to normalized range
-        let mut mac_buffer = PlatformAudioBuffer::F32(Vec::new());
-        mac_buffer.extend_from_s16le(&s16le_data, 2).unwrap(); // Stereo
-
-        if let PlatformAudioBuffer::F32(samples) = mac_buffer {
-            // Should have 8 samples (4 mono → 8 stereo)
-            assert_eq!(samples.len(), 8);
-            // Values should be normalized to [-1.0, 1.0] range
-            assert_eq!(samples[0], 4096.0 / 32768.0); // ≈ 0.125
-            assert_eq!(samples[1], 4096.0 / 32768.0); // Right (duplicated)
-            assert_eq!(samples[2], 8192.0 / 32768.0); // ≈ 0.25
-            assert_eq!(samples[3], 8192.0 / 32768.0); // Right (duplicated)
-            println!("✅ macOS: Appropriate conversion! s16le → f32 → stereo f32");
-        } else {
-            panic!("Expected F32 buffer for macOS");
-        }
-    }
-
-    #[test]
-    fn test_platform_format_selection() {
-        // Test that we select the right format for each platform
-        let pi_config = AudioPlatform::RaspberryPi.playback_config();
-        let mac_config = AudioPlatform::MacOS.playback_config();
-
-        assert_eq!(pi_config.format, PlatformSampleFormat::I16);
-        assert_eq!(mac_config.format, PlatformSampleFormat::F32);
-
-        println!("✅ Platform detection working correctly:");
-        println!("   Raspberry Pi → I16 (optimal for DAC)");
-        println!("   macOS → F32 (optimal for Core Audio)");
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer[0], 4096);
+        assert_eq!(buffer[1], 8192);
+        assert_eq!(buffer[2], 12288);
+        assert_eq!(buffer[3], 16384);
     }
 
     #[test]
     fn test_buffer_underrun_handling() {
-        let mut buffer = PlatformAudioBuffer::I16(vec![1, 2, 3]);
+        let mut buffer = vec![1i16, 2, 3];
 
-        // Extract more samples than available
-        let (samples, underrun) = buffer.extract_i16_samples(5);
+        let (samples, underrun) = drain_samples(&mut buffer, 5);
 
-        assert_eq!(samples.len(), 3); // Only got what was available
-        assert!(underrun); // Should signal underrun
-        assert_eq!(buffer.len(), 0); // Buffer should be empty after extraction
+        assert_eq!(samples.len(), 3);
+        assert!(underrun);
+        assert_eq!(buffer.len(), 0);
     }
 }
