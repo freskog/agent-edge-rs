@@ -308,6 +308,15 @@ impl ProducerServer {
                 }
             }
 
+            // When waiting for playback completion, don't block on read_message().
+            // The TCP stream is blocking, so read_exact() would block forever
+            // after the client sends EndOfStream and stops writing — preventing
+            // the loop from ever reaching the pending_completion check above.
+            if pending_completion.is_some() {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+
             match connection.read_message() {
                 Ok(message) => {
                     match message {
@@ -431,10 +440,6 @@ impl ProducerServer {
                 Err(ProtocolError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     log::info!("🔌 Producer {} disconnected", addr);
                     break;
-                }
-                Err(ProtocolError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No message available, sleep briefly
-                    thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => {
                     log::error!("❌ Protocol error with producer {}: {}", addr, e);

@@ -337,12 +337,9 @@ impl AudioSink {
                                     buffer.len()
                                 };
 
-                                if queue_is_empty
-                                    && buffer_len < hardware_sample_rate as usize / 50
-                                {
+                                if queue_is_empty && buffer_len == 0 {
                                     log::debug!(
-                                        "✅ Playback complete: queue empty, buffer={} samples (< 20ms)",
-                                        buffer_len
+                                        "✅ Playback complete: queue empty, buffer drained"
                                     );
                                     for tx in completion_signals.drain(..) {
                                         let _ = tx.send(());
@@ -395,10 +392,9 @@ impl AudioSink {
                             buffer.len()
                         };
 
-                        if queue_is_empty && buffer_len < hardware_sample_rate as usize / 50 {
+                        if queue_is_empty && buffer_len == 0 {
                             log::debug!(
-                                "✅ Playback complete (timeout check): queue empty, buffer={} samples (< 20ms)",
-                                buffer_len
+                                "✅ Playback complete (timeout check): queue empty, buffer drained"
                             );
                             for tx in completion_signals.drain(..) {
                                 let _ = tx.send(());
@@ -415,7 +411,7 @@ impl AudioSink {
         Ok(())
     }
 
-    /// Find best I16 output config at 48kHz mono.
+    /// Find best I16 output config at 48kHz, preferring mono but accepting stereo.
     fn select_output_config(
         device: &cpal::Device,
     ) -> Result<cpal::SupportedStreamConfig, AudioError> {
@@ -427,9 +423,14 @@ impl AudioSink {
         let mut best_score = u32::MAX;
 
         for range in configs {
-            if range.channels() != TARGET_CHANNELS {
+            let channel_penalty: u32 = if range.channels() == TARGET_CHANNELS {
+                0
+            } else if range.channels() == 2 {
+                10
+            } else {
                 continue;
-            }
+            };
+
             let format_penalty: u32 = if range.sample_format() == SampleFormat::I16 {
                 0
             } else {
@@ -441,7 +442,7 @@ impl AudioSink {
             let rate = TARGET_SAMPLE_RATE.clamp(min, max);
             let rate_penalty = rate.abs_diff(TARGET_SAMPLE_RATE);
 
-            let score = format_penalty + rate_penalty;
+            let score = format_penalty + rate_penalty + channel_penalty;
             if score < best_score {
                 best_score = score;
                 best = Some(range.with_sample_rate(cpal::SampleRate(rate)));
@@ -458,18 +459,24 @@ impl AudioSink {
         config: &cpal::StreamConfig,
         audio_buffer: Arc<Mutex<Vec<i16>>>,
     ) -> Result<Stream, AudioError> {
+        let channels = config.channels as usize;
         device
             .build_output_stream(
                 config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    let frames = data.len() / channels;
                     let mut buffer = audio_buffer.lock().unwrap();
-                    let (samples, underrun) = drain_samples(&mut buffer, data.len());
+                    let (samples, underrun) = drain_samples(&mut buffer, frames);
 
-                    let copy_len = samples.len().min(data.len());
-                    data[..copy_len].copy_from_slice(&samples[..copy_len]);
+                    for (i, &sample) in samples.iter().enumerate() {
+                        for ch in 0..channels {
+                            data[i * channels + ch] = sample;
+                        }
+                    }
 
-                    if underrun && copy_len < data.len() {
-                        for sample in data.iter_mut().skip(copy_len) {
+                    let filled = samples.len() * channels;
+                    if underrun && filled < data.len() {
+                        for sample in data.iter_mut().skip(filled) {
                             *sample = 0;
                         }
                     }
