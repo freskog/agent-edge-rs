@@ -19,4 +19,12 @@ ctrlc = "3.4"
 voice_activity_detector = "0.2.0"        # VAD processing
 tflitec = { path = "./tflitec-rs-fork" } # TensorFlow Lite models
 
+# LED controller dependencies
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+i2cdev = "0.6"
+tower-http = { version = "0.6", features = ["cors"] }
+
 [build-dependencies]

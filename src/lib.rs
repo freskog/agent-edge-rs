@@ -12,3 +12,7 @@ pub mod wakeword_model;
 pub mod wakeword_models;
 pub mod wakeword_utils;
 pub mod wakeword_vad;
+
+// LED ring control
+pub mod led_engine;
+pub mod led_ring;
