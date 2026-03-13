@@ -1,3 +1,4 @@
+pub mod alsa_volume;
 pub mod audio_sink;
 pub mod audio_source;
 pub mod consumer_server;

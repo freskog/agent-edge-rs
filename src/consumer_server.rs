@@ -53,7 +53,6 @@ pub struct ConsumerServerConfig {
     pub wakeword_models: Vec<String>,
     pub detection_threshold: f32,
     pub vad_config: VadConfig,
-    pub spotify_player: Option<String>,
 }
 
 impl Default for ConsumerServerConfig {
@@ -64,7 +63,6 @@ impl Default for ConsumerServerConfig {
             wakeword_models: vec!["hey_mycroft".to_string()],
             detection_threshold: 0.5,
             vad_config: VadConfig::default(),
-            spotify_player: None,
         }
     }
 }
@@ -77,17 +75,12 @@ pub struct ConsumerServer {
     audio_capture: Arc<Mutex<Option<AudioCapture>>>,
     wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
     vad_processor: Arc<Mutex<Option<VadProcessor>>>,
-    spotify_controller: Option<SpotifyController>,
-    barge_in_tx: Option<Sender<()>>, // Sends barge-in signal to producer when wakeword detected during playback
+    spotify_controller: SpotifyController,
+    barge_in_tx: Option<Sender<()>>,
 }
 
 impl ConsumerServer {
     pub fn new(config: ConsumerServerConfig) -> Self {
-        let spotify_controller = config
-            .spotify_player
-            .as_ref()
-            .map(|player| SpotifyController::new_with_player(player.clone()));
-
         Self {
             config,
             should_stop: Arc::new(AtomicBool::new(false)),
@@ -95,7 +88,7 @@ impl ConsumerServer {
             audio_capture: Arc::new(Mutex::new(None)),
             wakeword_model: Arc::new(Mutex::new(None)),
             vad_processor: Arc::new(Mutex::new(None)),
-            spotify_controller,
+            spotify_controller: SpotifyController::new(),
             barge_in_tx: None,
         }
     }
@@ -219,7 +212,7 @@ impl ConsumerServer {
         vad_processor: Arc<Mutex<Option<VadProcessor>>>,
         config: ConsumerServerConfig,
         sender: Sender<AudioDetectionPair>,
-        spotify_controller: Option<SpotifyController>,
+        spotify_controller: SpotifyController,
         barge_in_tx: Option<Sender<()>>,
     ) -> Result<(), ConsumerServerError> {
         // Initialize audio capture for streaming
@@ -430,7 +423,7 @@ impl ConsumerServer {
         threshold: f32,
         last_wakeword_time: &Option<Instant>,
         debounce_ms: u64,
-        spotify_controller: &Option<SpotifyController>,
+        spotify_controller: &SpotifyController,
         barge_in_tx: &Option<Sender<()>>,
     ) -> Result<Option<(WakewordEvent, Instant)>, ConsumerServerError> {
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
@@ -476,18 +469,8 @@ impl ConsumerServer {
                                 }
                             }
 
-                            // Try to pause Spotify if controller is available
-                            let spotify_was_paused = if let Some(controller) = spotify_controller {
-                                match controller.pause_for_wakeword() {
-                                    Ok(was_paused) => was_paused,
-                                    Err(e) => {
-                                        log::warn!("Failed to pause Spotify: {}", e);
-                                        false
-                                    }
-                                }
-                            } else {
-                                false
-                            };
+                            let spotify_was_paused =
+                                spotify_controller.pause_for_wakeword();
 
                             let wakeword_event = WakewordEvent {
                                 model: model_name,

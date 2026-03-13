@@ -39,8 +39,8 @@ EXAMPLES:
   # Use specific audio devices
   audio_service --input-device \"ReSpeaker 4 Mic Array\" --output-device \"Built-in Audio\"
 
-  # Pause spotifyd on wakeword detection
-  audio_service --spotify-player spotifyd
+  # Boost TTS volume by 30 percentage points
+  audio_service --mixer-name \"XVF3800 SoftMaster\" --tts-volume-boost 30
 ")]
 struct Args {
     /// Consumer server bind address (for audio streaming)
@@ -67,10 +67,13 @@ struct Args {
     #[arg(long, default_value = "0")]
     input_channel: u32,
 
-    /// Spotify/media player name for playerctl (e.g., "spotifyd")
-    /// When specified, pauses the player on wakeword detection
+    /// ALSA mixer element name for volume control (e.g., "XVF3800 SoftMaster")
     #[arg(long)]
-    spotify_player: Option<String>,
+    mixer_name: Option<String>,
+
+    /// TTS volume boost in percentage points added to current volume (e.g., 20)
+    #[arg(long, default_value = "20")]
+    tts_volume_boost: u8,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -96,7 +99,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wakeword_models: vec!["hey_mycroft".to_string()],
         detection_threshold: 0.5,
         vad_config: VadConfig::default(),
-        spotify_player: args.spotify_player.clone(),
     };
 
     let producer_config = ProducerServerConfig {
@@ -104,6 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_sink_config: AudioSinkConfig {
             device_name: args.output_device.clone(),
         },
+        mixer_name: args.mixer_name.clone(),
+        tts_volume_boost: args.tts_volume_boost,
     };
 
     // Create barge-in channel for automatic server-side interruption

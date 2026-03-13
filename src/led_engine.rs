@@ -1,6 +1,6 @@
+use crate::alsa_volume;
 use crate::led_ring::{LedRing, RgbColor, NUM_LEDS};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -103,19 +103,19 @@ impl LedEngine {
             LedEvent::Volume { level } => {
                 self.previous_state = self.base_state();
                 self.volume_leds = (level.min(100) as f32 / 100.0 * NUM_LEDS as f32).round() as u8;
-                set_system_volume(level.min(100));
+                alsa_volume::set_volume(MIXER_NAME, level.min(100));
                 self.transition(LedState::Volume);
             }
             LedEvent::VolumeUp => {
                 self.previous_state = self.base_state();
                 self.volume_leds = (self.volume_leds + VOLUME_STEP).min(NUM_LEDS as u8);
-                set_system_volume(self.volume_percent());
+                alsa_volume::set_volume(MIXER_NAME, self.volume_percent());
                 self.transition(LedState::Volume);
             }
             LedEvent::VolumeDown => {
                 self.previous_state = self.base_state();
                 self.volume_leds = self.volume_leds.saturating_sub(VOLUME_STEP);
-                set_system_volume(self.volume_percent());
+                alsa_volume::set_volume(MIXER_NAME, self.volume_percent());
                 self.transition(LedState::Volume);
             }
         }
@@ -261,20 +261,3 @@ fn render_volume(volume_leds: u8) -> [RgbColor; NUM_LEDS] {
     frame
 }
 
-fn set_system_volume(percent: u8) {
-    let arg = format!("{}%", percent.min(100));
-    match Command::new("amixer")
-        .args(["sset", MIXER_NAME, &arg])
-        .output()
-    {
-        Ok(output) if !output.status.success() => {
-            log::warn!(
-                "amixer exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Err(e) => log::warn!("Failed to run amixer: {}", e),
-        _ => {}
-    }
-}
