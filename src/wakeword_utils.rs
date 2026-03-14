@@ -27,9 +27,6 @@ pub struct AudioFeatures {
 
     // Configuration
     feature_buffer_max_len: usize, // 120 frames (~10 seconds)
-
-    // Track processed chunks to avoid recomputation (like Python)
-    processed_chunks: usize, // Number of chunks we've already computed embeddings for
 }
 
 impl AudioFeatures {
@@ -132,12 +129,15 @@ impl AudioFeatures {
             raw_data_remainder: Vec::new(),
             feature_buffer: VecDeque::new(),
             feature_buffer_max_len: 120, // ~10 seconds
-            processed_chunks: 0,
         };
 
-        // Initialize feature buffer with dummy embeddings to avoid tensor allocation issues
-        // We'll populate this properly when we start processing real audio
-        instance.feature_buffer.push_back(vec![0.0; 96]); // Start with one empty embedding
+        // Initialize feature buffer with embeddings from random noise (matches Python:
+        // self.feature_buffer = self._get_embeddings(np.random.randint(-1000, 1000, 16000*4)))
+        let warmup_noise = Self::generate_warmup_noise(16000 * 4);
+        let warmup_embeddings = instance._get_embeddings(&warmup_noise)?;
+        for emb in warmup_embeddings {
+            instance.feature_buffer.push_back(emb);
+        }
 
         Ok(instance)
     }
@@ -151,13 +151,31 @@ impl AudioFeatures {
         }
         self.accumulated_samples = 0;
         self.raw_data_remainder.clear();
-        self.processed_chunks = 0; // Reset processed chunks counter
 
-        // Reinitialize feature buffer with dummy embeddings
+        // Reinitialize feature buffer with embeddings from random noise (matches Python)
         self.feature_buffer.clear();
-        self.feature_buffer.push_back(vec![0.0; 96]); // Start with one empty embedding
+        let warmup_noise = Self::generate_warmup_noise(16000 * 4);
+        let warmup_embeddings = self._get_embeddings(&warmup_noise)?;
+        for emb in warmup_embeddings {
+            self.feature_buffer.push_back(emb);
+        }
 
         Ok(())
+    }
+
+    /// Generate deterministic pseudo-random noise for model warmup.
+    /// Matches Python: np.random.randint(-1000, 1000, n_samples).astype(np.int16)
+    fn generate_warmup_noise(n_samples: usize) -> Vec<i16> {
+        let mut state: u64 = 42;
+        let mut samples = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let value = ((state >> 33) as i32 % 2001 - 1000) as i16;
+            samples.push(value);
+        }
+        samples
     }
 
     /// Process audio data (main callable interface like Python)
@@ -173,53 +191,59 @@ impl AudioFeatures {
 
     /// Get features for model prediction (matches Python get_features)
     ///
-    /// # Arguments  
-    /// * `n_feature_frames` - Number of feature frames to return (default: 16)
-    /// * `start_ndx` - Starting index in buffer (-1 for most recent)
-    ///
-    /// # Returns
-    /// * Flattened feature vector for model input
+    /// Supports negative indexing like Python/numpy:
+    /// - `start_ndx == -1`: returns the last `n_feature_frames` frames (default behavior)
+    /// - `start_ndx < -1`: interprets as negative index from the end of the buffer
+    ///   e.g., start_ndx=-17 with n_feature_frames=16 returns buffer[-17:-1]
+    /// - `start_ndx >= 0`: interprets as positive index from the start
     pub fn get_features(&self, n_feature_frames: usize, start_ndx: i32) -> Vec<f32> {
         let buffer_len = self.feature_buffer.len();
-
-        // If buffer is empty, return empty vector
         if buffer_len == 0 {
             return Vec::new();
         }
 
-        // Match Python's approach: self.feature_buffer[int(-1*n_feature_frames):, :]
-        let actual_start_ndx = if start_ndx < 0 {
+        let buffer_vec: Vec<_> = self.feature_buffer.iter().collect();
+
+        if start_ndx == -1 {
+            // Default: return the last n_feature_frames
             // Python: self.feature_buffer[int(-1*n_feature_frames):, :]
-            // This takes the last n_feature_frames, even if buffer is shorter
-            if buffer_len >= n_feature_frames {
-                buffer_len - n_feature_frames
-            } else {
-                0 // Take all available frames if buffer is shorter
-            }
-        } else {
-            let end_ndx = (start_ndx as usize + n_feature_frames).min(buffer_len);
-            let buffer_vec: Vec<_> = self.feature_buffer.iter().collect();
-            return buffer_vec[start_ndx as usize..end_ndx]
+            let start = buffer_len.saturating_sub(n_feature_frames);
+            return buffer_vec[start..buffer_len]
                 .iter()
                 .flat_map(|frame| frame.iter().copied())
                 .collect();
-        };
-
-        // Extract frames from buffer
-        let end_ndx = buffer_len; // Always go to end of buffer for negative indices
-        let mut flattened = Vec::new();
-        let buffer_vec: Vec<_> = self.feature_buffer.iter().collect();
-        for i in actual_start_ndx..end_ndx {
-            flattened.extend(buffer_vec[i]);
         }
 
-        // If we have more features than requested, take only the last n_feature_frames worth
-        if flattened.len() > n_feature_frames * 96 {
-            let start_feature_idx = flattened.len() - (n_feature_frames * 96);
-            flattened = flattened[start_feature_idx..].to_vec();
+        if start_ndx < -1 {
+            // Negative indexing (matches Python numpy negative slicing)
+            // Python: end_ndx = start_ndx + n if (start_ndx + n) != 0 else len(buffer)
+            let abs_start = (-start_ndx) as usize;
+            let start = buffer_len.saturating_sub(abs_start);
+            let end_offset = start_ndx + n_feature_frames as i32;
+            let end = if end_offset == 0 {
+                buffer_len
+            } else if end_offset < 0 {
+                buffer_len.saturating_sub((-end_offset) as usize)
+            } else {
+                (start + n_feature_frames).min(buffer_len)
+            };
+
+            if start >= end {
+                return Vec::new();
+            }
+            return buffer_vec[start..end]
+                .iter()
+                .flat_map(|frame| frame.iter().copied())
+                .collect();
         }
 
-        flattened
+        // Positive indexing
+        let start = (start_ndx as usize).min(buffer_len);
+        let end = (start + n_feature_frames).min(buffer_len);
+        buffer_vec[start..end]
+            .iter()
+            .flat_map(|frame| frame.iter().copied())
+            .collect()
     }
 
     /// Compute melspectrogram from audio data
@@ -373,26 +397,27 @@ impl AudioFeatures {
 
     /// Compute embeddings from raw audio (matches Python _get_embeddings)
     fn _get_embeddings(&mut self, x: &[i16]) -> Result<Vec<Vec<f32>>> {
-        let window_size = 76;
-        let step_size = 8;
+        let window_size_frames = 76;
+        let step_size_frames = 8;
+        let features_per_frame = 32;
 
-        // Get melspectrogram
         let spec = self._get_melspectrogram(x)?;
+        let n_frames = spec.len() / features_per_frame;
 
-        // Create windows with step size 8
+        // Python: for i in range(0, spec.shape[0], 8): window = spec[i:i+76]
         let mut windows = Vec::new();
-        for i in (0..spec.len()).step_by(step_size) {
-            if i + window_size * 32 <= spec.len() {
-                let window = &spec[i..i + window_size * 32];
-                windows.push(window.to_vec());
-            }
+        let mut frame_idx = 0;
+        while frame_idx + window_size_frames <= n_frames {
+            let start = frame_idx * features_per_frame;
+            let end = (frame_idx + window_size_frames) * features_per_frame;
+            windows.push(spec[start..end].to_vec());
+            frame_idx += step_size_frames;
         }
 
         if windows.is_empty() {
-            return Ok(vec![vec![0.0; 96]]); // Return default if no windows
+            return Ok(vec![vec![0.0; 96]]);
         }
 
-        // Process each window to get embeddings
         let mut all_embeddings = Vec::new();
         for window in windows {
             let embedding = self._get_embeddings_from_melspec(&window)?;
@@ -426,201 +451,127 @@ impl AudioFeatures {
         // Note: accumulated_samples is managed separately in _streaming_features
     }
 
-    /// Process streaming audio features (matches Python _streaming_features)  
+    /// Process streaming audio features (matches Python _streaming_features)
     fn _streaming_features(&mut self, x: &[i16]) -> Result<usize> {
         log::debug!(
-            "🔍 AudioFeatures::_streaming_features - input: {} samples",
-            x.len()
-        );
-        log::debug!(
-            "🔍 Current state: accumulated_samples={}, remainder={}, buffer_len={}",
+            "🔍 _streaming_features: input={} samples, accumulated={}, remainder={}, buffer={}",
+            x.len(),
             self.accumulated_samples,
             self.raw_data_remainder.len(),
             self.raw_data_buffer.len()
         );
-        log::debug!(
-            "🔍 Feature buffer has {} embeddings",
-            self.feature_buffer.len()
-        );
 
-        // Combine remainder with new data
-        let mut combined_data = self.raw_data_remainder.clone();
-        combined_data.extend(x.iter().copied());
-
-        let chunk_size = 1280; // 80ms at 16kHz
         let mut processed_samples: usize = 0;
 
-        log::debug!(
-            "🔍 Combined data: {} samples, need {} for processing",
-            combined_data.len(),
-            chunk_size
-        );
+        // Prepend any remainder from previous call (matches Python)
+        let x = if !self.raw_data_remainder.is_empty() {
+            let mut combined = std::mem::take(&mut self.raw_data_remainder);
+            combined.extend_from_slice(x);
+            combined
+        } else {
+            x.to_vec()
+        };
 
-        // Only process if we have enough samples for mel computation
-        if self.accumulated_samples + combined_data.len() >= chunk_size {
-            let remainder = (self.accumulated_samples + combined_data.len()) % chunk_size;
+        let chunk_size = 1280;
 
-            let (process_data, remainder_data) = if remainder != 0 {
-                let split_point = combined_data.len() - remainder;
-                (
-                    combined_data[..split_point].to_vec(),
-                    combined_data[split_point..].to_vec(),
-                )
+        if self.accumulated_samples + x.len() >= chunk_size {
+            let remainder = (self.accumulated_samples + x.len()) % chunk_size;
+
+            if remainder != 0 {
+                let split = x.len() - remainder;
+                self._buffer_raw_data(&x[..split]);
+                self.accumulated_samples += split;
+                self.raw_data_remainder = x[split..].to_vec();
             } else {
-                (combined_data.clone(), Vec::new())
-            };
-
-            // Add processed data to buffer and update accumulated samples
-            self._buffer_raw_data(&process_data);
-            self.accumulated_samples += process_data.len();
-            processed_samples = process_data.len();
-
-            // Process in chunks and update melspectrogram buffer
-            if self.accumulated_samples >= chunk_size && self.accumulated_samples % chunk_size == 0
-            {
-                log::debug!(
-                    "🔍 Processing mel chunk: accumulated_samples={}",
-                    self.accumulated_samples
-                );
-
-                // Get melspectrogram for the accumulated samples
-                let buffer_data: Vec<i16> = self.raw_data_buffer.iter().copied().collect();
-                let n_samples = self.accumulated_samples;
-
-                // Extract the most recent n_samples + some padding for melspec computation
-                let start_idx = if buffer_data.len() > n_samples + 480 {
-                    // 480 = 160*3 (3 frames of padding)
-                    buffer_data.len() - n_samples - 480
-                } else {
-                    0
-                };
-
-                let mel_input = &buffer_data[start_idx..];
-                log::debug!("🔍 Getting melspectrogram from {} samples", mel_input.len());
-                let spec = self._get_melspectrogram(mel_input)?;
-                log::debug!("🔍 Got melspectrogram with {} elements", spec.len());
-
-                // The melspectrogram output should be reshaped to frames
-                // Assuming each 1280 samples produces 5 mel frames of 32 features each
-                let frames_per_chunk = 5;
-                let features_per_frame = 32;
-
-                if spec.len() >= frames_per_chunk * features_per_frame {
-                    // Add new frames to melspectrogram buffer
-                    for i in 0..frames_per_chunk {
-                        let start_idx = i * features_per_frame;
-                        let end_idx = (i + 1) * features_per_frame;
-                        let frame = spec[start_idx..end_idx].to_vec();
-
-                        // Add new frame to buffer (keep more frames for sliding windows)
-                        self.melspectrogram_buffer.push_back(frame);
-
-                        // Calculate buffer size to match Python implementation exactly
-                        // Python: melspectrogram_max_len = 10*97 = 970 frames (10 seconds)
-                        // 97 frames = 1 second of 16kHz audio processed as melspectrograms
-                        let max_frames = 970; // Match Python's buffer size exactly
-
-                        if self.melspectrogram_buffer.len() > max_frames {
-                            let dropped_frame_ms = (160.0 / 16000.0 * 1000.0) as u32; // Each frame = 160 samples = 10ms at 16kHz
-                            log::debug!(
-                                "⚠️ MELSPEC BUFFER OVERFLOW: Dropping oldest frame ({}ms of data) - buffer was {} frames", 
-                                dropped_frame_ms, self.melspectrogram_buffer.len()
-                            );
-                            self.melspectrogram_buffer.pop_front();
-                            log::debug!(
-                                "🔧 Melspec buffer trimmed to {} frames (max: {})",
-                                self.melspectrogram_buffer.len(),
-                                max_frames
-                            );
-                        }
-                    }
-
-                    // Calculate embeddings from NEW chunks only (match Python approach)
-                    // Python extracts embeddings only for newly processed chunks
-                    if self.melspectrogram_buffer.len() >= 76 {
-                        let chunks_to_process = self.accumulated_samples / chunk_size;
-                        let new_chunks = chunks_to_process - self.processed_chunks;
-
-                        log::debug!(
-                            "🔍 Processing {} new chunks (total processed: {} -> {})",
-                            new_chunks,
-                            self.processed_chunks,
-                            chunks_to_process
-                        );
-
-                        // Only compute embeddings for NEW chunks (like Python)
-                        for i in (0..new_chunks).rev() {
-                            // Calculate the index offset (matches Python: ndx = -8*i)
-                            let offset = 8 * i;
-                            let end_idx = self.melspectrogram_buffer.len() - offset;
-                            let start_idx = if end_idx >= 76 { end_idx - 76 } else { 0 };
-
-                            if end_idx > start_idx && (end_idx - start_idx) == 76 {
-                                log::debug!(
-                                    "🔍 Computing embedding for chunk {} (frames {}..{})",
-                                    i,
-                                    start_idx,
-                                    end_idx
-                                );
-
-                                // Extract exactly 76 frames from melspectrogram buffer
-                                let mut melspec_window = Vec::new();
-                                let buffer_vec: Vec<_> =
-                                    self.melspectrogram_buffer.iter().collect();
-                                for frame_idx in start_idx..end_idx {
-                                    melspec_window.extend(buffer_vec[frame_idx]);
-                                }
-
-                                // Compute embedding if we have exactly 76 frames (76 * 32 = 2432 elements)
-                                if melspec_window.len() == 76 * 32 {
-                                    let embedding =
-                                        self._get_embeddings_from_melspec(&melspec_window)?;
-                                    log::debug!(
-                                        "🔍 Got embedding with {} features for chunk {}",
-                                        embedding.len(),
-                                        i
-                                    );
-
-                                    // Update feature buffer (FIFO)
-                                    self.feature_buffer.push_back(embedding);
-                                    if self.feature_buffer.len() > self.feature_buffer_max_len {
-                                        let dropped_embedding_ms =
-                                            (8.0 * 160.0 / 16000.0 * 1000.0) as u32; // Each embedding represents ~80ms of audio
-                                        log::debug!(
-                                            "⚠️ FEATURE BUFFER OVERFLOW: Dropping oldest embedding (~{}ms of detection data) - buffer was {} embeddings",
-                                            dropped_embedding_ms, self.feature_buffer.len()
-                                        );
-                                        self.feature_buffer.pop_front();
-                                        log::debug!(
-                                            "🔧 Feature buffer trimmed to {} embeddings (max: {})",
-                                            self.feature_buffer.len(),
-                                            self.feature_buffer_max_len
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Update processed chunks counter (like Python resets accumulated_samples)
-                        self.processed_chunks = chunks_to_process;
-                        log::debug!("🔍 Updated processed_chunks to {}", self.processed_chunks);
-                    }
-
-                    // Reset accumulated samples counter (like Python does)
-                    processed_samples = self.accumulated_samples;
-                    self.accumulated_samples = 0;
-                    self.processed_chunks = 0; // Reset when we finish processing this batch
-                }
-
-                // Store remainder for next processing
-                self.raw_data_remainder = remainder_data;
+                self._buffer_raw_data(&x);
+                self.accumulated_samples += x.len();
+                self.raw_data_remainder.clear();
             }
         } else {
-            // Not enough samples yet, just accumulate
-            self.accumulated_samples += combined_data.len();
-            self.raw_data_remainder = combined_data;
+            // Not enough for a full chunk yet; buffer and accumulate (matches Python)
+            self.accumulated_samples += x.len();
+            self._buffer_raw_data(&x);
         }
 
-        Ok(processed_samples)
+        // Process mel + embeddings when we have complete chunks
+        if self.accumulated_samples >= chunk_size && self.accumulated_samples % chunk_size == 0 {
+            // Compute streaming melspectrogram (matches Python _streaming_melspectrogram)
+            let buffer_data: Vec<i16> = self.raw_data_buffer.iter().copied().collect();
+            let n_samples = self.accumulated_samples;
+
+            // Python: list(self.raw_data_buffer)[-n_samples-160*3:]
+            let padding = 160 * 3; // 480 samples
+            let start_idx = if buffer_data.len() > n_samples + padding {
+                buffer_data.len() - n_samples - padding
+            } else {
+                0
+            };
+
+            let mel_input = &buffer_data[start_idx..];
+            let spec = self._get_melspectrogram(mel_input)?;
+
+            // Add ALL mel frames to buffer (matches Python np.vstack)
+            let features_per_frame = 32;
+            let total_frames = spec.len() / features_per_frame;
+
+            for i in 0..total_frames {
+                let start = i * features_per_frame;
+                let end = start + features_per_frame;
+                self.melspectrogram_buffer
+                    .push_back(spec[start..end].to_vec());
+            }
+
+            // Trim to max length (Python: melspectrogram_max_len = 10*97 = 970)
+            const MAX_FRAMES: usize = 970;
+            while self.melspectrogram_buffer.len() > MAX_FRAMES {
+                self.melspectrogram_buffer.pop_front();
+            }
+
+            log::debug!(
+                "🔍 Added {} mel frames, buffer now {} frames",
+                total_frames,
+                self.melspectrogram_buffer.len()
+            );
+
+            // Compute embeddings for each new chunk
+            // Python: for i in np.arange(accumulated_samples//1280-1, -1, -1)
+            if self.melspectrogram_buffer.len() >= 76 {
+                let new_chunks = self.accumulated_samples / chunk_size;
+
+                for i in (0..new_chunks).rev() {
+                    let offset = 8 * i;
+                    let end_idx = self.melspectrogram_buffer.len() - offset;
+                    let start_idx = if end_idx >= 76 { end_idx - 76 } else { 0 };
+
+                    if (end_idx - start_idx) == 76 {
+                        let mut melspec_window = Vec::with_capacity(76 * features_per_frame);
+                        let buffer_vec: Vec<_> = self.melspectrogram_buffer.iter().collect();
+                        for frame_idx in start_idx..end_idx {
+                            melspec_window.extend(buffer_vec[frame_idx]);
+                        }
+
+                        if melspec_window.len() == 76 * 32 {
+                            let embedding =
+                                self._get_embeddings_from_melspec(&melspec_window)?;
+                            self.feature_buffer.push_back(embedding);
+
+                            if self.feature_buffer.len() > self.feature_buffer_max_len {
+                                self.feature_buffer.pop_front();
+                            }
+                        }
+                    }
+                }
+            }
+
+            processed_samples = self.accumulated_samples;
+            self.accumulated_samples = 0;
+        }
+
+        // Match Python: return processed_samples if processed_samples != 0 else self.accumulated_samples
+        Ok(if processed_samples != 0 {
+            processed_samples
+        } else {
+            self.accumulated_samples
+        })
     }
 }

@@ -330,181 +330,93 @@ impl Model {
 
     /// Predict on audio data (matches Python predict method)
     ///
-    /// # Arguments
-    /// * `x` - Input audio data (16-bit PCM)
-    /// * `threshold` - Optional threshold values per model
-    /// * `debounce_time` - Time to wait before returning another detection
-    ///
-    /// # Returns
-    /// * `Result<PredictionResult>` - Prediction scores per model
+    /// Processes all input audio through the preprocessor at once, then runs
+    /// each wakeword model on the resulting features. For multi-chunk inputs
+    /// (> 1280 samples), uses different feature window positions and takes
+    /// the maximum prediction across positions.
     pub fn predict(
         &mut self,
         x: &[i16],
         threshold: Option<HashMap<String, f32>>,
         debounce_time: f32,
     ) -> Result<PredictionResult> {
-        // Process audio in 1280-sample chunks like Python does
         log::debug!("🔍 Starting prediction with {} audio samples", x.len());
 
-        let chunk_size = 1280;
-        let mut final_predictions = HashMap::new();
+        // Process ALL audio through preprocessor at once (matches Python)
+        let n_prepared_samples = self.preprocessor.__call__(x)?;
+        log::debug!(
+            "🔍 Preprocessor returned {} prepared samples",
+            n_prepared_samples
+        );
 
-        // Initialize predictions for all models
         let model_names: Vec<String> = self.models.keys().cloned().collect();
-        for model_name in &model_names {
-            final_predictions.insert(model_name.clone(), 0.0);
-        }
+        let mut predictions = HashMap::new();
 
-        // Process each chunk
-        for (chunk_idx, chunk) in x.chunks(chunk_size).enumerate() {
-            let mut chunk_vec = chunk.to_vec();
+        for mdl in &model_names {
+            let n_feature_frames = self.model_inputs[mdl];
 
-            // Pad chunk to 1280 samples if needed
-            while chunk_vec.len() < chunk_size {
-                chunk_vec.push(0);
-            }
+            let prediction = if n_prepared_samples > 1280 {
+                // Multi-chunk: use different start_ndx for each chunk position, take max
+                let n_chunks = n_prepared_samples / 1280;
+                let mut max_pred = 0.0f32;
 
-            log::debug!(
-                "🔍 Processing chunk {}: {} samples",
-                chunk_idx,
-                chunk_vec.len()
-            );
+                for i in (0..n_chunks).rev() {
+                    let start_ndx = -(n_feature_frames as i32) - i as i32;
+                    let features = self.preprocessor.get_features(n_feature_frames, start_ndx);
 
-            // Get audio features for this chunk
-            let n_prepared_samples = self.preprocessor.__call__(&chunk_vec)?;
-            log::debug!(
-                "🔍 Chunk {}: preprocessor returned {} prepared samples",
-                chunk_idx,
-                n_prepared_samples
-            );
-
-            // Process this chunk through each model
-            for mdl in &model_names {
-                let n_feature_frames = self.model_inputs[mdl];
-
-                // For single chunk processing (1280 samples), we expect to get the right number of features
-                if n_prepared_samples == 1280 {
-                    let features = self.preprocessor.get_features(n_feature_frames, -1);
-                    log::debug!(
-                        "🔍 Chunk {}: Model {}: got {} features, expected {}",
-                        chunk_idx,
-                        mdl,
-                        features.len(),
-                        n_feature_frames * 96
-                    );
-
-                    // Calculate feature stats for comparison with Python
-                    if !features.is_empty() {
-                        let mean = features.iter().sum::<f32>() / features.len() as f32;
-                        let min = features.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-                        let max = features.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                        log::debug!(
-                            "🔍 Chunk {}: Model {}: feature stats: mean={:.6}, min={:.6}, max={:.6}",
-                            chunk_idx, mdl, mean, min, max
-                        );
-
-                        // === DETAILED FEATURE COMPARISON DEBUG ===
-                        log::debug!(
-                            "📊 FEATURE_COMPARISON: chunk={}, model={}, len={}, mean={:.8}, min={:.8}, max={:.8}",
-                            chunk_idx, mdl, features.len(), mean, min, max
-                        );
-
-                        // Log first 16 feature values for direct comparison
-                        log::debug!(
-                            "📊 FEATURE_VALUES: chunk={}, model={}, first_16={:?}",
-                            chunk_idx,
-                            mdl,
-                            &features[..features.len().min(16)]
-                        );
-
-                        // Calculate variance/std for distribution comparison
-                        let variance = features.iter().map(|&x| (x - mean).powi(2)).sum::<f32>()
-                            / features.len() as f32;
-                        let std_dev = variance.sqrt();
-                        log::debug!(
-                            "📊 FEATURE_DIST: chunk={}, model={}, variance={:.8}, std_dev={:.8}",
-                            chunk_idx,
-                            mdl,
-                            variance,
-                            std_dev
-                        );
-                    }
-
-                    // Only predict if we have enough features (don't pad with zeros)
                     if features.len() >= n_feature_frames * 96 {
-                        let prediction = Self::run_model_prediction_static(
+                        let pred = Self::run_model_prediction_static(
                             self.models.get_mut(mdl).unwrap(),
                             &features,
                         )?;
-
                         log::debug!(
-                            "🔍 Chunk {}: Model {}: raw prediction = {}",
-                            chunk_idx,
+                            "🔍 Multi-chunk {}: Model {}: prediction = {:.6}",
+                            i,
                             mdl,
-                            prediction
+                            pred
                         );
-
-                        // === DETAILED PREDICTION COMPARISON DEBUG ===
-                        log::debug!(
-                            "🎯 PREDICTION_COMPARISON: chunk={}, model={}, raw_prediction={:.15}",
-                            chunk_idx,
-                            mdl,
-                            prediction
-                        );
-
-                        // Log prediction in scientific notation for extreme values
-                        log::debug!(
-                            "🎯 PREDICTION_SCIENTIFIC: chunk={}, model={}, prediction={:e}",
-                            chunk_idx,
-                            mdl,
-                            prediction
-                        );
-
-                        // Take maximum prediction across chunks
-                        let current_max = final_predictions.get(mdl).unwrap_or(&0.0);
-                        let old_max = *current_max;
-                        if prediction > *current_max {
-                            final_predictions.insert(mdl.clone(), prediction);
-                            log::debug!(
-                                "🎯 PREDICTION_UPDATE: chunk={}, model={}, new_max={:.15}, old_max={:.15}",
-                                chunk_idx, mdl, prediction, old_max
-                            );
-                        }
-                    } else {
-                        log::debug!(
-                            "🔍 Chunk {}: Model {}: insufficient features, skipping",
-                            chunk_idx,
-                            mdl
-                        );
+                        max_pred = max_pred.max(pred);
                     }
+                }
+                max_pred
+            } else if n_prepared_samples == 1280 {
+                // Single chunk: standard feature extraction
+                let features = self.preprocessor.get_features(n_feature_frames, -1);
+
+                if features.len() >= n_feature_frames * 96 {
+                    let pred = Self::run_model_prediction_static(
+                        self.models.get_mut(mdl).unwrap(),
+                        &features,
+                    )?;
+                    log::debug!("🔍 Model {}: prediction = {:.6}", mdl, pred);
+                    pred
                 } else {
-                    log::debug!(
-                        "🔍 Chunk {}: Model {}: unexpected prepared samples: {}",
-                        chunk_idx,
-                        mdl,
-                        n_prepared_samples
-                    );
+                    log::debug!("🔍 Model {}: insufficient features, skipping", mdl);
+                    0.0
+                }
+            } else {
+                // Not enough samples accumulated yet -- return previous prediction
+                if let Some(buffer) = self.prediction_buffer.get(mdl) {
+                    *buffer.back().unwrap_or(&0.0)
+                } else {
+                    0.0
+                }
+            };
+
+            predictions.insert(mdl.clone(), prediction);
+        }
+
+        // Zero predictions for first 5 frames during model warmup (matches Python)
+        for (model_name, prediction) in predictions.iter_mut() {
+            if let Some(buffer) = self.prediction_buffer.get(model_name) {
+                if buffer.len() < 5 {
+                    *prediction = 0.0;
                 }
             }
         }
 
-        // FIXME: This logic was zeroing out initial predictions
-        // Zero predictions for first 5 frames during model initialization (matches Python)
-        // for (model_name, prediction) in final_predictions.iter_mut() {
-        //     if let Some(buffer) = self.prediction_buffer.get(model_name) {
-        //         if buffer.len() < 5 {
-        //             log::debug!(
-        //                 "🔍 Zeroing prediction for {} (buffer length: {})",
-        //                 model_name,
-        //                 buffer.len()
-        //             );
-        //             *prediction = 0.0;
-        //         }
-        //     }
-        // }
-
-        // Update prediction buffers (matches Python)
-        for (model_name, prediction) in &final_predictions {
+        // Update prediction buffers
+        for (model_name, prediction) in &predictions {
             if let Some(buffer) = self.prediction_buffer.get_mut(model_name) {
                 buffer.push_back(*prediction);
                 if buffer.len() > 30 {
@@ -513,9 +425,9 @@ impl Model {
             }
         }
 
-        // Handle thresholds and debounce (simplified for now)
-        if let Some(threshold_map) = threshold {
-            for (model_name, prediction) in final_predictions.iter_mut() {
+        // Apply thresholds
+        if let Some(ref threshold_map) = threshold {
+            for (model_name, prediction) in predictions.iter_mut() {
                 if let Some(&threshold_value) = threshold_map.get(model_name) {
                     if *prediction < threshold_value {
                         *prediction = 0.0;
@@ -524,12 +436,35 @@ impl Model {
             }
         }
 
-        // Handle debounce time (simplified)
+        // Apply debounce
         if debounce_time > 0.0 {
-            // TODO: Implement debounce logic similar to Python
+            if let Some(ref threshold_map) = threshold {
+                let n_frames =
+                    (debounce_time / (n_prepared_samples.max(1) as f32 / 16000.0)).ceil() as usize;
+                for (model_name, prediction) in predictions.iter_mut() {
+                    if let Some(&threshold_value) = threshold_map.get(model_name) {
+                        if *prediction >= threshold_value {
+                            if let Some(buffer) = self.prediction_buffer.get(model_name) {
+                                let recent: Vec<f32> = buffer
+                                    .iter()
+                                    .rev()
+                                    .take(n_frames)
+                                    .copied()
+                                    .collect();
+                                if recent
+                                    .iter()
+                                    .any(|&p| p >= threshold_value)
+                                {
+                                    *prediction = 0.0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        Ok(final_predictions)
+        Ok(predictions)
     }
 
     /// Get parent model name from label (for multi-class models)

@@ -4,7 +4,6 @@ use crate::spotify_controller::SpotifyController;
 use crate::wakeword_model::Model as WakewordModel;
 use crate::wakeword_vad::{VadConfig, VadProcessor};
 use crossbeam::channel::{Receiver, Sender};
-use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -276,19 +275,13 @@ impl ConsumerServer {
 
         log::info!("🎵 Starting audio detection processing");
 
-        // Audio processing buffers and performance tracking
-        let mut audio_buffer = VecDeque::new();
-        let mut last_detection_time = Instant::now();
         let mut last_wakeword_time: Option<Instant> = None;
         let mut detection_attempts = 0u64;
         let mut audio_chunks_processed = 0u64;
         let start_time = Instant::now();
         let mut dropped_pairs = 0u64;
 
-        const DETECTION_WINDOW_SAMPLES: usize = 5120; // 320ms at 16kHz
-        const DETECTION_INTERVAL_MS: u64 = 160; // Run detection every 160ms
-        const MAX_BUFFER_SAMPLES: usize = 16000; // 1 second at 16kHz
-        const WAKEWORD_DEBOUNCE_MS: u64 = 3000; // Don't detect same wake word for 3 seconds
+        const WAKEWORD_DEBOUNCE_MS: u64 = 3000;
 
         while !should_stop.load(Ordering::SeqCst) {
             let audio = {
@@ -303,24 +296,14 @@ impl ConsumerServer {
                     .collect();
 
                 if !samples.is_empty() {
-                    audio_buffer.extend(samples.iter());
                     audio_chunks_processed += 1;
 
-                    // Run wakeword detection
-                    let has_enough_samples = audio_buffer.len() >= DETECTION_WINDOW_SAMPLES;
-                    let enough_time_passed = last_detection_time.elapsed()
-                        >= Duration::from_millis(DETECTION_INTERVAL_MS);
-
-                    let mut wakeword_event = None;
-                    if has_enough_samples && enough_time_passed {
-                        let buffer_len = audio_buffer.len();
-                        let start_idx = buffer_len.saturating_sub(DETECTION_WINDOW_SAMPLES);
-                        let detection_samples: Vec<i16> =
-                            audio_buffer.range(start_idx..).copied().collect();
-
+                    // Feed each chunk directly to the stateful model exactly once.
+                    // The model's preprocessor maintains internal mel/embedding buffers
+                    // across calls, so re-feeding overlapping windows would corrupt state.
+                    let wakeword_event = {
                         detection_attempts += 1;
 
-                        // Log performance stats every 100 detection attempts
                         if detection_attempts % 100 == 0 {
                             let elapsed = start_time.elapsed();
                             log::info!(
@@ -333,25 +316,22 @@ impl ConsumerServer {
                             );
                         }
 
-                        if let Some(detection) = Self::process_wakeword_detection_standalone(
+                        match Self::process_wakeword_detection_standalone(
                             &wakeword_model,
-                            &detection_samples,
+                            &samples,
                             config.detection_threshold,
                             &last_wakeword_time,
                             WAKEWORD_DEBOUNCE_MS,
                             &spotify_controller,
                             &barge_in_tx,
                         )? {
-                            wakeword_event = Some(detection.0);
-                            last_wakeword_time = Some(detection.1);
+                            Some(detection) => {
+                                last_wakeword_time = Some(detection.1);
+                                Some(detection.0)
+                            }
+                            None => None,
                         }
-                        last_detection_time = Instant::now();
-                    }
-
-                    // Keep buffer from growing too large
-                    while audio_buffer.len() > MAX_BUFFER_SAMPLES {
-                        audio_buffer.pop_front();
-                    }
+                    };
 
                     let speech_detected = {
                         let mut vad_guard = vad_processor.lock().unwrap();
@@ -368,45 +348,31 @@ impl ConsumerServer {
                         }
                     };
 
-                    let pair = Some(AudioDetectionPair {
+                    let pair = AudioDetectionPair {
                         audio_data: chunk_data.clone(),
                         speech_detected,
                         wakeword_event,
                         timestamp: ConsumerMessage::current_timestamp(),
-                    });
+                    };
 
-                    // Send to consumer only if consumer is connected and we have a pair
-                    if let Some(audio_pair) = pair {
-                        if consumer_connected.load(Ordering::SeqCst) {
-                            match sender.try_send(audio_pair) {
-                                Ok(()) => {
-                                    // Successfully sent
-                                }
-                                Err(crossbeam::channel::TrySendError::Full(_)) => {
-                                    dropped_pairs += 1;
-                                    if dropped_pairs % 10 == 0 {
-                                        log::warn!("⚠️ [Detection] Backpressure: dropped {} audio pairs, consumer lagging", dropped_pairs);
-                                    }
-                                }
-                                Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                                    log::debug!(
-                                        "🔌 Detection thread: consumer disconnected during send"
-                                    );
+                    if consumer_connected.load(Ordering::SeqCst) {
+                        match sender.try_send(pair) {
+                            Ok(()) => {}
+                            Err(crossbeam::channel::TrySendError::Full(_)) => {
+                                dropped_pairs += 1;
+                                if dropped_pairs % 10 == 0 {
+                                    log::warn!("⚠️ [Detection] Backpressure: dropped {} audio pairs, consumer lagging", dropped_pairs);
                                 }
                             }
-                        }
-                    } else {
-                        // No consumer connected - detection runs "into the void"
-                        // This is exactly what we want for testing isolation
-                        if dropped_pairs % 100 == 0 && dropped_pairs > 0 {
-                            log::debug!(
-                                "🔌 [Detection] Running without consumer (no backpressure)"
-                            );
+                            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                                log::debug!(
+                                    "🔌 Detection thread: consumer disconnected during send"
+                                );
+                            }
                         }
                     }
                 }
             } else {
-                // No audio available, sleep briefly
                 thread::sleep(Duration::from_millis(10));
             }
         }
@@ -469,8 +435,7 @@ impl ConsumerServer {
                                 }
                             }
 
-                            let spotify_was_paused =
-                                spotify_controller.pause_for_wakeword();
+                            let spotify_was_paused = spotify_controller.pause_for_wakeword();
 
                             let wakeword_event = WakewordEvent {
                                 model: model_name,
