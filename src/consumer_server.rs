@@ -1,4 +1,5 @@
 use crate::audio_source::{AudioCapture, AudioCaptureConfig};
+use crate::mpv_controller::MpvController;
 use crate::protocol::{ConsumerConnection, ConsumerMessage, ProtocolError};
 use crate::spotify_controller::SpotifyController;
 use crate::wakeword_model::Model as WakewordModel;
@@ -41,7 +42,8 @@ pub struct WakewordEvent {
     pub model: String,
     pub confidence: f32,
     pub timestamp: u64,
-    pub spotify_was_paused: bool, // Whether Spotify was paused for this wakeword
+    pub spotify_was_paused: bool,
+    pub mpv_was_paused: bool,
 }
 
 /// Configuration for the consumer server
@@ -75,6 +77,7 @@ pub struct ConsumerServer {
     wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
     vad_processor: Arc<Mutex<Option<VadProcessor>>>,
     spotify_controller: SpotifyController,
+    mpv_controller: MpvController,
     barge_in_tx: Option<Sender<()>>,
 }
 
@@ -88,6 +91,7 @@ impl ConsumerServer {
             wakeword_model: Arc::new(Mutex::new(None)),
             vad_processor: Arc::new(Mutex::new(None)),
             spotify_controller: SpotifyController::new(),
+            mpv_controller: MpvController::new(),
             barge_in_tx: None,
         }
     }
@@ -111,6 +115,7 @@ impl ConsumerServer {
         let vad_processor = Arc::clone(&self.vad_processor);
         let config = self.config.clone();
         let spotify_controller = self.spotify_controller.clone();
+        let mpv_controller = self.mpv_controller.clone();
         let barge_in_tx = self.barge_in_tx.clone();
 
         // Start detection thread
@@ -124,6 +129,7 @@ impl ConsumerServer {
                 config,
                 sender,
                 spotify_controller,
+                mpv_controller,
                 barge_in_tx,
             );
 
@@ -212,6 +218,7 @@ impl ConsumerServer {
         config: ConsumerServerConfig,
         sender: Sender<AudioDetectionPair>,
         spotify_controller: SpotifyController,
+        mpv_controller: MpvController,
         barge_in_tx: Option<Sender<()>>,
     ) -> Result<(), ConsumerServerError> {
         // Initialize audio capture for streaming
@@ -323,6 +330,7 @@ impl ConsumerServer {
                             &last_wakeword_time,
                             WAKEWORD_DEBOUNCE_MS,
                             &spotify_controller,
+                            &mpv_controller,
                             &barge_in_tx,
                         )? {
                             Some(detection) => {
@@ -390,6 +398,7 @@ impl ConsumerServer {
         last_wakeword_time: &Option<Instant>,
         debounce_ms: u64,
         spotify_controller: &SpotifyController,
+        mpv_controller: &MpvController,
         barge_in_tx: &Option<Sender<()>>,
     ) -> Result<Option<(WakewordEvent, Instant)>, ConsumerServerError> {
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
@@ -436,12 +445,14 @@ impl ConsumerServer {
                             }
 
                             let spotify_was_paused = spotify_controller.pause_for_wakeword();
+                            let mpv_was_paused = mpv_controller.pause_for_wakeword();
 
                             let wakeword_event = WakewordEvent {
                                 model: model_name,
                                 confidence,
                                 timestamp: ConsumerMessage::current_timestamp(),
                                 spotify_was_paused,
+                                mpv_was_paused,
                             };
 
                             return Ok(Some((wakeword_event, now)));
@@ -554,6 +565,7 @@ impl ConsumerServer {
                             model: wakeword_event.model.clone(),
                             timestamp: wakeword_event.timestamp,
                             spotify_was_paused: wakeword_event.spotify_was_paused,
+                            mpv_was_paused: wakeword_event.mpv_was_paused,
                         };
 
                         match connection.write_message(&wakeword_msg) {

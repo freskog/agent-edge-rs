@@ -4,6 +4,7 @@ pub mod audio_source;
 pub mod consumer_server;
 pub mod producer_server;
 pub mod protocol;
+pub mod mpv_controller;
 pub mod spotify_controller;
 pub mod types;
 
