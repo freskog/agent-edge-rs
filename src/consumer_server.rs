@@ -445,7 +445,15 @@ impl ConsumerServer {
                             }
 
                             let spotify_was_paused = spotify_controller.pause_for_wakeword();
+
+                            let mpv_start = Instant::now();
+                            log::info!("[mpv] Starting mpv pause attempt");
                             let mpv_was_paused = mpv_controller.pause_for_wakeword();
+                            log::info!(
+                                "[mpv] Pause attempt finished in {:.1}ms, was_paused={}",
+                                mpv_start.elapsed().as_secs_f64() * 1000.0,
+                                mpv_was_paused
+                            );
 
                             let wakeword_event = WakewordEvent {
                                 model: model_name,
