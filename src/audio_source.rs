@@ -3,11 +3,15 @@ use cpal::{
     Device, SampleFormat, Stream as CpalStream,
 };
 use crossbeam::channel::{bounded, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
 pub use crate::types::AudioDeviceInfo;
+
+use std::time::Instant;
 
 pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size (in samples)
 
@@ -51,7 +55,7 @@ pub struct AudioCapture {
 
 impl AudioCapture {
     pub fn new(config: AudioCaptureConfig) -> Result<Self, AudioCaptureError> {
-        let (sender, receiver) = bounded(100);
+        let (sender, receiver) = bounded(15);
         let (stop_sender, stop_receiver) = bounded(1);
 
         let handle = thread::spawn(move || {
@@ -111,21 +115,53 @@ impl AudioCapture {
 
         log::info!("🎤 Using input device: {:?}", device.name());
 
-        let (stream, _hardware_sample_rate) =
-            Self::try_open_stream(&device, &config, &sender)?;
+        let stream_broken = Arc::new(AtomicBool::new(false));
+
+        let (mut stream, _hardware_sample_rate) =
+            Self::try_open_stream(&device, &config, &sender, Arc::clone(&stream_broken))?;
 
         stream
             .play()
             .map_err(|e| AudioCaptureError::Stream(e.to_string()))?;
 
-        let _stream = stream;
         let _host = host;
+        let mut last_recreation = Instant::now();
 
         loop {
             if stop_receiver.try_recv().is_ok() {
                 log::info!("Audio capture thread received stop signal. Exiting.");
                 break;
             }
+
+            if stream_broken.load(Ordering::Acquire)
+                && last_recreation.elapsed() >= Duration::from_millis(500)
+            {
+                log::warn!("Capture stream broken (xrun), recreating...");
+                drop(stream);
+                stream_broken.store(false, Ordering::Release);
+
+                match Self::try_open_stream(
+                    &device,
+                    &config,
+                    &sender,
+                    Arc::clone(&stream_broken),
+                ) {
+                    Ok((new_stream, _)) => {
+                        if let Err(e) = new_stream.play() {
+                            log::error!("Failed to restart capture stream: {}", e);
+                            break;
+                        }
+                        stream = new_stream;
+                        last_recreation = Instant::now();
+                        log::info!("Capture stream recreated successfully after xrun");
+                    }
+                    Err(e) => {
+                        log::error!("Failed to recreate capture stream: {}", e);
+                        break;
+                    }
+                }
+            }
+
             thread::sleep(Duration::from_millis(100));
         }
 
@@ -136,6 +172,7 @@ impl AudioCapture {
         device: &Device,
         config: &AudioCaptureConfig,
         sender: &Sender<Vec<u8>>,
+        stream_broken: Arc<AtomicBool>,
     ) -> Result<(CpalStream, u32), AudioCaptureError> {
         let supported_config = match Self::select_input_config(device, config.channel) {
             Ok(cfg) => cfg,
@@ -176,7 +213,7 @@ impl AudioCapture {
         }
 
         log::info!(
-            "🎤 Hardware: {}Hz, {} channels, I16 → Output: 16kHz mono s16le (zero-copy)",
+            "🎤 Hardware: {}Hz, {} channels, I16 → Output: 16kHz mono s16le",
             hardware_sample_rate,
             channels,
         );
@@ -188,7 +225,7 @@ impl AudioCapture {
             config.channel,
             channels,
             sender,
-            move |err| log::error!("Audio stream error: {}", err),
+            stream_broken,
         )?;
 
         Ok((stream, hardware_sample_rate))
@@ -240,17 +277,20 @@ impl AudioCapture {
         })
     }
 
-    /// Zero-copy I16 path: copies raw i16 bytes directly without any f32 conversion.
+    /// Allocation-free I16 capture path.
+    /// Pre-allocates all buffers; the only allocation per chunk is the Vec<u8>
+    /// sent over the channel (~12.5Hz), not per-sample or per-callback.
     fn create_native_i16_stream(
         device: &Device,
         config: &cpal::StreamConfig,
         channel: u32,
         channels: usize,
         sender: Sender<Vec<u8>>,
-        err_fn: impl FnMut(cpal::StreamError) + Send + 'static + Copy,
+        stream_broken: Arc<AtomicBool>,
     ) -> Result<CpalStream, AudioCaptureError> {
-        let mut byte_buffer: Vec<u8> = Vec::new();
         let chunk_bytes = CHUNK_SIZE * 2;
+        let mut byte_buffer: Vec<u8> = Vec::with_capacity(chunk_bytes * 8);
+        let mut chunk_buf: Vec<u8> = vec![0u8; chunk_bytes];
 
         device
             .build_input_stream(
@@ -262,14 +302,29 @@ impl AudioCapture {
                         }
                     }
 
-                    while byte_buffer.len() >= chunk_bytes {
-                        let chunk: Vec<u8> = byte_buffer.drain(..chunk_bytes).collect();
-                        if sender.try_send(chunk).is_err() {
+                    let mut read_pos = 0;
+                    while read_pos + chunk_bytes <= byte_buffer.len() {
+                        chunk_buf
+                            .copy_from_slice(&byte_buffer[read_pos..read_pos + chunk_bytes]);
+                        if sender.try_send(chunk_buf.clone()).is_err() {
+                            read_pos += chunk_bytes;
                             break;
                         }
+                        read_pos += chunk_bytes;
+                    }
+
+                    if read_pos > 0 {
+                        byte_buffer.drain(..read_pos);
                     }
                 },
-                err_fn,
+                move |err| {
+                    if stream_broken
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        log::error!("Audio stream error: {}", err);
+                    }
+                },
                 None,
             )
             .map_err(|e| AudioCaptureError::Stream(e.to_string()))

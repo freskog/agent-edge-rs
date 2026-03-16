@@ -103,8 +103,7 @@ impl ConsumerServer {
 
     /// Start the detection thread and return the receiver for audio-detection pairs
     fn start_detection_thread(&self) -> Result<Receiver<AudioDetectionPair>, ConsumerServerError> {
-        // Create bounded channel for audio-detection pairs (1-2 seconds of audio buffer)
-        let capacity = 100; // ~3 seconds at ~30 chunks/sec
+        let capacity = 20;
         let (sender, receiver) = crossbeam::channel::bounded(capacity);
 
         // Clone resources for detection thread

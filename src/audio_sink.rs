@@ -4,15 +4,25 @@ use cpal::{
     SupportedStreamConfigsError,
 };
 use crossbeam::channel::{bounded, Receiver, Sender};
-use std::sync::{mpsc, Arc, Mutex};
+use ringbuf::{
+    traits::{Consumer as RbConsumer, Observer as RbObserver, Producer as RbProducer, Split},
+    HeapCons, HeapProd, HeapRb,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub use crate::types::AudioDeviceInfo;
 
 const TARGET_SAMPLE_RATE: u32 = 48000;
 const TARGET_CHANNELS: u16 = 1;
+const RING_CAPACITY: usize = 48000;
+const MAX_CALLBACK_FRAMES: usize = 8192;
+/// Silence to pre-fill the ring buffer before stream.play() so the first
+/// ALSA period has data and doesn't immediately underrun.
+const PREFILL_SILENCE_SAMPLES: usize = 4800; // 100ms at 48kHz
 
 #[derive(Error, Debug, Clone)]
 pub enum AudioError {
@@ -73,31 +83,19 @@ enum AudioCommand {
     Abort,
 }
 
-/// Parse s16le bytes into the i16 playback buffer.
-fn extend_buffer_from_s16le(buffer: &mut Vec<i16>, s16le_data: &[u8]) -> Result<(), AudioError> {
+/// Decode s16le bytes and push into the SPSC ring buffer (command thread only).
+fn push_s16le_to_ring(prod: &mut HeapProd<i16>, s16le_data: &[u8]) -> Result<(), AudioError> {
     if s16le_data.len() % 2 != 0 {
         return Err(AudioError::WriteError(
             "S16LE data length not aligned to 16-bit samples".to_string(),
         ));
     }
-    buffer.reserve(s16le_data.len() / 2);
-    for chunk in s16le_data.chunks_exact(2) {
-        buffer.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-    }
+    let samples: Vec<i16> = s16le_data
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    prod.push_slice(&samples);
     Ok(())
-}
-
-/// Drain up to `count` samples from the buffer.
-/// Returns (samples, underrun).
-fn drain_samples(buffer: &mut Vec<i16>, count: usize) -> (Vec<i16>, bool) {
-    let available = buffer.len();
-    if available >= count {
-        let samples = buffer.drain(..count).collect();
-        (samples, false)
-    } else {
-        let samples = buffer.drain(..).collect();
-        (samples, available < count)
-    }
 }
 
 /// Sync streaming audio sink.
@@ -248,13 +246,30 @@ impl AudioSink {
             supported_config.sample_format(),
         );
 
-        let audio_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+        let underrun_count = Arc::new(AtomicU64::new(0));
+        let stream_broken = Arc::new(AtomicBool::new(false));
+        let clear_flag = Arc::new(AtomicBool::new(false));
+        let playback_active = Arc::new(AtomicBool::new(false));
 
-        let stream = Self::build_i16_stream(&device, &stream_config, Arc::clone(&audio_buffer))
-            .map_err(|e| {
-                let _ = ready_tx.send(Err(e.clone()));
-                e
-            })?;
+        let rb = HeapRb::<i16>::new(RING_CAPACITY);
+        let (mut prod, cons) = rb.split();
+
+        let silence = vec![0i16; PREFILL_SILENCE_SAMPLES];
+        prod.push_slice(&silence);
+
+        let mut stream = Self::build_i16_stream(
+            &device,
+            &stream_config,
+            cons,
+            Arc::clone(&underrun_count),
+            Arc::clone(&stream_broken),
+            Arc::clone(&clear_flag),
+            Arc::clone(&playback_active),
+        )
+        .map_err(|e| {
+            let _ = ready_tx.send(Err(e.clone()));
+            e
+        })?;
 
         stream.play().map_err(|e| {
             let err = AudioError::from(e);
@@ -266,8 +281,58 @@ impl AudioSink {
 
         let mut completion_signals: Vec<mpsc::Sender<()>> = Vec::new();
         let mut current_stream_id: u64 = 0;
+        let mut last_underrun_log = Instant::now();
+        let mut last_recreation = Instant::now();
 
         loop {
+            if stream_broken.load(Ordering::Acquire)
+                && last_recreation.elapsed() >= Duration::from_millis(500)
+            {
+                log::warn!("CPAL stream broken (xrun), recreating...");
+                drop(stream);
+
+                let rb = HeapRb::<i16>::new(RING_CAPACITY);
+                let (new_prod, new_cons) = rb.split();
+                prod = new_prod;
+
+                let silence = vec![0i16; PREFILL_SILENCE_SAMPLES];
+                prod.push_slice(&silence);
+
+                stream_broken.store(false, Ordering::Release);
+
+                match Self::build_i16_stream(
+                    &device,
+                    &stream_config,
+                    new_cons,
+                    Arc::clone(&underrun_count),
+                    Arc::clone(&stream_broken),
+                    Arc::clone(&clear_flag),
+                    Arc::clone(&playback_active),
+                ) {
+                    Ok(s) => {
+                        if let Err(e) = s.play() {
+                            log::error!("Failed to restart stream after xrun: {}", e);
+                            break;
+                        }
+                        stream = s;
+                        last_recreation = Instant::now();
+                        log::info!("Stream recreated successfully after xrun");
+                    }
+                    Err(e) => {
+                        log::error!("Failed to recreate stream after xrun: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            if last_underrun_log.elapsed() >= Duration::from_secs(5) {
+                let count = underrun_count.swap(0, Ordering::Relaxed);
+                if count > 0 {
+                    log::warn!("Playback underruns in last 5s: {}", count);
+                }
+                last_underrun_log = Instant::now();
+            }
+
             match command_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(command) => {
                     match command {
@@ -303,10 +368,7 @@ impl AudioSink {
                                         }
                                     }
 
-                                    {
-                                        let mut buffer = audio_buffer.lock().unwrap();
-                                        buffer.clear();
-                                    }
+                                    clear_flag.store(true, Ordering::Release);
 
                                     if drained_from_queue > 0 {
                                         log::info!(
@@ -325,22 +387,18 @@ impl AudioSink {
                                 current_stream_id = stream_id;
                             }
 
-                            {
-                                let mut buffer = audio_buffer.lock().unwrap();
-                                extend_buffer_from_s16le(&mut buffer, &s16le_data)?;
-                            }
+                            playback_active.store(true, Ordering::Release);
+                            push_s16le_to_ring(&mut prod, &s16le_data)?;
 
                             if !completion_signals.is_empty() {
                                 let queue_is_empty = command_rx.is_empty();
-                                let buffer_len = {
-                                    let buffer = audio_buffer.lock().unwrap();
-                                    buffer.len()
-                                };
+                                let buffer_len = prod.occupied_len();
 
                                 if queue_is_empty && buffer_len == 0 {
                                     log::debug!(
                                         "✅ Playback complete: queue empty, buffer drained"
                                     );
+                                    playback_active.store(false, Ordering::Release);
                                     for tx in completion_signals.drain(..) {
                                         let _ = tx.send(());
                                     }
@@ -371,10 +429,8 @@ impl AudioSink {
                                 );
                             }
 
-                            {
-                                let mut buffer = audio_buffer.lock().unwrap();
-                                buffer.clear();
-                            }
+                            clear_flag.store(true, Ordering::Release);
+                            playback_active.store(false, Ordering::Release);
 
                             current_stream_id = 0;
 
@@ -387,15 +443,13 @@ impl AudioSink {
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                     if !completion_signals.is_empty() {
                         let queue_is_empty = command_rx.is_empty();
-                        let buffer_len = {
-                            let buffer = audio_buffer.lock().unwrap();
-                            buffer.len()
-                        };
+                        let buffer_len = prod.occupied_len();
 
                         if queue_is_empty && buffer_len == 0 {
                             log::debug!(
                                 "✅ Playback complete (timeout check): queue empty, buffer drained"
                             );
+                            playback_active.store(false, Ordering::Release);
                             for tx in completion_signals.drain(..) {
                                 let _ = tx.send(());
                             }
@@ -454,34 +508,69 @@ impl AudioSink {
         })
     }
 
+    /// Build the CPAL output stream with a lock-free ring buffer consumer.
+    /// The callback is allocation-free and mutex-free.
     fn build_i16_stream(
         device: &cpal::Device,
         config: &cpal::StreamConfig,
-        audio_buffer: Arc<Mutex<Vec<i16>>>,
+        mut consumer: HeapCons<i16>,
+        underrun_count: Arc<AtomicU64>,
+        stream_broken: Arc<AtomicBool>,
+        clear_flag: Arc<AtomicBool>,
+        playback_active: Arc<AtomicBool>,
     ) -> Result<Stream, AudioError> {
         let channels = config.channels as usize;
         device
             .build_output_stream(
                 config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                    let frames = data.len() / channels;
-                    let mut buffer = audio_buffer.lock().unwrap();
-                    let (samples, underrun) = drain_samples(&mut buffer, frames);
-
-                    for (i, &sample) in samples.iter().enumerate() {
-                        for ch in 0..channels {
-                            data[i * channels + ch] = sample;
+                    if clear_flag.load(Ordering::Acquire) {
+                        consumer.clear();
+                        clear_flag.store(false, Ordering::Release);
+                        for s in data.iter_mut() {
+                            *s = 0;
                         }
+                        return;
                     }
 
-                    let filled = samples.len() * channels;
-                    if underrun && filled < data.len() {
-                        for sample in data.iter_mut().skip(filled) {
-                            *sample = 0;
+                    if channels == 1 {
+                        let popped = consumer.pop_slice(data);
+                        if popped < data.len() {
+                            for s in data[popped..].iter_mut() {
+                                *s = 0;
+                            }
+                            if playback_active.load(Ordering::Relaxed) {
+                                underrun_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        let frames = data.len() / channels;
+                        let mut mono_buf = [0i16; MAX_CALLBACK_FRAMES];
+                        let to_pop = frames.min(MAX_CALLBACK_FRAMES);
+                        let popped = consumer.pop_slice(&mut mono_buf[..to_pop]);
+                        for i in 0..popped {
+                            for ch in 0..channels {
+                                data[i * channels + ch] = mono_buf[i];
+                            }
+                        }
+                        if popped < frames {
+                            for s in data[popped * channels..].iter_mut() {
+                                *s = 0;
+                            }
+                            if playback_active.load(Ordering::Relaxed) {
+                                underrun_count.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 },
-                |err| log::error!("CPAL I16 stream error: {}", err),
+                move |err| {
+                    if stream_broken
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        log::error!("CPAL stream error: {}", err);
+                    }
+                },
                 None,
             )
             .map_err(AudioError::from)
@@ -523,7 +612,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_s16le_buffer_passthrough() {
+    fn test_s16le_ring_push() {
         let s16le_data = vec![
             0x00, 0x10, // 4096
             0x00, 0x20, // 8192
@@ -531,24 +620,29 @@ mod tests {
             0x00, 0x40, // 16384
         ];
 
-        let mut buffer = Vec::new();
-        extend_buffer_from_s16le(&mut buffer, &s16le_data).unwrap();
+        let rb = HeapRb::<i16>::new(64);
+        let (mut prod, mut cons) = rb.split();
+        push_s16le_to_ring(&mut prod, &s16le_data).unwrap();
 
-        assert_eq!(buffer.len(), 4);
-        assert_eq!(buffer[0], 4096);
-        assert_eq!(buffer[1], 8192);
-        assert_eq!(buffer[2], 12288);
-        assert_eq!(buffer[3], 16384);
+        assert_eq!(prod.occupied_len(), 4);
+
+        let mut out = [0i16; 4];
+        let n = cons.pop_slice(&mut out);
+        assert_eq!(n, 4);
+        assert_eq!(out, [4096, 8192, 12288, 16384]);
     }
 
     #[test]
-    fn test_buffer_underrun_handling() {
-        let mut buffer = vec![1i16, 2, 3];
+    fn test_ring_underrun_produces_fewer_samples() {
+        let rb = HeapRb::<i16>::new(64);
+        let (mut prod, mut cons) = rb.split();
 
-        let (samples, underrun) = drain_samples(&mut buffer, 5);
+        prod.push_slice(&[1i16, 2, 3]);
 
-        assert_eq!(samples.len(), 3);
-        assert!(underrun);
-        assert_eq!(buffer.len(), 0);
+        let mut out = [0i16; 5];
+        let n = cons.pop_slice(&mut out);
+        assert_eq!(n, 3);
+        assert_eq!(out[..3], [1, 2, 3]);
+        assert_eq!(prod.occupied_len(), 0);
     }
 }
