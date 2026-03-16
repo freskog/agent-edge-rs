@@ -18,7 +18,7 @@ pub use crate::types::AudioDeviceInfo;
 
 const TARGET_SAMPLE_RATE: u32 = 48000;
 const TARGET_CHANNELS: u16 = 1;
-const RING_CAPACITY: usize = 48000;
+const RING_CAPACITY: usize = 240_000; // 5 seconds at 48kHz
 const MAX_CALLBACK_FRAMES: usize = 8192;
 /// Silence to pre-fill the ring buffer before stream.play() so the first
 /// ALSA period has data and doesn't immediately underrun.
@@ -84,7 +84,9 @@ enum AudioCommand {
 }
 
 /// Decode s16le bytes and push into the SPSC ring buffer (command thread only).
-fn push_s16le_to_ring(prod: &mut HeapProd<i16>, s16le_data: &[u8]) -> Result<(), AudioError> {
+/// Spins with short sleeps when the ring is full so we never silently drop samples.
+/// Returns the number of i16 samples pushed.
+fn push_s16le_to_ring(prod: &mut HeapProd<i16>, s16le_data: &[u8]) -> Result<usize, AudioError> {
     if s16le_data.len() % 2 != 0 {
         return Err(AudioError::WriteError(
             "S16LE data length not aligned to 16-bit samples".to_string(),
@@ -94,8 +96,26 @@ fn push_s16le_to_ring(prod: &mut HeapProd<i16>, s16le_data: &[u8]) -> Result<(),
         .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
-    prod.push_slice(&samples);
-    Ok(())
+
+    let total = samples.len();
+    let mut offset = 0;
+    let mut spins = 0u32;
+    while offset < total {
+        let pushed = prod.push_slice(&samples[offset..]);
+        offset += pushed;
+        if offset < total {
+            spins += 1;
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if spins > 0 {
+        log::debug!(
+            "🔁 push_s16le_to_ring: ring was full, spun {}ms to push {} samples",
+            spins,
+            total
+        );
+    }
+    Ok(total)
 }
 
 /// Sync streaming audio sink.
@@ -250,6 +270,8 @@ impl AudioSink {
         let stream_broken = Arc::new(AtomicBool::new(false));
         let clear_flag = Arc::new(AtomicBool::new(false));
         let playback_active = Arc::new(AtomicBool::new(false));
+        let callback_samples_consumed = Arc::new(AtomicU64::new(0));
+        let callback_buf_size = Arc::new(AtomicU64::new(0));
 
         let rb = HeapRb::<i16>::new(RING_CAPACITY);
         let (mut prod, cons) = rb.split();
@@ -265,6 +287,8 @@ impl AudioSink {
             Arc::clone(&stream_broken),
             Arc::clone(&clear_flag),
             Arc::clone(&playback_active),
+            Arc::clone(&callback_samples_consumed),
+            Arc::clone(&callback_buf_size),
         )
         .map_err(|e| {
             let _ = ready_tx.send(Err(e.clone()));
@@ -283,6 +307,10 @@ impl AudioSink {
         let mut current_stream_id: u64 = 0;
         let mut last_underrun_log = Instant::now();
         let mut last_recreation = Instant::now();
+        let mut stream_chunk_count: u64 = 0;
+        let mut stream_total_bytes: u64 = 0;
+        let mut stream_total_samples: u64 = 0;
+        let mut stream_start_time: Option<Instant> = None;
 
         loop {
             if stream_broken.load(Ordering::Acquire)
@@ -308,6 +336,8 @@ impl AudioSink {
                     Arc::clone(&stream_broken),
                     Arc::clone(&clear_flag),
                     Arc::clone(&playback_active),
+                    Arc::clone(&callback_samples_consumed),
+                    Arc::clone(&callback_buf_size),
                 ) {
                     Ok(s) => {
                         if let Err(e) = s.play() {
@@ -327,8 +357,14 @@ impl AudioSink {
 
             if last_underrun_log.elapsed() >= Duration::from_secs(5) {
                 let count = underrun_count.swap(0, Ordering::Relaxed);
+                let consumed = callback_samples_consumed.load(Ordering::Relaxed);
+                let buf_sz = callback_buf_size.load(Ordering::Relaxed);
+                let ring_occ = prod.occupied_len();
                 if count > 0 {
-                    log::warn!("Playback underruns in last 5s: {}", count);
+                    log::warn!(
+                        "Playback underruns in last 5s: {} | ring={}/{} cb_consumed={} cb_buf={}",
+                        count, ring_occ, RING_CAPACITY, consumed, buf_sz
+                    );
                 }
                 last_underrun_log = Instant::now();
             }
@@ -349,15 +385,17 @@ impl AudioSink {
                                     );
 
                                     let mut drained_from_queue = 0;
+                                    let mut saved_new_chunk: Option<Vec<u8>> = None;
                                     while let Ok(cmd) = command_rx.try_recv() {
                                         match cmd {
                                             AudioCommand::WriteChunk {
+                                                data,
                                                 stream_id: cmd_sid,
-                                                ..
                                             } => {
                                                 if cmd_sid == current_stream_id {
                                                     drained_from_queue += 1;
                                                 } else {
+                                                    saved_new_chunk = Some(data);
                                                     break;
                                                 }
                                             }
@@ -370,6 +408,16 @@ impl AudioSink {
 
                                     clear_flag.store(true, Ordering::Release);
 
+                                    // Wait for the callback to process the clear so we don't
+                                    // push new-stream data that immediately gets wiped.
+                                    let clear_deadline =
+                                        Instant::now() + Duration::from_millis(50);
+                                    while clear_flag.load(Ordering::Acquire)
+                                        && Instant::now() < clear_deadline
+                                    {
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+
                                     if drained_from_queue > 0 {
                                         log::info!(
                                             "🗑️  Dropped {} old chunks from stream {}",
@@ -381,22 +429,57 @@ impl AudioSink {
                                     for tx in completion_signals.drain(..) {
                                         let _ = tx.send(());
                                     }
+
+                                    // Push any new-stream chunk that was consumed during drain
+                                    if let Some(chunk) = saved_new_chunk {
+                                        push_s16le_to_ring(&mut prod, &chunk)?;
+                                    }
                                 } else {
                                     log::info!("🆕 First stream started: {}", stream_id);
                                 }
                                 current_stream_id = stream_id;
+                                stream_chunk_count = 0;
+                                stream_total_bytes = 0;
+                                stream_total_samples = 0;
+                                stream_start_time = Some(Instant::now());
+                                callback_samples_consumed.store(0, Ordering::Relaxed);
                             }
 
                             playback_active.store(true, Ordering::Release);
-                            push_s16le_to_ring(&mut prod, &s16le_data)?;
+                            let pushed =
+                                push_s16le_to_ring(&mut prod, &s16le_data)?;
+                            stream_chunk_count += 1;
+                            stream_total_bytes += s16le_data.len() as u64;
+                            stream_total_samples += pushed as u64;
+                            if stream_chunk_count == 1 {
+                                log::info!(
+                                    "📦 Stream {} chunk #1: {} bytes, {} samples, ring={}",
+                                    stream_id,
+                                    s16le_data.len(),
+                                    pushed,
+                                    prod.occupied_len()
+                                );
+                            }
 
                             if !completion_signals.is_empty() {
                                 let queue_is_empty = command_rx.is_empty();
                                 let buffer_len = prod.occupied_len();
 
                                 if queue_is_empty && buffer_len == 0 {
-                                    log::debug!(
-                                        "✅ Playback complete: queue empty, buffer drained"
+                                    let elapsed = stream_start_time
+                                        .map(|t| t.elapsed().as_millis())
+                                        .unwrap_or(0);
+                                    let consumed =
+                                        callback_samples_consumed.load(Ordering::Relaxed);
+                                    log::info!(
+                                        "✅ Stream {} complete: {} chunks, {} bytes, {} samples pushed, {} consumed by cb, {:.1}s audio, {}ms wall",
+                                        current_stream_id,
+                                        stream_chunk_count,
+                                        stream_total_bytes,
+                                        stream_total_samples,
+                                        consumed,
+                                        stream_total_samples as f64 / TARGET_SAMPLE_RATE as f64,
+                                        elapsed
                                     );
                                     playback_active.store(false, Ordering::Release);
                                     for tx in completion_signals.drain(..) {
@@ -406,6 +489,15 @@ impl AudioSink {
                             }
                         }
                         AudioCommand::EndStreamAndWait(tx) => {
+                            let ring_occ = prod.occupied_len();
+                            log::info!(
+                                "🏁 EndStreamAndWait for stream {}: {} chunks, {} samples pushed, ring={}, cb_consumed={}",
+                                current_stream_id,
+                                stream_chunk_count,
+                                stream_total_samples,
+                                ring_occ,
+                                callback_samples_consumed.load(Ordering::Relaxed)
+                            );
                             completion_signals.push(tx);
                         }
                         AudioCommand::Abort => {
@@ -446,8 +538,20 @@ impl AudioSink {
                         let buffer_len = prod.occupied_len();
 
                         if queue_is_empty && buffer_len == 0 {
-                            log::debug!(
-                                "✅ Playback complete (timeout check): queue empty, buffer drained"
+                            let elapsed = stream_start_time
+                                .map(|t| t.elapsed().as_millis())
+                                .unwrap_or(0);
+                            let consumed =
+                                callback_samples_consumed.load(Ordering::Relaxed);
+                            log::info!(
+                                "✅ Stream {} complete: {} chunks, {} bytes, {} samples pushed, {} consumed by cb, {:.1}s audio, {}ms wall",
+                                current_stream_id,
+                                stream_chunk_count,
+                                stream_total_bytes,
+                                stream_total_samples,
+                                consumed,
+                                stream_total_samples as f64 / TARGET_SAMPLE_RATE as f64,
+                                elapsed
                             );
                             playback_active.store(false, Ordering::Release);
                             for tx in completion_signals.drain(..) {
@@ -518,12 +622,16 @@ impl AudioSink {
         stream_broken: Arc<AtomicBool>,
         clear_flag: Arc<AtomicBool>,
         playback_active: Arc<AtomicBool>,
+        callback_samples_consumed: Arc<AtomicU64>,
+        callback_buf_size: Arc<AtomicU64>,
     ) -> Result<Stream, AudioError> {
         let channels = config.channels as usize;
         device
             .build_output_stream(
                 config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    callback_buf_size.store(data.len() as u64, Ordering::Relaxed);
+
                     if clear_flag.load(Ordering::Acquire) {
                         consumer.clear();
                         clear_flag.store(false, Ordering::Release);
@@ -535,6 +643,10 @@ impl AudioSink {
 
                     if channels == 1 {
                         let popped = consumer.pop_slice(data);
+                        if popped > 0 {
+                            callback_samples_consumed
+                                .fetch_add(popped as u64, Ordering::Relaxed);
+                        }
                         if popped < data.len() {
                             for s in data[popped..].iter_mut() {
                                 *s = 0;
@@ -548,6 +660,10 @@ impl AudioSink {
                         let mut mono_buf = [0i16; MAX_CALLBACK_FRAMES];
                         let to_pop = frames.min(MAX_CALLBACK_FRAMES);
                         let popped = consumer.pop_slice(&mut mono_buf[..to_pop]);
+                        if popped > 0 {
+                            callback_samples_consumed
+                                .fetch_add(popped as u64, Ordering::Relaxed);
+                        }
                         for i in 0..popped {
                             for ch in 0..channels {
                                 data[i * channels + ch] = mono_buf[i];
