@@ -8,6 +8,7 @@ const FRAME_INTERVAL_MS: u64 = 33; // ~30 fps
 const VOLUME_OVERLAY_DURATION_MS: u64 = 2000;
 const ERROR_DURATION_MS: u64 = 2000;
 const ACK_DURATION_MS: u64 = 1000;
+const TIMER_ALERT_DURATION_MS: u64 = 4000;
 const VOLUME_STEP: u8 = 1; // 1 LED per step
 
 const MIXER_NAME: &str = "XVF3800 SoftMaster";
@@ -18,6 +19,7 @@ const COLOR_RESPONDING: RgbColor = RgbColor::new(255, 180, 50);
 const COLOR_ERROR: RgbColor = RgbColor::new(255, 0, 0);
 const COLOR_ACK: RgbColor = RgbColor::new(0, 220, 80);
 const COLOR_VOLUME: RgbColor = RgbColor::new(0, 200, 0);
+const COLOR_TIMER_ALERT: RgbColor = RgbColor::new(255, 140, 0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -31,6 +33,7 @@ pub enum LedEvent {
     VolumeUp,
     VolumeDown,
     Idle,
+    TimerAlert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +46,7 @@ pub enum LedState {
     Error,
     Ack,
     Volume,
+    TimerAlert,
 }
 
 pub struct LedEngine {
@@ -118,13 +122,19 @@ impl LedEngine {
                 alsa_volume::set_volume(MIXER_NAME, self.volume_percent());
                 self.transition(LedState::Volume);
             }
+            LedEvent::TimerAlert => {
+                self.previous_state = self.base_state();
+                self.transition(LedState::TimerAlert);
+            }
         }
     }
 
     /// Returns the "base" state (ignoring temporary overlays) for restoration.
     fn base_state(&self) -> LedState {
         match self.state {
-            LedState::Volume | LedState::Error | LedState::Ack => self.previous_state,
+            LedState::Volume | LedState::Error | LedState::Ack | LedState::TimerAlert => {
+                self.previous_state
+            }
             other => other,
         }
     }
@@ -149,6 +159,10 @@ impl LedEngine {
                 let restore = self.previous_state;
                 self.transition(restore);
             }
+            LedState::TimerAlert if elapsed_ms >= TIMER_ALERT_DURATION_MS => {
+                let restore = self.previous_state;
+                self.transition(restore);
+            }
             _ => {}
         }
     }
@@ -164,6 +178,7 @@ impl LedEngine {
             LedState::Error => render_error(elapsed_ms),
             LedState::Ack => render_ack(elapsed_ms),
             LedState::Volume => render_volume(self.volume_leds),
+            LedState::TimerAlert => render_timer_alert(elapsed_ms),
         };
 
         if let Err(e) = self.ring.set_leds(&frame) {
@@ -259,5 +274,34 @@ fn render_volume(volume_leds: u8) -> [RgbColor; NUM_LEDS] {
         *led = COLOR_VOLUME;
     }
     frame
+}
+
+/// Rapid triple-flash amber strobe: 3 quick flashes, dark pause, repeat.
+/// Distinct from error (double red) and ack (single green) in both color and rhythm.
+fn render_timer_alert(elapsed_ms: u64) -> [RgbColor; NUM_LEDS] {
+    let burst_period_ms = 700.0;
+    let burst_phase = (elapsed_ms as f64 % burst_period_ms) / burst_period_ms;
+
+    let on = match () {
+        _ if burst_phase < 0.10 => true,
+        _ if burst_phase < 0.17 => false,
+        _ if burst_phase < 0.27 => true,
+        _ if burst_phase < 0.34 => false,
+        _ if burst_phase < 0.44 => true,
+        _ => false,
+    };
+
+    if !on {
+        return [RgbColor::BLACK; NUM_LEDS];
+    }
+
+    let overall = elapsed_ms as f64 / TIMER_ALERT_DURATION_MS as f64;
+    let envelope = if overall < 0.8 {
+        1.0
+    } else {
+        ((1.0 - overall) / 0.2).max(0.0)
+    };
+
+    [COLOR_TIMER_ALERT.scaled(envelope as f32); NUM_LEDS]
 }
 
