@@ -279,6 +279,29 @@ impl ConsumerServer {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            log::info!("Detection thread nice value set to 10 (lower priority)");
+
+            let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(2, &mut cpuset);
+            libc::CPU_SET(3, &mut cpuset);
+            let ret = libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &cpuset,
+            );
+            if ret == 0 {
+                log::info!("Detection thread pinned to cores 2-3");
+            } else {
+                log::warn!(
+                    "Failed to pin detection thread to cores 2-3: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
         log::info!("🎵 Starting audio detection processing");
 
         let mut last_wakeword_time: Option<Instant> = None;

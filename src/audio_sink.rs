@@ -22,7 +22,7 @@ const RING_CAPACITY: usize = 240_000; // 5 seconds at 48kHz
 const MAX_CALLBACK_FRAMES: usize = 8192;
 /// Silence to pre-fill the ring buffer before stream.play() so the first
 /// ALSA period has data and doesn't immediately underrun.
-const PREFILL_SILENCE_SAMPLES: usize = 4800; // 100ms at 48kHz
+const PREFILL_SILENCE_SAMPLES: usize = 9600; // 200ms at 48kHz
 
 #[derive(Error, Debug, Clone)]
 pub enum AudioError {
@@ -626,10 +626,43 @@ impl AudioSink {
         callback_buf_size: Arc<AtomicU64>,
     ) -> Result<Stream, AudioError> {
         let channels = config.channels as usize;
+        let rt_set = Arc::new(AtomicBool::new(false));
         device
             .build_output_stream(
                 config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    #[cfg(target_os = "linux")]
+                    if !rt_set.load(Ordering::Relaxed) {
+                        rt_set.store(true, Ordering::Relaxed);
+                        unsafe {
+                            let param = libc::sched_param { sched_priority: 10 };
+                            let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+                            if ret == 0 {
+                                log::info!("Audio callback thread set to SCHED_FIFO priority 10");
+                            } else {
+                                log::warn!(
+                                    "Failed to set RT on callback thread: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            }
+                            let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+                            libc::CPU_SET(0, &mut cpuset);
+                            let ret = libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &cpuset,
+                            );
+                            if ret == 0 {
+                                log::info!("Audio callback thread pinned to core 0");
+                            } else {
+                                log::warn!(
+                                    "Failed to pin callback thread to core 0: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            }
+                        }
+                    }
+
                     callback_buf_size.store(data.len() as u64, Ordering::Relaxed);
 
                     if clear_flag.load(Ordering::Acquire) {
