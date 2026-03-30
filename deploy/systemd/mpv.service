@@ -1,0 +1,17 @@
+[Unit]
+Description=mpv (idle audio player)
+After=sound.target
+
+[Service]
+Type=simple
+CPUAffinity=1
+EnvironmentFile=%h/.env
+WorkingDirectory=%h
+ExecStart=/usr/bin/mpv --idle=yes --no-video --no-terminal --input-ipc-server=/tmp/mpv-news.sock --volume=100 --af=loudnorm=I=-14:TP=-1:LRA=11
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Spotifyd (Spotify Connect)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+CPUAffinity=1
+EnvironmentFile=%h/.env
+WorkingDirectory=%h
+ExecStart=%h/spotifyd --no-daemon -b alsa --volume-controller alsa-linear --control "XVF3800 SoftMaster" -d mycroft --initial-volume 50 --device-type speaker --use-mpris
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target

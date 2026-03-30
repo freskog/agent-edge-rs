@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Edge
+After=audio.service led-controller.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.env
+WorkingDirectory=%h
+ExecStart=%h/agent-edge
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target

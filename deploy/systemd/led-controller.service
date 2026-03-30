@@ -1,0 +1,16 @@
+[Unit]
+Description=LED Ring Controller (ReSpeaker I2C)
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.env
+Environment=LD_LIBRARY_PATH=%h/libs/linux-aarch64
+WorkingDirectory=%h
+ExecStart=%h/led_controller
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target
