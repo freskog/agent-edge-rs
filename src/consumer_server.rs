@@ -335,7 +335,7 @@ impl ConsumerServer {
 
                         if detection_attempts % 100 == 0 {
                             let elapsed = start_time.elapsed();
-                            log::info!(
+                            log::debug!(
                                 "📊 [Detection] Performance stats: {} detections in {:.1}s, {} audio chunks, rate={:.1} detections/min, dropped={}",
                                 detection_attempts,
                                 elapsed.as_secs_f64(),
@@ -622,7 +622,7 @@ impl ConsumerServer {
                     // Log consumer performance stats every 100 audio chunks
                     if sent_audio % 100 == 0 {
                         let elapsed = start_time.elapsed();
-                        log::info!(
+                        log::debug!(
                             "📊 [{}] Consumer stats: received={} sent_audio={} sent_wakewords={} dropped={} in {:.1}s",
                             addr,
                             received_pairs,

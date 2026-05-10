@@ -1,23 +1,44 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_EVENT_SKIP: usize = 32;
+/// Default mpv IPC socket path, matching `deploy/systemd/mpv.service`'s
+/// `--input-ipc-server=` flag. Used when `MPV_SOCKET_PATH` is unset so the
+/// audio service works out of the box on the standard deployment.
+const DEFAULT_SOCKET_PATH: &str = "/tmp/mpv-news.sock";
 
 #[derive(Clone)]
 pub struct MpvController {
-    socket_path: Option<String>,
+    socket_path: String,
 }
 
 impl MpvController {
     pub fn new() -> Self {
-        let socket_path = std::env::var("MPV_SOCKET_PATH").ok();
-        if let Some(ref path) = socket_path {
-            log::info!("[mpv] MpvController initialized with socket: {}", path);
+        let (socket_path, from_env) = match std::env::var("MPV_SOCKET_PATH") {
+            Ok(p) if !p.is_empty() => (p, true),
+            _ => (DEFAULT_SOCKET_PATH.to_string(), false),
+        };
+
+        if from_env {
+            log::info!("[mpv] MpvController initialized with socket: {}", socket_path);
         } else {
-            log::warn!("[mpv] MPV_SOCKET_PATH not set, mpv pause disabled");
+            log::info!(
+                "[mpv] MPV_SOCKET_PATH unset, defaulting to {}",
+                socket_path
+            );
         }
+
+        if !Path::new(&socket_path).exists() {
+            log::warn!(
+                "[mpv] socket {} does not exist at startup — is mpv running? \
+                 Pause-on-wakeword will be a no-op until the socket appears.",
+                socket_path
+            );
+        }
+
         Self { socket_path }
     }
 
@@ -39,22 +60,22 @@ impl MpvController {
     }
 
     fn try_pause(&self) -> Result<bool, Box<dyn std::error::Error>> {
-        let path = match self.socket_path {
-            Some(ref p) => p,
-            None => {
-                log::warn!("[mpv] No socket path configured (set MPV_SOCKET_PATH), skipping");
-                return Ok(false);
-            }
-        };
+        if !Path::new(&self.socket_path).exists() {
+            log::warn!(
+                "[mpv] socket {} missing — is mpv running? Skipping pause.",
+                self.socket_path
+            );
+            return Ok(false);
+        }
 
-        log::info!("[mpv] Connecting to socket: {}", path);
-        let stream = match UnixStream::connect(path) {
+        log::info!("[mpv] Connecting to socket: {}", self.socket_path);
+        let stream = match UnixStream::connect(&self.socket_path) {
             Ok(s) => {
                 log::info!("[mpv] Connected to socket successfully");
                 s
             }
             Err(e) => {
-                log::warn!("[mpv] Failed to connect to socket {}: {}", path, e);
+                log::warn!("[mpv] Failed to connect to socket {}: {}", self.socket_path, e);
                 return Err(Box::new(e));
             }
         };
@@ -73,17 +94,21 @@ impl MpvController {
         let get_resp = self.read_response(&mut reader, 1)?;
         log::info!("[mpv] get_property pause response: {}", get_resp);
 
+        // Default to `false` (i.e. "not paused, try to pause it") if the
+        // response is malformed or `data` is missing — matches the user
+        // intent of "always try to pause on wakeword unless we know it's
+        // already paused". The previous default of `true` silently
+        // suppressed pauses on any unparseable response.
         let is_paused = get_resp
             .get("data")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         if is_paused {
             log::info!("[mpv] Already paused (data={}), nothing to do", is_paused);
             return Ok(false);
         }
 
-        // mpv is playing -- pause it
         log::info!("[mpv] Currently playing, sending pause command");
         writer.write_all(b"{\"command\":[\"set_property\",\"pause\",true],\"request_id\":2}\n")?;
         writer.flush()?;

@@ -291,11 +291,34 @@ impl AudioCapture {
         let chunk_bytes = CHUNK_SIZE * 2;
         let mut byte_buffer: Vec<u8> = Vec::with_capacity(chunk_bytes * 8);
         let mut chunk_buf: Vec<u8> = vec![0u8; chunk_bytes];
+        let affinity_set = Arc::new(AtomicBool::new(false));
 
         device
             .build_input_stream(
                 config,
                 move |data: &[i16], _| {
+                    #[cfg(target_os = "linux")]
+                    if !affinity_set.load(Ordering::Relaxed) {
+                        affinity_set.store(true, Ordering::Relaxed);
+                        unsafe {
+                            let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+                            libc::CPU_SET(1, &mut cpuset);
+                            let ret = libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &cpuset,
+                            );
+                            if ret == 0 {
+                                log::info!("Audio capture thread pinned to core 1");
+                            } else {
+                                log::warn!(
+                                    "Failed to pin capture thread to core 1: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            }
+                        }
+                    }
+
                     for frame in data.chunks(channels) {
                         if let Some(&s) = frame.get(channel as usize) {
                             byte_buffer.extend_from_slice(&s.to_le_bytes());

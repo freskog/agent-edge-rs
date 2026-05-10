@@ -30,7 +30,29 @@ pub struct SpotifyController;
 
 impl SpotifyController {
     pub fn new() -> Self {
-        Self
+        let ctrl = Self;
+        // Probe the session bus once at startup so a missing spotifyd is
+        // visible in logs without having to wait for the first wakeword.
+        match ctrl.find_mpris_player() {
+            Ok((_, name)) => {
+                log::info!("[spotify] MPRIS player available at startup: {}", name);
+            }
+            Err(SpotifyControlError::NoPlayerFound) => {
+                log::warn!(
+                    "[spotify] No MPRIS player on session bus at startup — \
+                     is spotifyd running? Pause-on-wakeword will be a no-op \
+                     until one appears."
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[spotify] Could not probe session bus at startup: {} — \
+                     pause-on-wakeword may fail.",
+                    e
+                );
+            }
+        }
+        ctrl
     }
 
     /// Pause music if currently playing. Returns true if music was actually paused,
@@ -43,19 +65,22 @@ impl SpotifyController {
                 }
                 was_paused
             }
+            Err(SpotifyControlError::NoPlayerFound) => {
+                log::warn!(
+                    "[spotify] No MPRIS player on session bus — \
+                     is spotifyd running? Skipping pause."
+                );
+                false
+            }
             Err(e) => {
-                log::debug!("Could not pause music: {}", e);
+                log::warn!("[spotify] Could not pause music: {}", e);
                 false
             }
         }
     }
 
     fn try_pause(&self) -> Result<bool, SpotifyControlError> {
-        let (conn, service) = match self.find_mpris_player() {
-            Ok(r) => r,
-            Err(SpotifyControlError::NoPlayerFound) => return Ok(false),
-            Err(e) => return Err(e),
-        };
+        let (conn, service) = self.find_mpris_player()?;
 
         let proxy = Proxy::new(&conn, service.as_str(), MPRIS_PATH, MPRIS_PLAYER_IFACE)?;
 
@@ -64,6 +89,11 @@ impl SpotifyController {
             .map_err(SpotifyControlError::from)?;
 
         if status != "Playing" {
+            log::debug!(
+                "[spotify] MPRIS player {} not playing (status={}), skipping pause",
+                service,
+                status
+            );
             return Ok(false);
         }
 
