@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# /usr/local/bin/assistant-audio-mode
+#
+# Switch the system ALSA configuration between the I2S and USB ReSpeaker
+# transports. The two configs (i2s.conf, usb.conf) share the same softvol
+# control name "XVF3800 SoftMaster" so audio.service, spotifyd.service and
+# the Rust binaries do not need any changes to follow the switch.
+#
+# Usage:
+#   sudo assistant-audio-mode i2s    # force I2S mode
+#   sudo assistant-audio-mode usb    # force USB mode
+#   sudo assistant-audio-mode auto   # USB if card "Array" is present, else I2S
+#   sudo assistant-audio-mode status # print current mode + active.conf target
+#
+# Successful mode changes restart the user-level audio consumer services
+# (audio, spotifyd, mpv) so they re-open ALSA on the newly selected device.
+
+set -euo pipefail
+
+CONF_DIR=/etc/assistant/alsa
+MODE_FILE=/etc/assistant/audio-mode
+ACTIVE_LINK="$CONF_DIR/active.conf"
+TARGET_USER="${ASSISTANT_AUDIO_USER:-freskog}"
+CONSUMER_UNITS=(audio.service spotifyd.service mpv.service)
+
+usage() {
+  cat >&2 <<EOF
+usage: ${0##*/} {i2s|usb|auto|status}
+
+  i2s     point ALSA at the bcm2835-i2s XVF3800 simple-card
+  usb     point ALSA at the XVF3800 USB Audio Class card "Array"
+  auto    pick USB if card "Array" is present, otherwise I2S
+  status  show the active config without changing anything
+
+The user-level consumer services (${CONSUMER_UNITS[*]}) are restarted on
+success so they re-open ALSA on the newly selected device.
+EOF
+  exit 1
+}
+
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    exec sudo --preserve-env=ASSISTANT_AUDIO_USER "$0" "$@"
+  fi
+}
+
+apply_mode() {
+  local mode="$1"
+  local conf="$CONF_DIR/$mode.conf"
+  if [[ ! -f "$conf" ]]; then
+    echo "Error: $conf does not exist" >&2
+    exit 2
+  fi
+  ln -sfn "$conf" "$ACTIVE_LINK"
+  printf '%s\n' "$mode" > "$MODE_FILE"
+  echo "Selected audio mode: $mode  ($(readlink -f "$ACTIVE_LINK"))"
+}
+
+detect_mode() {
+  if aplay -l 2>/dev/null | grep -qE '^card [0-9]+: Array '; then
+    echo usb
+  else
+    echo i2s
+  fi
+}
+
+cleanup_stale_shm() {
+  # Mode switches leave dmix/dsnoop SysV shm segments behind once the old
+  # consumers exit. They are harmless once nobody is attached, but they
+  # consume ids and can cause subtle confusion. Drop any segments owned
+  # by the target user that nobody is attached to.
+  if ! id "$TARGET_USER" >/dev/null 2>&1; then
+    return 0
+  fi
+  local stale
+  stale=$(ipcs -m | awk -v u="$TARGET_USER" '$3==u && $6==0 {print $2}')
+  if [[ -n "$stale" ]]; then
+    echo "Cleaning stale shm segments (nattch=0) for $TARGET_USER:"
+    for id in $stale; do
+      echo "  ipcrm shmid=$id"
+      ipcrm -m "$id" 2>/dev/null || true
+    done
+  fi
+}
+
+restart_consumers() {
+  if ! id "$TARGET_USER" >/dev/null 2>&1; then
+    echo "Target user '$TARGET_USER' not found; skipping consumer restart." >&2
+    return 0
+  fi
+  local uid
+  uid="$(id -u "$TARGET_USER")"
+  local runtime_dir="/run/user/$uid"
+  if [[ ! -d "$runtime_dir" ]]; then
+    echo "User runtime dir $runtime_dir missing (linger not enabled?); skipping consumer restart." >&2
+    return 0
+  fi
+  echo "Stopping consumer services as $TARGET_USER:"
+  for unit in "${CONSUMER_UNITS[@]}"; do
+    if sudo -u "$TARGET_USER" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+        systemctl --user list-unit-files "$unit" --no-legend 2>/dev/null \
+        | grep -q "$unit"; then
+      echo "  stop $unit"
+      sudo -u "$TARGET_USER" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+        systemctl --user stop "$unit" 2>/dev/null || true
+    fi
+  done
+
+  # Clean up any orphaned shm AFTER consumers are stopped so dmix/dsnoop
+  # segments held by the old mode are detached and removable.
+  cleanup_stale_shm
+
+  echo "Starting consumer services as $TARGET_USER:"
+  for unit in "${CONSUMER_UNITS[@]}"; do
+    if sudo -u "$TARGET_USER" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+        systemctl --user list-unit-files "$unit" --no-legend 2>/dev/null \
+        | grep -q "$unit"; then
+      echo "  start $unit"
+      sudo -u "$TARGET_USER" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+        systemctl --user start "$unit" || \
+        echo "    (start failed; continuing)"
+    else
+      echo "  skip $unit (not installed)"
+    fi
+  done
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  i2s|usb)
+    require_root "$@"
+    apply_mode "$cmd"
+    restart_consumers
+    ;;
+  auto)
+    require_root "$@"
+    apply_mode "$(detect_mode)"
+    restart_consumers
+    ;;
+  status)
+    cur="<unset>"
+    [[ -f "$MODE_FILE" ]] && cur="$(<"$MODE_FILE")"
+    link="<missing>"
+    [[ -L "$ACTIVE_LINK" || -e "$ACTIVE_LINK" ]] && link="$(readlink -f "$ACTIVE_LINK" 2>/dev/null || echo "<broken>")"
+    echo "audio-mode file: $cur"
+    echo "active.conf -> $link"
+    ;;
+  ""|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Error: unknown command '$cmd'" >&2
+    usage
+    ;;
+esac
