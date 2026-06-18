@@ -34,6 +34,10 @@ pub struct AudioCaptureConfig {
     pub device_id: Option<String>,
     /// Channel to capture (0-based index)
     pub channel: u32,
+    /// Linear gain applied to each captured sample (1.0 = unchanged). Used to
+    /// raise the level of low-output mics (e.g. the Jabra USB speakerphone)
+    /// into the range openWakeWord expects. Applied with hard clamping.
+    pub gain: f32,
 }
 
 impl Default for AudioCaptureConfig {
@@ -41,6 +45,7 @@ impl Default for AudioCaptureConfig {
         Self {
             device_id: None,
             channel: 0,
+            gain: 1.0,
         }
     }
 }
@@ -224,6 +229,7 @@ impl AudioCapture {
             &stream_config,
             config.channel,
             channels,
+            config.gain,
             sender,
             stream_broken,
         )?;
@@ -285,6 +291,7 @@ impl AudioCapture {
         config: &cpal::StreamConfig,
         channel: u32,
         channels: usize,
+        gain: f32,
         sender: Sender<Vec<u8>>,
         stream_broken: Arc<AtomicBool>,
     ) -> Result<CpalStream, AudioCaptureError> {
@@ -321,7 +328,15 @@ impl AudioCapture {
 
                     for frame in data.chunks(channels) {
                         if let Some(&s) = frame.get(channel as usize) {
-                            byte_buffer.extend_from_slice(&s.to_le_bytes());
+                            let sample = if gain != 1.0 {
+                                (s as f32 * gain)
+                                    .round()
+                                    .clamp(i16::MIN as f32, i16::MAX as f32)
+                                    as i16
+                            } else {
+                                s
+                            };
+                            byte_buffer.extend_from_slice(&sample.to_le_bytes());
                         }
                     }
 

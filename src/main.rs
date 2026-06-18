@@ -40,7 +40,7 @@ EXAMPLES:
   audio_service --input-device \"ReSpeaker 4 Mic Array\" --output-device \"Built-in Audio\"
 
   # Boost TTS volume by 30 percentage points
-  audio_service --mixer-name \"XVF3800 SoftMaster\" --tts-volume-boost 30
+  audio_service --mixer-name \"PCM\" --tts-volume-boost 30
 ")]
 struct Args {
     /// Consumer server bind address (for audio streaming)
@@ -67,7 +67,13 @@ struct Args {
     #[arg(long, default_value = "0")]
     input_channel: u32,
 
-    /// ALSA mixer element name for volume control (e.g., "XVF3800 SoftMaster")
+    /// Software capture gain in dB applied to mic input (0 = unchanged).
+    /// Raises low-output USB mics (e.g. the Jabra speakerphone) into the level
+    /// openWakeWord expects. Leave at 0 for the ReSpeaker, which is already hot.
+    #[arg(long, default_value = "0.0")]
+    capture_gain: f32,
+
+    /// ALSA mixer element name for volume control (e.g., "PCM" for the Jabra, "XVF3800 SoftMaster" for the ReSpeaker)
     #[arg(long)]
     mixer_name: Option<String>,
 
@@ -95,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_capture_config: AudioCaptureConfig {
             device_id: args.input_device.clone(),
             channel: args.input_channel,
+            gain: 10f32.powf(args.capture_gain / 20.0),
         },
         wakeword_models: vec!["hey_mycroft".to_string()],
         detection_threshold: 0.5,

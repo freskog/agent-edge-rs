@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # /usr/local/bin/assistant-audio-mode
 #
-# Switch the system ALSA configuration between the I2S and USB ReSpeaker
-# transports. The two configs (i2s.conf, usb.conf) share the same softvol
-# control name "XVF3800 SoftMaster" so audio.service, spotifyd.service and
-# the Rust binaries do not need any changes to follow the switch.
+# Switch the system ALSA configuration between the I2S/USB ReSpeaker
+# transports and the Jabra Speak2 75 USB speakerphone.
+#
+# The two ReSpeaker configs (i2s.conf, usb.conf) share the same softvol
+# control name "XVF3800 SoftMaster". The jabra config (jabra.conf) has NO
+# softvol and instead exposes the device's hardware mixer control "PCM";
+# audio.service (--mixer-name), spotifyd.service (--control) and led_engine.rs
+# (MIXER_NAME) are configured with the matching control name for that device.
 #
 # Usage:
-#   sudo assistant-audio-mode i2s    # force I2S mode
-#   sudo assistant-audio-mode usb    # force USB mode
-#   sudo assistant-audio-mode auto   # USB if card "Array" is present, else I2S
+#   sudo assistant-audio-mode i2s    # force I2S mode (ReSpeaker)
+#   sudo assistant-audio-mode usb    # force USB mode (ReSpeaker)
+#   sudo assistant-audio-mode jabra  # force Jabra Speak2 75 mode
+#   sudo assistant-audio-mode auto   # Jabra if "J75" present, else USB "Array", else I2S
 #   sudo assistant-audio-mode status # print current mode + active.conf target
 #
 # Successful mode changes restart the user-level audio consumer services
@@ -25,11 +30,12 @@ CONSUMER_UNITS=(audio.service spotifyd.service mpv.service)
 
 usage() {
   cat >&2 <<EOF
-usage: ${0##*/} {i2s|usb|auto|status}
+usage: ${0##*/} {i2s|usb|jabra|auto|status}
 
   i2s     point ALSA at the bcm2835-i2s XVF3800 simple-card
   usb     point ALSA at the XVF3800 USB Audio Class card "Array"
-  auto    pick USB if card "Array" is present, otherwise I2S
+  jabra   point ALSA at the Jabra Speak2 75 card "J75" (hw mixer, no softvol)
+  auto    pick Jabra "J75" if present, else USB "Array", otherwise I2S
   status  show the active config without changing anything
 
 The user-level consumer services (${CONSUMER_UNITS[*]}) are restarted on
@@ -56,8 +62,24 @@ apply_mode() {
   echo "Selected audio mode: $mode  ($(readlink -f "$ACTIVE_LINK"))"
 }
 
+tune_device() {
+  # Per-device hardware control tuning applied on every (re)activation so the
+  # state is deterministic regardless of reboot/alsa-state restore.
+  local mode="$1"
+  if [[ "$mode" == jabra ]]; then
+    # The Jabra delivers a very low-level mic stream. Max its hardware capture
+    # gain (+9 dB, verified clean with no AGC pumping); audio.service applies
+    # additional software --capture-gain on top to reach openWakeWord's range.
+    if amixer -c J75 sset Headset 7 >/dev/null 2>&1; then
+      echo "Tuned Jabra mic capture gain to max (Headset=7, +9 dB)"
+    fi
+  fi
+}
+
 detect_mode() {
-  if aplay -l 2>/dev/null | grep -qE '^card [0-9]+: Array '; then
+  if aplay -l 2>/dev/null | grep -qE '^card [0-9]+: J75 '; then
+    echo jabra
+  elif aplay -l 2>/dev/null | grep -qE '^card [0-9]+: Array '; then
     echo usb
   else
     echo i2s
@@ -135,14 +157,17 @@ restart_consumers() {
 
 cmd="${1:-}"
 case "$cmd" in
-  i2s|usb)
+  i2s|usb|jabra)
     require_root "$@"
     apply_mode "$cmd"
+    tune_device "$cmd"
     restart_consumers
     ;;
   auto)
     require_root "$@"
-    apply_mode "$(detect_mode)"
+    mode="$(detect_mode)"
+    apply_mode "$mode"
+    tune_device "$mode"
     restart_consumers
     ;;
   status)
