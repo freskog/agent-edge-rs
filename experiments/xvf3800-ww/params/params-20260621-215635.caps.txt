@@ -1,0 +1,218 @@
+SHF_BYPASS                      READ/WRITE  1   uint8    AEC bypass 
+
+AEC_NUM_MICS                    READ ONLY   1   int32    Number of microphone inputs into the AEC 
+
+AEC_NUM_FARENDS                 READ ONLY   1   int32    Number of farend inputs into the AEC 
+
+AEC_MIC_ARRAY_TYPE              READ ONLY   1   int32    Microphone array type (1 - linear, 2 - squarecular) 
+
+AEC_MIC_ARRAY_GEO               READ ONLY   12  float    Microphone array geometry. Each microphone is represented by 3 XYZ coordinates in m. 
+
+AEC_AZIMUTH_VALUES              READ ONLY   4   radians  Azimuth values in radians - beam 1, beam 2, free-running beam, 3 - auto-select beam 
+
+AEC_CURRENT_IDLE_TIME           READ ONLY   1   uint32   AEC processing current idle time in 10ns ticks 
+
+AEC_MIN_IDLE_TIME               READ ONLY   1   uint32   AEC processing minimum idle time in 10ns ticks 
+
+AEC_RESET_MIN_IDLE_TIME         WRITE ONLY  1   uint32   Reset the AEC minimum idle time. The value of the argument passed is ignored. 
+
+AEC_SPENERGY_VALUES             READ ONLY   4   float    Speech energy level values for each beam. Any value above 0 indicates speech. Higher values indicates louder or closer speech, however noise, echo and reverb can cause the energy level to decrease. 0 - beam 1, 1 - beam 2, 2 - free-running beam, 3 - auto-select beam 
+
+AEC_FIXEDBEAMSAZIMUTH_VALUES    READ/WRITE  2   radians  Azimuth values in radians for beams in fixed mode - fixed beam 1, fixed beam 2 
+
+AEC_FIXEDBEAMSELEVATION_VALUES  READ/WRITE  2   radians  Elevation angles in radians for the beams in fixed mode. 0 - fixed beam 1, 1 - fixed beam 2 
+
+AEC_FIXEDBEAMSGATING            READ/WRITE  1   uint8    Enables/disables gating for beams in fixed mode. When enabled, speech energy is used to determine which beam should be active; inactive beams are silenced. 
+
+AEC_FILTER_CMD_ABORT            WRITE ONLY  1   int32    Reset the special command state machine. Used for safely exiting from an AEC filter read/write command sequence that has gone wrong. 
+
+AEC_AECPATHCHANGE               READ ONLY   1   int32    AEC Path Change Detection. Valid range: 0,1 (false,true) 
+
+AEC_HPFONOFF                    READ/WRITE  1   int32    High-pass Filter on microphone signals. Valid range: 0,1,2,3,4 (0:Off, 1:on70, 2:on125, 3:on150, 4:on180) 
+
+AEC_AECSILENCELEVEL             READ/WRITE  2   float    Power threshold for signal detection in adaptive filter.(set,cur), Valid range (set): [0.0 .. 1.0] Valid range (cur): 0.05*set, 1e-6f or set. 
+
+AEC_AECCONVERGED                READ ONLY   1   int32    Flag indicating whether AEC is converged. Valid range: 0,1 (false,true) 
+
+AEC_AECEMPHASISONOFF            READ/WRITE  1   int32    Pre-emphasis and de-emphasis filtering for AEC. Valid range: 0,1,2 (off,on,on_eq)on: Emphasis filter for speech signals without modification of far-end ref. on_eq: Emphasis filter for far-end reference signals where the low frequencies are boosted by e.g. an equalizer. 
+
+AEC_FAR_EXTGAIN                 READ/WRITE  1   float    External gain in dB applied to the far-end reference signals. Valid range: [-inf .. inf] 
+
+AEC_PCD_COUPLINGI               READ/WRITE  1   float    Sensitivity parameter for PCD. Valid range: [0.0 .. 1.0]PCD can be disabled by setting a value outside the range 
+
+AEC_PCD_MINTHR                  READ/WRITE  1   float    Minimum threshold value used in PCD. Valid range: [0.0 .. 0.02] 
+
+AEC_PCD_MAXTHR                  READ/WRITE  1   float    Maximum threshold value used in PCD. Valid range: [0.025 .. 0.2] 
+
+AEC_RT60                        READ ONLY   1   float    Current RT60 estimate. Valid range: [0.250 .. 0.900] (seconds) A negative value indicates that the RT60 estimation is invalid. 
+
+AEC_ASROUTONOFF                 READ/WRITE  1   int32    Enables the automatic speech recognition (ASR) output: if set to 0, the AEC residuals are output, one channel per microphone, if set to 1, the ASR processed output is used, where each channel is associated with a beam from the beamformer. Valid range: 0,1 (off, on) 
+
+AEC_ASROUTGAIN                  READ/WRITE  1   float    Fixed gain applied to qsr output, i.e., only applied if ASROUTONOFF==1.. Valid range: [0.0 .. 1000.0] (linear gain factor) 
+
+AEC_FIXEDBEAMSONOFF             READ/WRITE  1   int32    Enables or disables fixed focused beam mode. Valid range: 0,1 (off, on) 
+
+AEC_FIXEDBEAMNOISETHR           READ/WRITE  2   float    Threshold value for updating the noise canceller when fixed beam mode is enabled. A higher value indicates that the noise canceller may update when the free running beam is close to the fixed beam. A lower value indicates that the noise canceller may update when the free running beam is further away from the focused beam.[BECLEAR_NUMBER_OF_BEAMS], Valid range: [0.0 .. 1.0] 
+
+VERSION                         READ ONLY   3   uint8    The version number of the firmware. The format is VERSION_MAJOR VERSION_MINOR VERSION_PATCH 
+
+BLD_MSG                         READ ONLY   50  char     Retrieve the build message built in to the firmware, normally the build configuration name 
+
+BLD_HOST                        READ ONLY   30  char     Retrieve details of the CI build host used to build the firmware 
+
+BLD_REPO_HASH                   READ ONLY   40  char     Retrieve the GIT hash of the sw_xvf3800 repo used to build the firmware 
+
+BLD_MODIFIED                    READ ONLY   6   char     Show whether or not the current firmware repo has been modified from the official release. Requires use of a GIT repo 
+
+BOOT_STATUS                     READ ONLY   3   char     Shows whether or not the firmware has been booted via SPI or JTAG/FLASH 
+
+REBOOT                          WRITE ONLY  1   uint8    Set to any value to reboot the chip and reset all parameters to default. 
+
+USB_BIT_DEPTH                   READ/WRITE  2   uint8    Only relevant for the UA device variant. For the UA device, set or get the USB bit depth IN, OUT to either 16, 24 or 32. Setting will reboot the chip, resetting all other parameters to default. If issued to the INT device, a set is ignored and the device is not rebooted while a get always returns 0 as both IN and OUT bit depths. 
+
+SAVE_CONFIGURATION              WRITE ONLY  1   uint8    Set to any value to save the current configuration to flash. 
+
+CLEAR_CONFIGURATION             WRITE ONLY  1   uint8    Set to any value to clear the current configuration and revert to the default configuration. 
+
+SERIAL_NUMBER                   READ ONLY   32  char     Show the serial number of this device 
+
+AUDIO_MGR_MIC_GAIN              READ/WRITE  1   float    Audio Mgr pre SHF microphone gain 
+
+AUDIO_MGR_REF_GAIN              READ/WRITE  1   float    Audio Mgr pre SHF reference gain 
+
+AUDIO_MGR_CURRENT_IDLE_TIME     READ ONLY   1   int32    Get audio manager current idle time in 10ns ticks 
+
+AUDIO_MGR_MIN_IDLE_TIME         READ ONLY   1   int32    Get audio manager min idle time in 10ns ticks 
+
+AUDIO_MGR_RESET_MIN_IDLE_TIME   WRITE ONLY  1   int32    Reset audio manager min idle time. The value of the argument passed is ignored. 
+
+MAX_CONTROL_TIME                READ ONLY   1   int32    Get audio manager max control time 
+
+RESET_MAX_CONTROL_TIME          WRITE ONLY  1   int32    Reset audio manager max control time. The value of the argument passed is ignored. 
+
+I2S_CURRENT_IDLE_TIME           READ ONLY   1   int32    Get I2S current idle time in 10ns ticks 
+
+I2S_MIN_IDLE_TIME               READ ONLY   1   int32    Get I2S min idle time in 10ns ticks 
+
+I2S_RESET_MIN_IDLE_TIME         WRITE ONLY  1   int32    I2S reset idle time. The value of the argument passed is ignored. 
+
+I2S_INPUT_PACKED                READ/WRITE  1   uint8    Will expect packed input on both I2S or USB channels if this is not 0. Note, could take up to 3 samples to take effect. 
+
+AUDIO_MGR_SELECTED_AZIMUTHS     READ ONLY   2   radians  This returns the azimuths determined by the beam_selection function in post_shf_dsp.c. The default implementation will provide a processed DoA at index 0 and the DoA of the auto select beam at index 1. The processed DoA uses speech energy to select from the DoA on each fixed beam to provide the direction of a speaker. NAN will be returned if neither of the fixed beams contain speech. Versions 2.0.0 and earlier of XVF3800 had a different default implementation of beam_selection which returned the DoA associated with the AUDIO_MGR_SELECTED_CHANNELS 
+
+AUDIO_MGR_SELECTED_CHANNELS     READ/WRITE  2   uint8    Default implementation of post processing will use this to select which channels should be output to MUX_USER_CHOSEN_CHANNELS. Note that a customer implementation of the beam selection stage could override this command. How this channel selection aligns with actual output depends on the mux configuration 
+
+AUDIO_MGR_OP_PACKED             READ/WRITE  2   uint8    <L>, <R>; Sets/gets packing status for L and R output channels 
+
+AUDIO_MGR_OP_UPSAMPLE           READ/WRITE  2   uint8    <L>, <R>; Sets/gets upsample status for L and R output channels, where appropriate 
+
+AUDIO_MGR_OP_L                  READ/WRITE  2   uint8    <category>, <source>; Sets category and source for L output channel. Equivalent to AUDIO_MGR_OP_L_PK0 
+
+AUDIO_MGR_OP_L_PK0              READ/WRITE  2   uint8    <category>, <source>; Sets category and source for first (of three) sources on the L channel in packed mode. Equivalent to AUDIO_MGR_OP_L 
+
+AUDIO_MGR_OP_L_PK1              READ/WRITE  2   uint8    Sets category and source for second (of three) sources on the L channel in packed mode 
+
+AUDIO_MGR_OP_L_PK2              READ/WRITE  2   uint8    Sets category and source for third (of three) sources on the L channel in packed mode 
+
+AUDIO_MGR_OP_R                  READ/WRITE  2   uint8    <category>, <source>; Sets category and source for R output channel. Equivalent to AUDIO_MGR_OP_R_PK0 
+
+AUDIO_MGR_OP_R_PK0              READ/WRITE  2   uint8    <category>, <source>; Sets category and source for first (of three) sources on the R channel in packed mode. Equivalent to AUDIO_MGR_OP_R 
+
+AUDIO_MGR_OP_R_PK1              READ/WRITE  2   uint8    Sets category and source for second (of three) sources on the R channel in packed mode 
+
+AUDIO_MGR_OP_R_PK2              READ/WRITE  2   uint8    Sets category and source for third (of three) sources on the R channel in packed mode 
+
+AUDIO_MGR_OP_ALL                READ/WRITE  12  uint8    Sets category and source for all 3 sources on L channel and all 3 sources for R channel. Equivalent to AUDIO_MGR_OP_[L,R]_PK[0,1,2] with successive pairs of arguments 
+
+I2S_INACTIVE                    READ ONLY   1   uint8    Returns whether the main audio loop is exchanging samples with I2S (0). If not (1), I2S is inactive 
+
+AUDIO_MGR_FAR_END_DSP_ENABLE    READ/WRITE  1   uint8    Enables/disables XVF3800 far-end DSP (if implemented). Write a 1 to enable, 0 to disable 
+
+AUDIO_MGR_SYS_DELAY             READ/WRITE  1   int32    Delay, measured in samples, that is applied to the reference signal before passing to SHF algorithm 
+
+I2S_DAC_DSP_ENABLE              READ/WRITE  1   uint8    Indicates if the DAC performs DSP on the far-end reference signal. If enabled (1), use the I2S signal as input to the audio pipeline, even in the UA configuration 
+
+GPI_READ_VALUES                 READ ONLY   3   uint8    Get current logic level of all GPI pins, in order of Pin X1D09, X1D13 and X1D34. 
+
+GPO_READ_VALUES                 READ ONLY   5   uint8    Get current logic level of all GPO pins, in order of Pin X0D11, X0D30, X0D31, X0D33 and X0D39. 
+
+GPO_WRITE_VALUE                 WRITE ONLY  2   uint8    Set current logic level of selected GPO pin. Supports Pin X0D11, X0D30, X0D31, X0D33 and X0D39. 
+
+LED_EFFECT                      READ/WRITE  1   uint8    Set the LED effect mode, 0 = off, 1 = breath, 2 = rainbow, 3 = single color, 4 = doa 
+
+LED_BRIGHTNESS                  READ/WRITE  1   uint8    Set the brightness value of the LED for the breath and rainbow mode 
+
+LED_GAMMIFY                     READ/WRITE  1   uint8    Set to enable gamma correction, 0 = disable, 1 = enable 
+
+LED_SPEED                       READ/WRITE  1   uint8    Set the effect speed of breath and rainbow mode 
+
+LED_COLOR                       READ/WRITE  1   uint32   Set the LED color of breath mode and single color mode 
+
+LED_DOA_COLOR                   READ/WRITE  2   uint32   Set the LED color of doa mode, the first value is the base color and the second value is the doa color 
+
+PLL_LOCK_STATUS                 READ ONLY   1   int32    Returns the lock status of the audio PLL used for generating MCLK (for builds where it is used). It may return one of the following - -1 input frequency too low to track; 0 pll output is locked to input; 1 input frequency is too high to track Note that the PLL status is only valid when the external clock source is active (eg. I2S is running for int-dev. See I2S_INACTIVE to check this), or when running in USB Audio adaptive mode (UA) 
+
+PP_CURRENT_IDLE_TIME            READ ONLY   1   uint32   PP processing current idle time in 10ns ticks 
+
+PP_MIN_IDLE_TIME                READ ONLY   1   uint32   PP processing minimum idle time in 10ns ticks 
+
+PP_RESET_MIN_IDLE_TIME          WRITE ONLY  1   uint32   Reset the PP minimum idle time. The value of the argument passed is ignored. 
+
+PP_NL_MODEL_CMD_ABORT           WRITE ONLY  1   int32    Reset the special command state machine. Used for safely exiting from a NL model read/write sequence that has gone wrong. 
+
+PP_EQUALIZATION_CMD_ABORT       WRITE ONLY  1   int32    Reset the special command state machine. Used for safely exiting from an equalization read/write sequence that has gone wrong. 
+
+PP_AGCONOFF                     READ/WRITE  1   int32    Automatic Gain Control. Valid range: 0,1 (off,on) 
+
+PP_AGCMAXGAIN                   READ/WRITE  1   float    Maximum AGC gain factor. Valid range: [1.0 .. 1000.0] (linear gain factor) 
+
+PP_AGCDESIREDLEVEL              READ/WRITE  1   float    Target power level of the output signal. Valid range: [1e-8 .. 1.0] (power level) 
+
+PP_AGCGAIN                      READ/WRITE  1   float    Current AGC gain factor. Valid range: [1.0 .. 1000.0] (linear gain factor) 
+
+PP_AGCTIME                      READ/WRITE  1   float    Ramp-up/down time-constant. Valid range: [0.5 .. 4.0] (seconds) 
+
+PP_AGCFASTTIME                  READ/WRITE  1   float    Ramp down time-constant in case of peaks. Valid range: [0.05 .. 4.0] (seconds) 
+
+PP_AGCALPHAFASTGAIN             READ/WRITE  1   float    Gain threshold enabling fast alpha mode. Valid range: [0.0 .. 1000.0] (linear gain factor) 
+
+PP_AGCALPHASLOW                 READ/WRITE  1   float    Slow memory parameter for speech power. Valid range [0.0 .. 1.0] 
+
+PP_AGCALPHAFAST                 READ/WRITE  1   float    Fast memory parameter for speech power. Valid range [0.0 .. 1.0] 
+
+PP_LIMITONOFF                   READ/WRITE  1   int32    Limiter on communication output. Valid range: 0,1 (off,on) 
+
+PP_LIMITPLIMIT                  READ/WRITE  1   float    Maximum limiter power. Valid range: [1e-8 .. 1.0] (power level) 
+
+PP_MIN_NS                       READ/WRITE  1   float    Gain-floor for stationary noise suppression. Valid range: [0.0 .. 1.0] 
+
+PP_MIN_NN                       READ/WRITE  1   float    Gain-floor for non-stationary noise suppression. Valid range: [0.0 .. 1.0] 
+
+PP_ECHOONOFF                    READ/WRITE  1   int32    Echo suppression. Valid range: 0,1 (off,on) 
+
+PP_GAMMA_E                      READ/WRITE  1   float    Over-subtraction factor of echo (direct and early components). Valid range: [0.0 .. 2.0] 
+
+PP_GAMMA_ETAIL                  READ/WRITE  1   float    Over-subtraction factor of echo (tail components). Valid range: [0.0 .. 2.0] 
+
+PP_GAMMA_ENL                    READ/WRITE  1   float    Over-subtraction factor of non-linear echo. Valid range: [0.0 .. 5.0] 
+
+PP_NLATTENONOFF                 READ/WRITE  1   int32    Non-Linear echo attenuation. Valid range: 0,1 (off,on) 
+
+PP_NLAEC_MODE                   READ/WRITE  1   int32    Non-Linear AEC training mode. Valid range: 0,1,2 (normal,train,train2) 
+
+PP_MGSCALE                      READ/WRITE  3   float    Minimum gain scale for acoustic echo suppression.(max,min,cur), Valid range (max,min): [(1.0,0.0) .. (1e5,max)] Valid range (cur): min or max. 
+
+PP_FMIN_SPEINDEX                READ/WRITE  1   float    In case of double talk, frequencies below SPEINDEX are more suppressed than frequencies above SPEINDEX. The actual suppression is depending on the setting of DTSENSITIVE. The parameter is not a taste parameter but needs to be tuned for a specific device. Valid range: [0.0 .. 7999.0] 
+
+PP_DTSENSITIVE                  READ/WRITE  1   int32    Tradeoff between echo suppression and doubletalk performance. A lower value prefers high echo suppression (possibly at the cost of less doubletalk performance), a higher value prefers better doubletalk performance (possibly at the cost of good echo suppression). Good doubletalk performance is only possible for hardware without much non-linearities. When the value has 2 digits, for robustness an extra near-end speech detector is used. Valid range: [0 .. 5, 10 .. 15] 
+
+PP_ATTNS_MODE                   READ/WRITE  1   int32    Additional reduction of AGC gain during non-speech. Valid range: 0,1 (off, on) 
+
+PP_ATTNS_NOMINAL                READ/WRITE  1   float    Amount of additional reduction during non-speech at nominal speech level. Valid range: [0.0 .. 1.0] 
+
+PP_ATTNS_SLOPE                  READ/WRITE  1   float    Determines the extra amount of suppression during non-speech when the AGC level increases at lower speech level. The extra attenuation is given by (agcgain_nominal/agcgain_current)^attns_slope. With a value of 1.0 the amount of noise in the output remains approximately the same, independent of the agc gain. Valid range: [0.0 .. 5.0] 
+
+USB_D2H_BUFFER_STABLE           READ ONLY   1   uint8    Boolean value indicating if the D2H FIFO has been stable when streaming from the device. The buffer_stable value is retained between a streaming stop and the next streaming start event and reset on the next streaming start event. The command may return one of the following. 0 if the buffer was ever unstable after a streaming start event. 1 if the buffer has always been stable after it reached a stable state after a streaming start event. 
+
+USB_H2D_BUFFER_STABLE           READ ONLY   1   uint8    Boolean value indicating if the H2D FIFO has been stable when streaming to the device. The buffer_stable value is retained between a streaming stop and the next streaming start event and reset on the next streaming start event. The command may return one of the following. 0 if the buffer was ever unstable after a streaming start event. 1 if the buffer has always been stable after it reached a stable state after a streaming start event. 
+
