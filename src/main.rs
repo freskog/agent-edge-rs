@@ -80,6 +80,18 @@ struct Args {
     /// TTS volume boost in percentage points added to current volume (e.g., 20)
     #[arg(long, default_value = "20")]
     tts_volume_boost: u8,
+
+    /// LED controller HTTP endpoint (host:port). The audio service POSTs a
+    /// `ww_detected` event here the instant a wake word fires for immediate
+    /// ring feedback, bypassing the agent round-trip.
+    #[arg(long, default_value = "127.0.0.1:3000")]
+    led_endpoint: String,
+
+    /// spotify-control HTTP endpoint (host:port). The audio service POSTs a
+    /// pause request here on wake word. If unreachable, pause is a logged
+    /// no-op and detection is unaffected.
+    #[arg(long, default_value = "127.0.0.1:3001")]
+    spotify_endpoint: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,6 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wakeword_models: vec!["hey_mycroft".to_string()],
         detection_threshold: 0.5,
         vad_config: VadConfig::default(),
+        led_endpoint: args.led_endpoint.clone(),
+        spotify_endpoint: args.spotify_endpoint.clone(),
     };
 
     let producer_config = ProducerServerConfig {

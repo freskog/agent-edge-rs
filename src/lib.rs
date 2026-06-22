@@ -1,6 +1,6 @@
-pub mod alsa_volume;
 pub mod audio_sink;
 pub mod audio_source;
+pub mod beep;
 pub mod consumer_server;
 pub mod producer_server;
 pub mod protocol;
@@ -15,6 +15,5 @@ pub mod wakeword_models;
 pub mod wakeword_utils;
 pub mod wakeword_vad;
 
-// LED ring control
-pub mod led_engine;
-pub mod led_ring;
+// Fire-and-forget HTTP notifier for the LED controller
+pub mod led_notify;

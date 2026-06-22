@@ -108,10 +108,12 @@ impl LedRing {
         })
     }
 
+    #[allow(dead_code)] // utility kept for completeness
     pub fn all_off(&mut self) -> io::Result<()> {
         self.set_leds(&[RgbColor::BLACK; NUM_LEDS])
     }
 
+    #[allow(dead_code)] // utility kept for completeness
     pub fn all_solid(&mut self, color: RgbColor) -> io::Result<()> {
         self.set_leds(&[color; NUM_LEDS])
     }

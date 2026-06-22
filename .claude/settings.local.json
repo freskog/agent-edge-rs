@@ -1,7 +1,33 @@
 {
   "permissions": {
     "allow": [
-      "Bash(make services:*)"
+      "Bash(make services:*)",
+      "Read(//Users/freskog/code/scala-voice-assistant/**)",
+      "Read(//Users/freskog/code/**)",
+      "Bash(python3 -m py_compile experiments/xvf3800-ww/fake_agent_edge.py)",
+      "Bash(chmod +x experiments/xvf3800-ww/fake_agent_edge.py)",
+      "Bash(python3 -m py_compile fake_agent_edge.py)",
+      "Bash(python3 fake_agent_edge.py --help)",
+      "Bash(python3 -m py_compile rescore.py)",
+      "Bash(chmod +x rescore.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 rescore.py --labels L=8_0_music L=7_3_music --language en --target-rms-dbfs -23)",
+      "Bash(python3 rescore.py --labels L=8_0_music L=7_3_music --language en --no-normalize)",
+      "Bash(python3 -m py_compile level_probe.py)",
+      "Bash(python3 level_probe.py --left 6_3 --right 3_0 quiet=a.wav music=b.wav)",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 mycroft.local ' *)",
+      "Bash(python3 -m py_compile stt_check.py)",
+      "Bash(python3 stt_check.py --wav speech_on.wav --channel 0 --expected \"play some jazz music please\")",
+      "Bash(python3 stt_check.py --wav speech_on.wav --channel 1 --expected \"play some jazz music please\")",
+      "Bash(python3 stt_check.py --wav cmd_8_0_echoON.wav --channel 0)",
+      "Bash(sox cmd_8_0_echoON.wav -r 16000 -c 1 -b 16 cmd_8_0_echoON_mono.wav remix 1)",
+      "Bash(ssh *)",
+      "Bash(python3 level_probe.py --left 8_0 --right 3_0 only=cmd_8_0_echoON.wav)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(cd *)",
+      "WebFetch(domain:www.xmos.com)"
     ]
   }
 }

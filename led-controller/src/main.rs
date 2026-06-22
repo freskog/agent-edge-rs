@@ -1,5 +1,8 @@
-use audio::led_engine::{LedEngine, LedEvent, LedState};
-use audio::led_ring::LedRing;
+mod led_engine;
+mod led_ring;
+
+use crate::led_engine::{LedEngine, LedEvent, LedState};
+use crate::led_ring::LedRing;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};

@@ -1,6 +1,6 @@
 [Unit]
 Description=Audio Service (wakeword + VAD + streaming)
-After=spotifyd.service mpv.service
+After=spotifyd.service mpv.service spotify-control.service
 
 [Service]
 Type=simple

@@ -6,17 +6,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RELEASE_DIR="$PROJECT_ROOT/target/release"
 
-# Map deploy names to cargo binary names and systemd unit names
+# Map deploy names to cargo package names, output binary names, and unit names
+declare -A PKG_MAP=(
+    [audio]=audio
+    [led_controller]=led-controller
+    [spotify_control]=spotify-control
+)
 declare -A BIN_MAP=(
     [audio]=audio
     [led_controller]=led_controller
+    [spotify_control]=spotify-control
 )
 declare -A UNIT_MAP=(
     [audio]=audio
     [led_controller]=led-controller
+    [spotify_control]=spotify-control
 )
 
-SERVICES=(audio led_controller)
+SERVICES=(audio led_controller spotify_control)
 
 usage() {
     cat <<EOF
@@ -43,9 +50,10 @@ EOF
 
 build_service() {
     local svc="$1"
+    local pkg="${PKG_MAP[$svc]}"
     local bin="${BIN_MAP[$svc]}"
-    echo "==> Building $bin..."
-    cargo build --release --bin "$bin" --manifest-path "$PROJECT_ROOT/Cargo.toml"
+    echo "==> Building $pkg..."
+    cargo build --release -p "$pkg" --manifest-path "$PROJECT_ROOT/Cargo.toml"
     echo "    Built: $RELEASE_DIR/$bin"
 }
 
@@ -127,13 +135,13 @@ case "$cmd" in
         echo "==> Reloading systemd..."
         ssh "$PI_HOST" "systemctl --user daemon-reload"
         echo "==> Enabling all services..."
-        ssh "$PI_HOST" "systemctl --user enable spotifyd mpv led-controller audio agent-edge"
+        ssh "$PI_HOST" "systemctl --user enable spotifyd mpv led-controller spotify-control audio agent-edge"
         echo "==> Enabling linger (start services at boot without login)..."
         ssh "$PI_HOST" "sudo loginctl enable-linger freskog"
         echo "Done. Services will start on next reboot, or run: ./deploy.sh start all"
         ;;
     status)
-        ALL_SERVICES="spotifyd mpv led-controller audio agent-edge"
+        ALL_SERVICES="spotifyd mpv led-controller spotify-control audio agent-edge"
         target="${1:-all}"
         if [[ "$target" == "all" ]]; then
             services_list="$ALL_SERVICES"
@@ -151,11 +159,11 @@ case "$cmd" in
         if [[ -n "$target" ]]; then
             ssh "$PI_HOST" "journalctl --user -u $target.service -f --no-pager"
         else
-            ssh "$PI_HOST" "journalctl --user -u spotifyd -u mpv -u led-controller -u audio -u agent-edge -f --no-pager"
+            ssh "$PI_HOST" "journalctl --user -u spotifyd -u mpv -u led-controller -u spotify-control -u audio -u agent-edge -f --no-pager"
         fi
         ;;
     restart)
-        ALL_SERVICES="spotifyd mpv led-controller audio agent-edge"
+        ALL_SERVICES="spotifyd mpv led-controller spotify-control audio agent-edge"
         target="${1:-all}"
         if [[ "$target" == "all" ]]; then
             services_list="$ALL_SERVICES"

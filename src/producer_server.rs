@@ -1,4 +1,3 @@
-use crate::alsa_volume;
 use crate::audio_sink::{AudioSink, AudioSinkConfig};
 use crate::protocol::{ProducerConnection, ProducerMessage, ProtocolError};
 use crossbeam::channel::Receiver;

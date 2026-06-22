@@ -54,6 +54,13 @@ pub struct ConsumerServerConfig {
     pub wakeword_models: Vec<String>,
     pub detection_threshold: f32,
     pub vad_config: VadConfig,
+    /// `host:port` of the LED controller's HTTP API. The detection thread POSTs
+    /// a `ww_detected` event here the instant a wake word fires, before any
+    /// media-pause work, for the lowest-latency ring feedback.
+    pub led_endpoint: String,
+    /// `host:port` of the spotify-control service. The detection thread POSTs a
+    /// pause request here on wake word.
+    pub spotify_endpoint: String,
 }
 
 impl Default for ConsumerServerConfig {
@@ -64,6 +71,8 @@ impl Default for ConsumerServerConfig {
             wakeword_models: vec!["hey_mycroft".to_string()],
             detection_threshold: 0.5,
             vad_config: VadConfig::default(),
+            led_endpoint: "127.0.0.1:3000".to_string(),
+            spotify_endpoint: "127.0.0.1:3001".to_string(),
         }
     }
 }
@@ -83,6 +92,7 @@ pub struct ConsumerServer {
 
 impl ConsumerServer {
     pub fn new(config: ConsumerServerConfig) -> Self {
+        let spotify_controller = SpotifyController::new(config.spotify_endpoint.clone());
         Self {
             config,
             should_stop: Arc::new(AtomicBool::new(false)),
@@ -90,7 +100,7 @@ impl ConsumerServer {
             audio_capture: Arc::new(Mutex::new(None)),
             wakeword_model: Arc::new(Mutex::new(None)),
             vad_processor: Arc::new(Mutex::new(None)),
-            spotify_controller: SpotifyController::new(),
+            spotify_controller,
             mpv_controller: MpvController::new(),
             barge_in_tx: None,
         }
@@ -312,6 +322,22 @@ impl ConsumerServer {
 
         const WAKEWORD_DEBOUNCE_MS: u64 = 3000;
 
+        // Near-miss instrumentation: when WW_NEARMISS_LOG=1, track the peak wake
+        // confidence across each VAD speech segment and log it when the segment
+        // ends without firing. This surfaces sub-threshold "Hey Mycroft" misses
+        // that are otherwise invisible (only >= threshold detections are logged).
+        let nearmiss_log = std::env::var("WW_NEARMISS_LOG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut last_ww_max_conf = 0.0f32;
+        let mut segment_peak_conf = 0.0f32;
+        let mut in_speech_segment = false;
+        let mut segment_fired = false;
+        let mut silence_run = 0u32;
+        // End a speech segment after this many consecutive non-speech chunks, so
+        // brief VAD flicker mid-utterance doesn't split one phrase into several.
+        const SEGMENT_SILENCE_CHUNKS: u32 = 25;
+
         while !should_stop.load(Ordering::SeqCst) {
             let audio = {
                 let capture_guard = audio_capture.lock().unwrap();
@@ -345,16 +371,20 @@ impl ConsumerServer {
                             );
                         }
 
-                        match Self::process_wakeword_detection_standalone(
-                            &wakeword_model,
-                            &samples,
-                            config.detection_threshold,
-                            &last_wakeword_time,
-                            WAKEWORD_DEBOUNCE_MS,
-                            &spotify_controller,
-                            &mpv_controller,
-                            &barge_in_tx,
-                        )? {
+                        let (event_opt, ww_max_conf) =
+                            Self::process_wakeword_detection_standalone(
+                                &wakeword_model,
+                                &samples,
+                                config.detection_threshold,
+                                &last_wakeword_time,
+                                WAKEWORD_DEBOUNCE_MS,
+                                &spotify_controller,
+                                &mpv_controller,
+                                &barge_in_tx,
+                                &config.led_endpoint,
+                            )?;
+                        last_ww_max_conf = ww_max_conf;
+                        match event_opt {
                             Some(detection) => {
                                 last_wakeword_time = Some(detection.1);
                                 Some(detection.0)
@@ -377,6 +407,34 @@ impl ConsumerServer {
                             false
                         }
                     };
+
+                    if nearmiss_log {
+                        if speech_detected {
+                            in_speech_segment = true;
+                            silence_run = 0;
+                            if last_ww_max_conf > segment_peak_conf {
+                                segment_peak_conf = last_ww_max_conf;
+                            }
+                            if wakeword_event.is_some() {
+                                segment_fired = true;
+                            }
+                        } else if in_speech_segment {
+                            silence_run += 1;
+                            if silence_run >= SEGMENT_SILENCE_CHUNKS {
+                                if !segment_fired {
+                                    log::info!(
+                                        "🔎 [WW-NEARMISS] speech segment ended without firing: peak_confidence={:.3} (threshold={:.2})",
+                                        segment_peak_conf,
+                                        config.detection_threshold
+                                    );
+                                }
+                                in_speech_segment = false;
+                                segment_peak_conf = 0.0;
+                                segment_fired = false;
+                                silence_run = 0;
+                            }
+                        }
+                    }
 
                     let pair = AudioDetectionPair {
                         audio_data: chunk_data.clone(),
@@ -412,7 +470,9 @@ impl ConsumerServer {
     }
 
     /// Process wakeword detection without consumer connection (standalone)
-    /// Returns (WakewordEvent, timestamp) if a wake word was detected
+    /// Returns `(Some((WakewordEvent, timestamp)), peak_confidence)` if a wake
+    /// word fired, else `(None, peak_confidence)`. The peak confidence across
+    /// models is always returned so callers can log sub-threshold near-misses.
     fn process_wakeword_detection_standalone(
         wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
         detection_samples: &[i16],
@@ -422,12 +482,21 @@ impl ConsumerServer {
         spotify_controller: &SpotifyController,
         mpv_controller: &MpvController,
         barge_in_tx: &Option<Sender<()>>,
-    ) -> Result<Option<(WakewordEvent, Instant)>, ConsumerServerError> {
+        led_endpoint: &str,
+    ) -> Result<(Option<(WakewordEvent, Instant)>, f32), ConsumerServerError> {
+        let mut max_conf = 0.0f32;
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
+            // Time the TFLite inference so we can tell, on-device, how much of
+            // the end-to-end latency is the model itself vs. the pause work.
+            let predict_start = Instant::now();
             match model.predict(detection_samples, None, 1.0) {
                 Ok(predictions) => {
+                    let predict_ms = predict_start.elapsed().as_secs_f64() * 1000.0;
                     // Check predictions against threshold
                     for (model_name, confidence) in predictions {
+                        if confidence > max_conf {
+                            max_conf = confidence;
+                        }
                         if confidence >= threshold {
                             // Check debouncing - don't send wake word if we sent one recently
                             let now = Instant::now();
@@ -448,10 +517,18 @@ impl ConsumerServer {
                             }
 
                             log::info!(
-                                "🎯 [Detection] WAKEWORD DETECTED: '{}' with confidence {:.6}",
+                                "🎯 [Detection] WAKEWORD DETECTED: '{}' with confidence {:.6} (tflite inference {:.1}ms)",
                                 model_name,
-                                confidence
+                                confidence,
+                                predict_ms
                             );
+
+                            // --- Immediate feedback, BEFORE any blocking work ---
+                            // Light the ring instantly via the LED controller's
+                            // HTTP API (fire-and-forget, never blocks). This is
+                            // the lowest-latency feedback path: it does not wait
+                            // for the agent's TCP + STT round-trip.
+                            crate::led_notify::notify_ww_detected(led_endpoint);
 
                             // Send barge-in signal to producer (automatic server-side barge-in)
                             // Use try_send - non-blocking, stale signals will be drained by producer
@@ -466,16 +543,46 @@ impl ConsumerServer {
                                 }
                             }
 
-                            let spotify_was_paused = spotify_controller.pause_for_wakeword();
+                            // --- Pause Spotify + mpv concurrently ---
+                            // Each pause runs on its own thread so total latency
+                            // is max(spotify, mpv) instead of the sum. Both
+                            // controllers are cheap to clone (the Spotify one
+                            // caches its D-Bus connection internally).
+                            let pause_start = Instant::now();
+                            let spotify = spotify_controller.clone();
+                            let spotify_handle = thread::spawn(move || {
+                                let t = Instant::now();
+                                let paused = spotify.pause_for_wakeword();
+                                (paused, t.elapsed())
+                            });
+                            let mpv = mpv_controller.clone();
+                            let mpv_handle = thread::spawn(move || {
+                                let t = Instant::now();
+                                let paused = mpv.pause_for_wakeword();
+                                (paused, t.elapsed())
+                            });
 
-                            let mpv_start = Instant::now();
-                            log::info!("[mpv] Starting mpv pause attempt");
-                            let mpv_was_paused = mpv_controller.pause_for_wakeword();
+                            let (spotify_was_paused, spotify_dur) =
+                                spotify_handle.join().unwrap_or((false, Duration::ZERO));
+                            let (mpv_was_paused, mpv_dur) =
+                                mpv_handle.join().unwrap_or((false, Duration::ZERO));
+
                             log::info!(
-                                "[mpv] Pause attempt finished in {:.1}ms, was_paused={}",
-                                mpv_start.elapsed().as_secs_f64() * 1000.0,
+                                "⏱️ [Detection] media pause done in {:.1}ms (spotify {:.1}ms was_paused={}, mpv {:.1}ms was_paused={})",
+                                pause_start.elapsed().as_secs_f64() * 1000.0,
+                                spotify_dur.as_secs_f64() * 1000.0,
+                                spotify_was_paused,
+                                mpv_dur.as_secs_f64() * 1000.0,
                                 mpv_was_paused
                             );
+
+                            // --- Confirmation beep ---
+                            // Only beep when nothing was actually paused: if
+                            // media was playing, the pause itself is obvious
+                            // feedback, so a beep would just be redundant noise.
+                            if !spotify_was_paused && !mpv_was_paused {
+                                crate::beep::play_confirmation();
+                            }
 
                             let wakeword_event = WakewordEvent {
                                 model: model_name,
@@ -485,7 +592,7 @@ impl ConsumerServer {
                                 mpv_was_paused,
                             };
 
-                            return Ok(Some((wakeword_event, now)));
+                            return Ok((Some((wakeword_event, now)), max_conf));
                         }
                     }
                 }
@@ -494,7 +601,7 @@ impl ConsumerServer {
                 }
             }
         }
-        Ok(None) // No wake word detected
+        Ok((None, max_conf)) // No wake word fired; return peak for near-miss logging
     }
 
     /// Handle a single consumer connection

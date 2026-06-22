@@ -1,4 +1,3 @@
-use crate::alsa_volume;
 use crate::led_ring::{LedRing, RgbColor, NUM_LEDS};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -49,6 +48,10 @@ const INIT_HUE_PERIOD_MS: f64 = 12_000.0;
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum LedEvent {
     Init,
+    /// Emitted by the audio service the instant a wake word is detected, before
+    /// any media-pause work, so the ring lights up immediately. Distinct from
+    /// `Wakeword` (sent later by the agent when it actually starts listening).
+    WwDetected,
     Wakeword,
     Processing,
     Responding,
@@ -66,6 +69,7 @@ pub enum LedEvent {
 pub enum LedState {
     Init,
     Idle,
+    WwDetected,
     Listening,
     Processing,
     Responding,
@@ -136,6 +140,7 @@ impl LedEngine {
         matches!(
             state,
             LedState::Init
+                | LedState::WwDetected
                 | LedState::Listening
                 | LedState::Processing
                 | LedState::Responding
@@ -148,6 +153,7 @@ impl LedEngine {
     fn handle_event(&mut self, event: LedEvent) {
         match event {
             LedEvent::Init => self.transition(LedState::Init),
+            LedEvent::WwDetected => self.transition(LedState::WwDetected),
             LedEvent::Wakeword => self.transition(LedState::Listening),
             LedEvent::Processing => self.transition(LedState::Processing),
             LedEvent::Responding => self.transition(LedState::Responding),
@@ -224,6 +230,7 @@ impl LedEngine {
         let frame = match self.state {
             LedState::Idle => [RgbColor::BLACK; NUM_LEDS],
             LedState::Init => render_init(elapsed_ms),
+            LedState::WwDetected => render_ww_detected(elapsed_ms),
             LedState::Listening => render_listening(elapsed_ms),
             LedState::Processing => render_processing(elapsed_ms),
             LedState::Responding => render_responding(elapsed_ms),
@@ -265,6 +272,22 @@ fn render_init(elapsed_ms: u64) -> [RgbColor; NUM_LEDS] {
         *led = RgbColor::from_hsv(hue, 1.0, v);
     }
     frame
+}
+
+/// Instant-onset blue confirmation for the moment a wake word is detected.
+/// Starts at full brightness immediately (no fade-in) so the ring snaps on the
+/// instant the audio service fires the event, then breathes with the exact same
+/// color, period, and range as `render_listening` so the later agent-driven
+/// `Wakeword` -> `Listening` transition is visually seamless.
+fn render_ww_detected(elapsed_ms: u64) -> [RgbColor; NUM_LEDS] {
+    let period_ms = 1500.0;
+    let phase = (elapsed_ms as f64 % period_ms) / period_ms;
+    // Quarter-period phase shift so the breath starts at its peak (1.0) at
+    // elapsed 0 instead of mid-rise like Listening does.
+    let breath = ((phase * std::f64::consts::TAU + std::f64::consts::FRAC_PI_2).sin()) * 0.5 + 0.5;
+    let brightness = 0.15 + 0.85 * breath;
+
+    [COLOR_LISTENING.scaled(brightness as f32); NUM_LEDS]
 }
 
 /// Pulsing blue glow: all LEDs breathe between dim and bright.
@@ -373,4 +396,3 @@ fn render_timer_alert(elapsed_ms: u64) -> [RgbColor; NUM_LEDS] {
 
     [COLOR_TIMER_ALERT.scaled(envelope as f32); NUM_LEDS]
 }
-

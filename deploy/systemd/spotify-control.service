@@ -1,0 +1,17 @@
+[Unit]
+Description=Spotify Control (REST API over spotifyd D-Bus/MPRIS)
+After=spotifyd.service
+Wants=spotifyd.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.env
+WorkingDirectory=%h
+ExecStart=%h/spotify-control --bind 0.0.0.0:3001
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target
