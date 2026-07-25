@@ -27,7 +27,8 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(cd *)",
-      "WebFetch(domain:www.xmos.com)"
+      "WebFetch(domain:www.xmos.com)",
+      "Bash(grep -E '__pycache__|\\\\.pyc$|screen\\\\.txt')"
     ]
   }
 }
