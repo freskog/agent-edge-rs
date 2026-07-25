@@ -1,0 +1,3 @@
+[submodule "tflitec-rs-fork"]
+	path = tflitec-rs-fork
+	url = https://github.com/freskog/tflitec-rs-fork.git
