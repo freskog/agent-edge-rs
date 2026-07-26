@@ -1,6 +1,8 @@
 use audio::audio_sink::AudioSinkConfig;
 use audio::audio_source::AudioCaptureConfig;
-use audio::consumer_server::{ConsumerServer, ConsumerServerConfig};
+use audio::consumer_server::{
+    CommandAction, CommandModel, ConsumerServer, ConsumerServerConfig,
+};
 use audio::producer_server::{ProducerServer, ProducerServerConfig};
 // Import wakeword configuration
 use audio::wakeword_vad::VadConfig;
@@ -92,6 +94,13 @@ struct Args {
     /// no-op and detection is unaffected.
     #[arg(long, default_value = "127.0.0.1:3001")]
     spotify_endpoint: String,
+
+    /// Path to an ONNX "hey mycroft stop" command-wakeword classifier
+    /// (livekit-wakeword / openWakeWord compatible). When set, a local Stop
+    /// (barge-in) fires and a `hey_mycroft_stop` event is emitted alongside the
+    /// normal wake word. Omit to disable (default behavior).
+    #[arg(long)]
+    stop_model: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,6 +117,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🎯 Consumer server: {}", args.consumer_bind);
     info!("🔊 Producer server: {}", args.producer_bind);
 
+    // Opt-in command wakewords (empty unless --stop-model is given).
+    let command_models = match args.stop_model.clone() {
+        Some(path) => vec![CommandModel {
+            name: "hey_mycroft_stop".to_string(),
+            model_path: path,
+            action: CommandAction::Stop,
+        }],
+        None => vec![],
+    };
+
     let consumer_config = ConsumerServerConfig {
         bind_address: args.consumer_bind,
         audio_capture_config: AudioCaptureConfig {
@@ -116,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gain: 10f32.powf(args.capture_gain / 20.0),
         },
         wakeword_models: vec!["hey_mycroft".to_string()],
+        command_models,
         detection_threshold: 0.5,
         vad_config: VadConfig::default(),
         led_endpoint: args.led_endpoint.clone(),

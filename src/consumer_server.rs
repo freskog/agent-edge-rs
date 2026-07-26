@@ -46,12 +46,33 @@ pub struct WakewordEvent {
     pub mpv_was_paused: bool,
 }
 
+/// Local action taken on the device when a command wakeword fires (in addition
+/// to emitting the `WakewordDetected` event downstream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAction {
+    /// Barge-in / stop current playback. (More actions — next/prev/volume — can
+    /// be added later.)
+    Stop,
+}
+
+/// A command wakeword: an ONNX classifier (e.g. "hey mycroft stop") that fires a
+/// local `action` and emits its own `WakewordDetected` event. These are opt-in;
+/// with an empty `command_models` list the detector behaves exactly as before.
+#[derive(Debug, Clone)]
+pub struct CommandModel {
+    pub name: String,
+    pub model_path: String,
+    pub action: CommandAction,
+}
+
 /// Configuration for the consumer server
 #[derive(Clone)]
 pub struct ConsumerServerConfig {
     pub bind_address: String,
     pub audio_capture_config: AudioCaptureConfig,
     pub wakeword_models: Vec<String>,
+    /// ONNX command wakewords (opt-in; empty = classic behavior).
+    pub command_models: Vec<CommandModel>,
     pub detection_threshold: f32,
     pub vad_config: VadConfig,
     /// `host:port` of the LED controller's HTTP API. The detection thread POSTs
@@ -69,6 +90,7 @@ impl Default for ConsumerServerConfig {
             bind_address: "127.0.0.1:8080".to_string(),
             audio_capture_config: AudioCaptureConfig::default(),
             wakeword_models: vec!["hey_mycroft".to_string()],
+            command_models: vec![],
             detection_threshold: 0.5,
             vad_config: VadConfig::default(),
             led_endpoint: "127.0.0.1:3000".to_string(),
@@ -254,12 +276,23 @@ impl ConsumerServer {
             let mut model_guard = wakeword_model.lock().unwrap();
             if model_guard.is_none() {
                 log::info!("🎯 Initializing wakeword model for detection");
-                match WakewordModel::new(config.wakeword_models.clone(), vec![]) {
+                let command_specs: Vec<(String, String)> = config
+                    .command_models
+                    .iter()
+                    .map(|c| (c.name.clone(), c.model_path.clone()))
+                    .collect();
+                match WakewordModel::new_with_command_models(
+                    config.wakeword_models.clone(),
+                    vec![],
+                    "models",
+                    command_specs,
+                ) {
                     Ok(model) => {
                         *model_guard = Some(model);
                         log::info!(
-                            "✅ Wakeword model loaded with {} models",
-                            config.wakeword_models.len()
+                            "✅ Wakeword model loaded with {} wake + {} command models",
+                            config.wakeword_models.len(),
+                            config.command_models.len()
                         );
                     }
                     Err(e) => {
@@ -315,12 +348,18 @@ impl ConsumerServer {
         log::info!("🎵 Starting audio detection processing");
 
         let mut last_wakeword_time: Option<Instant> = None;
+        let mut last_command_time: Option<Instant> = None;
         let mut detection_attempts = 0u64;
         let mut audio_chunks_processed = 0u64;
         let start_time = Instant::now();
         let mut dropped_pairs = 0u64;
 
         const WAKEWORD_DEBOUNCE_MS: u64 = 3000;
+        // Command wakewords get their own, shorter debounce so a command (~400ms
+        // after the prefix wake) is NOT suppressed by the wake's debounce window.
+        const COMMAND_DEBOUNCE_MS: u64 = 800;
+        let command_names: std::collections::HashSet<String> =
+            config.command_models.iter().map(|c| c.name.clone()).collect();
 
         // Near-miss instrumentation: when WW_NEARMISS_LOG=1, track the peak wake
         // confidence across each VAD speech segment and log it when the segment
@@ -377,7 +416,10 @@ impl ConsumerServer {
                                 &samples,
                                 config.detection_threshold,
                                 &last_wakeword_time,
+                                &last_command_time,
                                 WAKEWORD_DEBOUNCE_MS,
+                                COMMAND_DEBOUNCE_MS,
+                                &command_names,
                                 &spotify_controller,
                                 &mpv_controller,
                                 &barge_in_tx,
@@ -385,9 +427,13 @@ impl ConsumerServer {
                             )?;
                         last_ww_max_conf = ww_max_conf;
                         match event_opt {
-                            Some(detection) => {
-                                last_wakeword_time = Some(detection.1);
-                                Some(detection.0)
+                            Some((event, at, is_command)) => {
+                                if is_command {
+                                    last_command_time = Some(at);
+                                } else {
+                                    last_wakeword_time = Some(at);
+                                }
+                                Some(event)
                             }
                             None => None,
                         }
@@ -473,17 +519,21 @@ impl ConsumerServer {
     /// Returns `(Some((WakewordEvent, timestamp)), peak_confidence)` if a wake
     /// word fired, else `(None, peak_confidence)`. The peak confidence across
     /// models is always returned so callers can log sub-threshold near-misses.
+    #[allow(clippy::too_many_arguments)]
     fn process_wakeword_detection_standalone(
         wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
         detection_samples: &[i16],
         threshold: f32,
         last_wakeword_time: &Option<Instant>,
+        last_command_time: &Option<Instant>,
         debounce_ms: u64,
+        command_debounce_ms: u64,
+        command_names: &std::collections::HashSet<String>,
         spotify_controller: &SpotifyController,
         mpv_controller: &MpvController,
         barge_in_tx: &Option<Sender<()>>,
         led_endpoint: &str,
-    ) -> Result<(Option<(WakewordEvent, Instant)>, f32), ConsumerServerError> {
+    ) -> Result<(Option<(WakewordEvent, Instant, bool)>, f32), ConsumerServerError> {
         let mut max_conf = 0.0f32;
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
             // Time the TFLite inference so we can tell, on-device, how much of
@@ -492,32 +542,43 @@ impl ConsumerServer {
             match model.predict(detection_samples, None, 1.0) {
                 Ok(predictions) => {
                     let predict_ms = predict_start.elapsed().as_secs_f64() * 1000.0;
-                    // Check predictions against threshold
+                    // Check predictions against threshold. Command classifiers use
+                    // a separate (shorter) debounce so a command isn't suppressed
+                    // by the prefix wake's debounce window; both events can fire.
                     for (model_name, confidence) in predictions {
-                        if confidence > max_conf {
+                        let is_command = command_names.contains(&model_name);
+                        // near-miss peak tracks the WAKE score only
+                        if !is_command && confidence > max_conf {
                             max_conf = confidence;
                         }
                         if confidence >= threshold {
-                            // Check debouncing - don't send wake word if we sent one recently
                             let now = Instant::now();
-                            let should_debounce = if let Some(last_time) = last_wakeword_time {
-                                now.duration_since(*last_time).as_millis() < debounce_ms as u128
+                            let (last_time_ref, this_debounce_ms) = if is_command {
+                                (last_command_time, command_debounce_ms)
+                            } else {
+                                (last_wakeword_time, debounce_ms)
+                            };
+                            let should_debounce = if let Some(last_time) = last_time_ref {
+                                now.duration_since(*last_time).as_millis()
+                                    < this_debounce_ms as u128
                             } else {
                                 false
                             };
 
                             if should_debounce {
                                 log::debug!(
-                                    "🔇 [Detection] Wake word '{}' debounced (confidence {:.6}) - last detection was {:.1}ms ago",
+                                    "🔇 [Detection] {} '{}' debounced (confidence {:.6}) - last was {:.1}ms ago",
+                                    if is_command { "Command" } else { "Wake word" },
                                     model_name,
                                     confidence,
-                                    last_wakeword_time.unwrap().elapsed().as_millis()
+                                    last_time_ref.unwrap().elapsed().as_millis()
                                 );
                                 continue;
                             }
 
                             log::info!(
-                                "🎯 [Detection] WAKEWORD DETECTED: '{}' with confidence {:.6} (tflite inference {:.1}ms)",
+                                "🎯 [Detection] {} DETECTED: '{}' with confidence {:.6} (tflite inference {:.1}ms)",
+                                if is_command { "COMMAND" } else { "WAKEWORD" },
                                 model_name,
                                 confidence,
                                 predict_ms
@@ -592,7 +653,7 @@ impl ConsumerServer {
                                 mpv_was_paused,
                             };
 
-                            return Ok((Some((wakeword_event, now)), max_conf));
+                            return Ok((Some((wakeword_event, now, is_command)), max_conf));
                         }
                     }
                 }
