@@ -7,9 +7,14 @@ use std::collections::{HashMap, VecDeque};
 use tflitec::interpreter::Interpreter;
 use tflitec::model::Model as TfliteModel;
 
+use crate::command_model::CommandClassifier;
 use crate::wakeword_error::{OpenWakeWordError, Result};
 use crate::wakeword_models::{get_model_class_mappings, FEATURE_MODELS, MODELS};
 use crate::wakeword_utils::AudioFeatures;
+
+/// Embedding timesteps consumed by command classifiers (openWakeWord/livekit
+/// use a 16-frame `[batch, 16, 96]` input — same window as the tflite models).
+const COMMAND_MODEL_FRAMES: usize = 16;
 
 /// Type alias for prediction results
 pub type PredictionResult = HashMap<String, f32>;
@@ -28,6 +33,10 @@ pub struct Model {
 
     // Prediction buffers (deque with maxlen=30 like Python)
     prediction_buffer: HashMap<String, VecDeque<f32>>,
+
+    // ONNX command-wakeword classifiers (e.g. "hey_mycroft_stop"). Empty in the
+    // default configuration, in which case behavior is identical to before.
+    command_models: Vec<CommandClassifier>,
 }
 
 impl Model {
@@ -59,6 +68,18 @@ impl Model {
         wakeword_models: Vec<String>,
         class_mapping_dicts: Vec<HashMap<String, String>>,
         model_dir: &str,
+    ) -> Result<Self> {
+        Self::new_with_command_models(wakeword_models, class_mapping_dicts, model_dir, vec![])
+    }
+
+    /// Like `new_with_model_path`, but also loads ONNX command-wakeword
+    /// classifiers. `command_models` is a list of `(name, onnx_path)`. Passing an
+    /// empty vec is equivalent to `new_with_model_path` (default behavior).
+    pub fn new_with_command_models(
+        wakeword_models: Vec<String>,
+        class_mapping_dicts: Vec<HashMap<String, String>>,
+        model_dir: &str,
+        command_models: Vec<(String, String)>,
     ) -> Result<Self> {
         let model_paths = MODELS;
         let mut model_names = Vec::new();
@@ -286,11 +307,22 @@ impl Model {
             16000,
         )?;
 
-        // Initialize prediction buffers (deque with maxlen=30)
+        // Load ONNX command classifiers (empty by default → no behavior change).
+        let mut loaded_command_models = Vec::new();
+        for (name, path) in &command_models {
+            log::info!("🎯 Loading command model: {} from {}", name, path);
+            let clf = CommandClassifier::load(name, path, COMMAND_MODEL_FRAMES)?;
+            loaded_command_models.push(clf);
+        }
+
+        // Initialize prediction buffers (deque with maxlen=30) for wakeword AND
+        // command models so warmup/buffering apply uniformly.
         let mut prediction_buffer = HashMap::new();
         for model_name in model_names.iter() {
-            let deque = VecDeque::with_capacity(30);
-            prediction_buffer.insert(model_name.clone(), deque);
+            prediction_buffer.insert(model_name.clone(), VecDeque::with_capacity(30));
+        }
+        for clf in loaded_command_models.iter() {
+            prediction_buffer.insert(clf.name().to_string(), VecDeque::with_capacity(30));
         }
 
         Ok(Model {
@@ -299,6 +331,7 @@ impl Model {
             class_mapping,
             preprocessor,
             prediction_buffer,
+            command_models: loaded_command_models,
         })
     }
 
@@ -404,6 +437,57 @@ impl Model {
             };
 
             predictions.insert(mdl.clone(), prediction);
+        }
+
+        // Score ONNX command classifiers on the SAME embedding window(s) the
+        // tflite models use. No-op when no command models are configured.
+        if !self.command_models.is_empty() {
+            let nf = COMMAND_MODEL_FRAMES;
+            // Previous scores, used when not enough samples are ready this call.
+            let fallbacks: Vec<f32> = self
+                .command_models
+                .iter()
+                .map(|c| {
+                    *self
+                        .prediction_buffer
+                        .get(c.name())
+                        .and_then(|b| b.back())
+                        .unwrap_or(&0.0)
+                })
+                .collect();
+            // Candidate feature windows (mirrors the tflite multi-chunk logic).
+            let windows: Vec<Vec<f32>> = if n_prepared_samples > 1280 {
+                let n_chunks = n_prepared_samples / 1280;
+                (0..n_chunks)
+                    .rev()
+                    .map(|i| {
+                        let start_ndx = -(nf as i32) - i as i32;
+                        self.preprocessor.get_features(nf, start_ndx)
+                    })
+                    .filter(|f| f.len() >= nf * 96)
+                    .collect()
+            } else if n_prepared_samples == 1280 {
+                let f = self.preprocessor.get_features(nf, -1);
+                if f.len() >= nf * 96 {
+                    vec![f]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            };
+            for (idx, clf) in self.command_models.iter_mut().enumerate() {
+                let pred = if windows.is_empty() {
+                    fallbacks[idx]
+                } else {
+                    let mut m = 0.0f32;
+                    for w in &windows {
+                        m = m.max(clf.score(w)?);
+                    }
+                    m
+                };
+                predictions.insert(clf.name().to_string(), pred);
+            }
         }
 
         // Zero predictions for first 5 frames during model warmup (matches Python)

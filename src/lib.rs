@@ -9,6 +9,7 @@ pub mod spotify_controller;
 pub mod types;
 
 // Wakeword detection modules
+pub mod command_model;
 pub mod wakeword_error;
 pub mod wakeword_model;
 pub mod wakeword_models;
