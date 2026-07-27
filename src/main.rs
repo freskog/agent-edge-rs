@@ -101,6 +101,13 @@ struct Args {
     /// normal wake word. Omit to disable (default behavior).
     #[arg(long)]
     stop_model: Option<String>,
+
+    /// Confidence bar for command wakewords (e.g. `--stop-model`). A command
+    /// fires a cancel, so it gates higher than the wake to suppress
+    /// `hey mycroft <other command>` false-cancels. Only affects command
+    /// classifiers; the wake still uses the built-in 0.5 threshold.
+    #[arg(long, default_value_t = 0.9)]
+    command_threshold: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -137,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wakeword_models: vec!["hey_mycroft".to_string()],
         command_models,
         detection_threshold: 0.5,
+        command_threshold: args.command_threshold,
         vad_config: VadConfig::default(),
         led_endpoint: args.led_endpoint.clone(),
         spotify_endpoint: args.spotify_endpoint.clone(),

@@ -74,6 +74,11 @@ pub struct ConsumerServerConfig {
     /// ONNX command wakewords (opt-in; empty = classic behavior).
     pub command_models: Vec<CommandModel>,
     pub detection_threshold: f32,
+    /// Separate (higher) confidence bar for command wakewords. A command fires a
+    /// cancel, which is more disruptive than a missed wake, so it should trip
+    /// only on strong matches. Defaults higher than `detection_threshold` to
+    /// suppress `hey mycroft <other command>` false-cancels.
+    pub command_threshold: f32,
     pub vad_config: VadConfig,
     /// `host:port` of the LED controller's HTTP API. The detection thread POSTs
     /// a `ww_detected` event here the instant a wake word fires, before any
@@ -92,6 +97,7 @@ impl Default for ConsumerServerConfig {
             wakeword_models: vec!["hey_mycroft".to_string()],
             command_models: vec![],
             detection_threshold: 0.5,
+            command_threshold: 0.9,
             vad_config: VadConfig::default(),
             led_endpoint: "127.0.0.1:3000".to_string(),
             spotify_endpoint: "127.0.0.1:3001".to_string(),
@@ -415,6 +421,7 @@ impl ConsumerServer {
                                 &wakeword_model,
                                 &samples,
                                 config.detection_threshold,
+                                config.command_threshold,
                                 &last_wakeword_time,
                                 &last_command_time,
                                 WAKEWORD_DEBOUNCE_MS,
@@ -524,6 +531,7 @@ impl ConsumerServer {
         wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
         detection_samples: &[i16],
         threshold: f32,
+        command_threshold: f32,
         last_wakeword_time: &Option<Instant>,
         last_command_time: &Option<Instant>,
         debounce_ms: u64,
@@ -551,7 +559,14 @@ impl ConsumerServer {
                         if !is_command && confidence > max_conf {
                             max_conf = confidence;
                         }
-                        if confidence >= threshold {
+                        // Commands gate on their own (higher) bar; wakes on the
+                        // classic detection threshold.
+                        let this_threshold = if is_command {
+                            command_threshold
+                        } else {
+                            threshold
+                        };
+                        if confidence >= this_threshold {
                             let now = Instant::now();
                             let (last_time_ref, this_debounce_ms) = if is_command {
                                 (last_command_time, command_debounce_ms)
