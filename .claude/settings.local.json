@@ -28,7 +28,14 @@
       "Bash(git commit -m ' *)",
       "Bash(cd *)",
       "WebFetch(domain:www.xmos.com)",
-      "Bash(grep -E '__pycache__|\\\\.pyc$|screen\\\\.txt')"
+      "Bash(grep -E '__pycache__|\\\\.pyc$|screen\\\\.txt')",
+      "Bash(git submodule *)",
+      "Bash(git check-ignore *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(set -e)",
+      "Bash(git config *)",
+      "Bash(git commit -m 'Register tflitec-rs-fork as a submodule \\(add .gitmodules\\) *)",
+      "Bash(git push *)"
     ]
   }
 }
