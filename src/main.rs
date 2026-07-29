@@ -97,8 +97,9 @@ struct Args {
 
     /// Path to an ONNX "hey mycroft stop" command-wakeword classifier
     /// (livekit-wakeword / openWakeWord compatible). When set, a local Stop
-    /// (barge-in) fires and a `hey_mycroft_stop` event is emitted alongside the
-    /// normal wake word. Omit to disable (default behavior).
+    /// (barge-in) fires and a `stop` wakeword event is emitted downstream
+    /// (same event shape as the wake, just named `stop`) so the agent can act
+    /// on it. Omit to disable (default behavior).
     #[arg(long)]
     stop_model: Option<String>,
 
@@ -124,10 +125,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🎯 Consumer server: {}", args.consumer_bind);
     info!("🔊 Producer server: {}", args.producer_bind);
 
-    // Opt-in command wakewords (empty unless --stop-model is given).
+    // Opt-in command wakewords (empty unless --stop-model is given). The name
+    // is the downstream event name emitted to the agent, so keep it simple:
+    // the command fires a `stop` WakewordDetected event (like the wake, but
+    // named `stop`).
     let command_models = match args.stop_model.clone() {
         Some(path) => vec![CommandModel {
-            name: "hey_mycroft_stop".to_string(),
+            name: "stop".to_string(),
             model_path: path,
             action: CommandAction::Stop,
         }],

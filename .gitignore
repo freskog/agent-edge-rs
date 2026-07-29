@@ -51,6 +51,7 @@ logs/
 
 # Python
 .venv/
+__pycache__/
 
 # Build directories for cross-compilation
 cross-target/

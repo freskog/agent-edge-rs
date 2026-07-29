@@ -4,7 +4,9 @@ set -euo pipefail
 PI_HOST="${PI_HOST:-freskog@mycroft.local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RELEASE_DIR="$PROJECT_ROOT/target/release"
+# Honor CARGO_TARGET_DIR when set (e.g. sandboxed builds redirect the target
+# dir outside the project), otherwise fall back to the in-tree target/.
+RELEASE_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/release"
 
 # Map deploy names to cargo package names, output binary names, and unit names
 declare -A PKG_MAP=(

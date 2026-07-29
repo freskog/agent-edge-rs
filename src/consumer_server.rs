@@ -379,6 +379,17 @@ impl ConsumerServer {
         let mut in_speech_segment = false;
         let mut segment_fired = false;
         let mut silence_run = 0u32;
+        // Command near-miss trackers, mirroring the wake ones above: the peak
+        // command-classifier score per speech segment and whether a command
+        // fired. A "hey mycroft stop" that fails the command bar still trips the
+        // wake prefix, so command misses are tracked independently of wake fires.
+        let mut last_cmd_max_conf = 0.0f32;
+        let mut segment_cmd_peak = 0.0f32;
+        let mut segment_cmd_fired = false;
+        let mut last_fire_is_command = false;
+        // Floor below which a command peak is treated as ambient (not a missed
+        // stop) and not logged, so every plain wake utterance doesn't emit noise.
+        const CMD_NEARMISS_FLOOR: f32 = 0.05;
         // End a speech segment after this many consecutive non-speech chunks, so
         // brief VAD flicker mid-utterance doesn't split one phrase into several.
         const SEGMENT_SILENCE_CHUNKS: u32 = 25;
@@ -416,7 +427,7 @@ impl ConsumerServer {
                             );
                         }
 
-                        let (event_opt, ww_max_conf) =
+                        let (event_opt, ww_max_conf, cmd_max_conf) =
                             Self::process_wakeword_detection_standalone(
                                 &wakeword_model,
                                 &samples,
@@ -433,8 +444,11 @@ impl ConsumerServer {
                                 &config.led_endpoint,
                             )?;
                         last_ww_max_conf = ww_max_conf;
+                        last_cmd_max_conf = cmd_max_conf;
+                        last_fire_is_command = false;
                         match event_opt {
                             Some((event, at, is_command)) => {
+                                last_fire_is_command = is_command;
                                 if is_command {
                                     last_command_time = Some(at);
                                 } else {
@@ -468,8 +482,15 @@ impl ConsumerServer {
                             if last_ww_max_conf > segment_peak_conf {
                                 segment_peak_conf = last_ww_max_conf;
                             }
+                            if last_cmd_max_conf > segment_cmd_peak {
+                                segment_cmd_peak = last_cmd_max_conf;
+                            }
                             if wakeword_event.is_some() {
-                                segment_fired = true;
+                                if last_fire_is_command {
+                                    segment_cmd_fired = true;
+                                } else {
+                                    segment_fired = true;
+                                }
                             }
                         } else if in_speech_segment {
                             silence_run += 1;
@@ -481,9 +502,22 @@ impl ConsumerServer {
                                         config.detection_threshold
                                     );
                                 }
+                                // Command near-miss: a "hey mycroft stop" that
+                                // cleared the wake prefix but missed the (higher)
+                                // command bar. Only log when the peak is above the
+                                // ambient floor so plain wakes stay quiet.
+                                if !segment_cmd_fired && segment_cmd_peak > CMD_NEARMISS_FLOOR {
+                                    log::info!(
+                                        "🔎 [CMD-NEARMISS] command speech segment ended without firing: peak_confidence={:.3} (command_threshold={:.2})",
+                                        segment_cmd_peak,
+                                        config.command_threshold
+                                    );
+                                }
                                 in_speech_segment = false;
                                 segment_peak_conf = 0.0;
                                 segment_fired = false;
+                                segment_cmd_peak = 0.0;
+                                segment_cmd_fired = false;
                                 silence_run = 0;
                             }
                         }
@@ -523,9 +557,10 @@ impl ConsumerServer {
     }
 
     /// Process wakeword detection without consumer connection (standalone)
-    /// Returns `(Some((WakewordEvent, timestamp)), peak_confidence)` if a wake
-    /// word fired, else `(None, peak_confidence)`. The peak confidence across
-    /// models is always returned so callers can log sub-threshold near-misses.
+    /// Returns `(Some((WakewordEvent, timestamp, is_command)), wake_peak, command_peak)`
+    /// if a wake or command fired, else `(None, wake_peak, command_peak)`. Both
+    /// peak confidences across models are always returned so callers can log
+    /// sub-threshold near-misses (wake and command are tracked separately).
     #[allow(clippy::too_many_arguments)]
     fn process_wakeword_detection_standalone(
         wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
@@ -541,8 +576,9 @@ impl ConsumerServer {
         mpv_controller: &MpvController,
         barge_in_tx: &Option<Sender<()>>,
         led_endpoint: &str,
-    ) -> Result<(Option<(WakewordEvent, Instant, bool)>, f32), ConsumerServerError> {
+    ) -> Result<(Option<(WakewordEvent, Instant, bool)>, f32, f32), ConsumerServerError> {
         let mut max_conf = 0.0f32;
+        let mut max_cmd_conf = 0.0f32;
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
             // Time the TFLite inference so we can tell, on-device, how much of
             // the end-to-end latency is the model itself vs. the pause work.
@@ -555,8 +591,13 @@ impl ConsumerServer {
                     // by the prefix wake's debounce window; both events can fire.
                     for (model_name, confidence) in predictions {
                         let is_command = command_names.contains(&model_name);
-                        // near-miss peak tracks the WAKE score only
-                        if !is_command && confidence > max_conf {
+                        // Near-miss peaks are tracked per class: wake score into
+                        // max_conf, command score into max_cmd_conf.
+                        if is_command {
+                            if confidence > max_cmd_conf {
+                                max_cmd_conf = confidence;
+                            }
+                        } else if confidence > max_conf {
                             max_conf = confidence;
                         }
                         // Commands gate on their own (higher) bar; wakes on the
@@ -668,7 +709,11 @@ impl ConsumerServer {
                                 mpv_was_paused,
                             };
 
-                            return Ok((Some((wakeword_event, now, is_command)), max_conf));
+                            return Ok((
+                                Some((wakeword_event, now, is_command)),
+                                max_conf,
+                                max_cmd_conf,
+                            ));
                         }
                     }
                 }
@@ -677,7 +722,8 @@ impl ConsumerServer {
                 }
             }
         }
-        Ok((None, max_conf)) // No wake word fired; return peak for near-miss logging
+        // No wake/command fired; return both peaks for near-miss logging.
+        Ok((None, max_conf, max_cmd_conf))
     }
 
     /// Handle a single consumer connection

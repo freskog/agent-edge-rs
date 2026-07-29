@@ -7,7 +7,7 @@ Type=simple
 EnvironmentFile=%h/.env
 Environment=LD_LIBRARY_PATH=%h/libs/linux-aarch64
 WorkingDirectory=%h
-ExecStart=%h/audio --consumer-bind 0.0.0.0:50051 --producer-bind 0.0.0.0:50052 --mixer-name "XVF3800 SoftMaster" --tts-volume-boost 15 --input-channel 0
+ExecStart=%h/audio --consumer-bind 0.0.0.0:50051 --producer-bind 0.0.0.0:50052 --mixer-name "XVF3800 SoftMaster" --tts-volume-boost 15 --input-channel 0 --stop-model %h/hey_mycroft_stop_v2.onnx --command-threshold 0.9
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=300
