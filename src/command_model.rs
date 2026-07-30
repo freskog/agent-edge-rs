@@ -24,8 +24,17 @@ impl CommandClassifier {
     /// timesteps the model expects (openWakeWord/livekit use 16 → input
     /// `[batch, 16, 96]`).
     pub fn load(name: &str, path: &str, n_frames: usize) -> Result<Self> {
+        // Constrain ONNX Runtime to a single, non-spinning thread. These heads
+        // are tiny ([1, n_frames, 96]) and run on the detection thread ~12.5x/sec;
+        // ORT otherwise defaults its intra-op pool to every core and busy-waits
+        // between calls, which pegged ~3 cores on the Pi Zero 2W. Running inline
+        // on the caller with no spin keeps the cost to just the head inference.
         let session = Session::builder()
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
+            .and_then(|b| b.with_intra_threads(1))
+            .and_then(|b| b.with_inter_threads(1))
+            .and_then(|b| b.with_intra_op_spinning(false))
+            .and_then(|b| b.with_inter_op_spinning(false))
             .and_then(|b| b.commit_from_file(path))
             .map_err(|e| {
                 OpenWakeWordError::ModelLoadError(format!(
