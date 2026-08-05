@@ -10,16 +10,9 @@ WW_NEARMISS_LOG path, and `WW_NEARMISS_LOG=1` in the Pi's ~/.env.
 Run this on your Mac, then say "Hey Mycroft" N times in the condition you want to
 measure (silence / over music / from across the room). Pause ~1s between attempts.
 
-It also tallies command-wakeword ("hey mycroft stop") FIRES and CMD-NEARMISSES
-separately, so the same session can measure command recall (say "hey mycroft
-stop" x N) or false-cancels (say "hey mycroft <other command>" x N). Command
-near-misses require the instrumented binary + WW_NEARMISS_LOG=1.
-
 Usage:
   ./ww-livetest.py --label silence
   ./ww-livetest.py --label over-music --floor 0.05
-  ./ww-livetest.py --label stop-recall      # say "hey mycroft stop" x N
-  ./ww-livetest.py --label other-cmd        # say "hey mycroft play music" x N
   PI_HOST=freskog@mycroft.local ./ww-livetest.py --label distance-3m
 
 Ctrl-C ends the session and prints the distribution. The raw matched lines are
@@ -38,11 +31,6 @@ from datetime import datetime
 
 FIRE_RE = re.compile(r"WAKEWORD DETECTED:.*confidence ([0-9.]+)")
 NEARMISS_RE = re.compile(r"WW-NEARMISS.*peak_confidence=([0-9.]+).*threshold=([0-9.]+)")
-# Command-wakeword (e.g. "hey mycroft stop") fires and near-misses. A command
-# fire during a "hey mycroft <other command>" utterance is a FALSE-CANCEL; a
-# CMD-NEARMISS on a "hey mycroft stop" utterance is a missed stop.
-CMD_FIRE_RE = re.compile(r"COMMAND DETECTED: '([^']+)' with confidence ([0-9.]+)")
-CMD_NEARMISS_RE = re.compile(r"CMD-NEARMISS.*peak_confidence=([0-9.]+).*command_threshold=([0-9.]+)")
 
 
 def main() -> int:
@@ -57,10 +45,7 @@ def main() -> int:
     logf = open(logpath, "a")
     fires: list[float] = []
     misses: list[float] = []
-    cmd_fires: list[float] = []
-    cmd_misses: list[float] = []
     threshold = None
-    cmd_threshold = None
 
     print(f"=== Live wake test [{args.label}] — say 'Hey Mycroft', pause ~1s between tries ===")
     print(f"    streaming {args.pi_host} audio.service journal (Ctrl-C to finish)\n")
@@ -86,19 +71,6 @@ def main() -> int:
             print(f"  fire confidence:  min={min(fires):.3f} median={st.median(fires):.3f}")
         if misses:
             print(f"  miss peak:        {sorted(round(m,3) for m in misses)}")
-        # Command-wakeword tally. Interpretation depends on what was spoken this
-        # session: fires on "stop" utterances = recall; fires on other commands =
-        # false-cancels; near-misses on "stop" utterances = missed stops.
-        cmd_attempts = len(cmd_fires) + len(cmd_misses)
-        print(f"\n  --- command-wakeword ---")
-        print(f"  COMMAND FIRED (>= {cmd_threshold or 0.9}): {len(cmd_fires)}")
-        print(f"  COMMAND NEAR-MISS (< command_threshold, peak>{args.floor}): {len(cmd_misses)}")
-        if cmd_attempts:
-            print(f"  command fire rate: {len(cmd_fires)/cmd_attempts:.0%}")
-        if cmd_fires:
-            print(f"  command fire confidence: min={min(cmd_fires):.3f} median={st.median(cmd_fires):.3f}")
-        if cmd_misses:
-            print(f"  command miss peak:       {sorted(round(m,3) for m in cmd_misses)}")
         print(f"\nraw matched lines appended to {logpath}")
         sys.exit(0)
 
@@ -121,21 +93,6 @@ def main() -> int:
             logf.write(line); logf.flush()
             print(f"  ❌ MISS     peak={peak:.3f} (threshold={threshold:.2f})   (total misses={len(misses)})")
             continue
-        cf = CMD_FIRE_RE.search(line)
-        if cf:
-            name = cf.group(1); c = float(cf.group(2))
-            cmd_fires.append(c)
-            logf.write(line); logf.flush()
-            print(f"  🟦 CMD FIRE '{name}' confidence={c:.3f}   (total cmd fires={len(cmd_fires)})")
-            continue
-        cm = CMD_NEARMISS_RE.search(line)
-        if cm:
-            peak = float(cm.group(1)); cmd_threshold = float(cm.group(2))
-            if peak < args.floor:
-                continue
-            cmd_misses.append(peak)
-            logf.write(line); logf.flush()
-            print(f"  🟥 CMD MISS peak={peak:.3f} (command_threshold={cmd_threshold:.2f})   (total cmd misses={len(cmd_misses)})")
     return 0
 
 

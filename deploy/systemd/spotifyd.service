@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-CPUAffinity=1
+# Keep spotifyd on cores 2-3, off the audio pipeline (cores 0-1).
+CPUAffinity=2 3
 EnvironmentFile=%h/.env
 WorkingDirectory=%h
 ExecStart=%h/spotifyd --no-daemon -b alsa --volume-controller alsa-linear --control "XVF3800 SoftMaster" -d mycroft --initial-volume 50 --device-type speaker --use-mpris

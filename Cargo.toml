@@ -25,9 +25,5 @@ alsa-volume = { path = "alsa-volume" }
 # Wakeword detection dependencies
 voice_activity_detector = "0.2.0"        # VAD processing (also pulls in ort/ONNX Runtime)
 tflitec = { path = "./tflitec-rs-fork" } # TensorFlow Lite models
-# ONNX Runtime for command-wakeword classifiers (livekit-wakeword models).
-# Pinned to the same version voice_activity_detector uses so cargo unifies to a
-# single ONNX Runtime.
-ort = "=2.0.0-rc.10"
 
 [build-dependencies]

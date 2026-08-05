@@ -4,10 +4,23 @@ After=spotifyd.service mpv.service spotify-control.service
 
 [Service]
 Type=simple
+# Core map: 0 = RT ALSA playback, 1 = mic capture + wake detection + TTS feed.
+# Keep the audio pipeline off cores 2-3 (spotifyd/agent-edge/mpv/led/control).
+CPUAffinity=0 1
+# Keep the audio server responsive under CPU load; cpal still promotes the ALSA
+# callback thread to RT. LimitRTPRIO allows the RT playback thread; CPUWeight
+# gives the audio cgroup the lion's share when cores contend.
+LimitRTPRIO=50
+LimitNICE=10
+LimitRTTIME=infinity
+CPUWeight=10000
 EnvironmentFile=%h/.env
 Environment=LD_LIBRARY_PATH=%h/libs/linux-aarch64
 WorkingDirectory=%h
-ExecStart=%h/audio --consumer-bind 0.0.0.0:50051 --producer-bind 0.0.0.0:50052 --mixer-name "XVF3800 SoftMaster" --tts-volume-boost 15 --input-channel 0 --stop-model %h/hey_mycroft_stop_v2.onnx --command-threshold 0.9
+ExecStart=%h/audio --consumer-bind 0.0.0.0:50051 --producer-bind 0.0.0.0:50052 --mixer-name "XVF3800 SoftMaster" --tts-volume-boost 15 --input-channel 0
+# Nudge the audio threads up in priority a couple seconds after start (renice
+# via passwordless sudo). Installed to ~/bin by `deploy.sh services`.
+ExecStartPost=%h/bin/audio-service-priority
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=300

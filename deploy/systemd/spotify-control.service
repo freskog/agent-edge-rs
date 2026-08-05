@@ -5,6 +5,8 @@ Wants=spotifyd.service
 
 [Service]
 Type=simple
+# Keep spotify-control on cores 2-3, off the audio pipeline (cores 0-1).
+CPUAffinity=2 3
 EnvironmentFile=%h/.env
 WorkingDirectory=%h
 ExecStart=%h/spotify-control --bind 0.0.0.0:3001

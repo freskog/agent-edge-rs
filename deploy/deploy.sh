@@ -131,6 +131,10 @@ case "$cmd" in
         done
         ;;
     services)
+        echo "==> Installing helper scripts to ~/bin..."
+        ssh "$PI_HOST" "mkdir -p ~/bin"
+        scp "$SCRIPT_DIR"/bin/audio-service-priority "$PI_HOST:~/bin/"
+        ssh "$PI_HOST" "chmod +x ~/bin/audio-service-priority"
         echo "==> Copying service files to Pi..."
         ssh "$PI_HOST" "mkdir -p ~/.config/systemd/user"
         scp "$SCRIPT_DIR"/systemd/*.service "$PI_HOST:~/.config/systemd/user/"

@@ -4,7 +4,8 @@ After=sound.target
 
 [Service]
 Type=simple
-CPUAffinity=1
+# Keep mpv on cores 2-3, off the audio pipeline (cores 0-1).
+CPUAffinity=2 3
 EnvironmentFile=%h/.env
 WorkingDirectory=%h
 ExecStart=/usr/bin/mpv --idle=yes --no-video --no-terminal --input-ipc-server=/tmp/mpv-news.sock --volume=100 --af=loudnorm=I=-14:TP=-1:LRA=11

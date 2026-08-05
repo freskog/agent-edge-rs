@@ -1,0 +1,15 @@
+#!/bin/sh
+# Bump every thread of the running audio.service up in priority a couple of
+# seconds after start. Systemd's Nice=/LimitNICE= only set the initial value;
+# cpal spawns its ALSA threads after exec, so we renice them here once they
+# exist. Run as ExecStartPost from audio.service; installed to ~/bin by
+# `deploy.sh services`. Requires passwordless sudo for renice.
+set -eu
+sleep 2
+pid=$(systemctl --user show -p MainPID --value audio.service)
+case "$pid" in ""|0) exit 0 ;; esac
+for task in /proc/$pid/task/*; do
+  [ -e "$task" ] || continue
+  tid=${task##*/}
+  /usr/bin/sudo -n /usr/bin/renice -n -5 -p "$tid" >/dev/null 2>&1 || true
+done

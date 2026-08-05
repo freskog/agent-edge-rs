@@ -149,7 +149,6 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
- "ort",
  "ringbuf",
  "serde_json",
  "tflitec",

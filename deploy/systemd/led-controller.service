@@ -3,6 +3,8 @@ Description=LED Ring Controller (ReSpeaker I2C)
 
 [Service]
 Type=simple
+# Keep led-controller I2C polling on cores 2-3, off the audio pipeline (0-1).
+CPUAffinity=2 3
 EnvironmentFile=%h/.env
 Environment=LD_LIBRARY_PATH=%h/libs/linux-aarch64
 WorkingDirectory=%h

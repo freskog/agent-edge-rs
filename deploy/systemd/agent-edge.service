@@ -4,6 +4,10 @@ After=audio.service led-controller.service
 
 [Service]
 Type=simple
+# Keep agent-edge off the audio pipeline (cores 0-1); it is a light TTS/STT
+# bridge here (intent runs remotely), so a small nice bump protects the TTS feed.
+CPUAffinity=2 3
+Nice=-5
 EnvironmentFile=%h/.env
 WorkingDirectory=%h
 ExecStart=%h/agent-edge
