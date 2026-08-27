@@ -190,20 +190,6 @@ def wer(ref: str, hyp: str):
     return dp[len(h)] / len(r), first_word_deleted
 
 
-def spotify_post(base: str, path: str, timeout: float = 3.0) -> bool:
-    """POST to the spotify-control service (port 3001). Returns True on 2xx.
-    Best-effort: never raises, so a down service can't break the test."""
-    try:
-        req = urllib.request.Request(
-            f"{base.rstrip('/')}{path}", data=b"", method="POST",
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
-    except Exception as e:  # noqa: BLE001
-        print(f"      ⚠️  spotify {path} failed: {e}")
-        return False
-
-
 def transcribe(stt_url: str, pcm: bytes, prompt: str, timeout: float):
     qs = urllib.parse.urlencode({
         "beam_size": "1", "vad_filter": "true",
@@ -336,14 +322,6 @@ def main() -> int:
     ap.add_argument("--consumer", default=os.environ.get("CONSUMER", "127.0.0.1:8080"),
                     help="audio process consumer host:port")
     ap.add_argument("--stt-url", default=os.environ.get("STT_URL", "http://10.10.100.102:8008"))
-    ap.add_argument("--keep-music", action="store_true",
-                    help="resume spotifyd after each wake (the audio process pauses it "
-                         "on barge-in) so every trial happens over live playback")
-    ap.add_argument("--spotify-control",
-                    default=os.environ.get("SPOTIFY_CONTROL_URL", "http://mycroft.local:3001"),
-                    help="spotify-control base URL for --keep-music")
-    ap.add_argument("--music-settle-s", type=float, default=2.0,
-                    help="wait after resuming music before the next prompt")
     ap.add_argument("--prompt", default="Hey Mycroft",
                     help="Whisper initial_prompt (matches scala BasePrompt)")
     ap.add_argument("--commands-file",
@@ -382,9 +360,6 @@ def main() -> int:
     print(f"    STT: {'(disabled)' if args.no_stt else args.stt_url}")
     print(f"    {len(plan)} trials  (~{est/60:.0f} min upper bound)")
     print(f"    Read each line aloud as: “Hey Mycroft, <command>”. Ctrl-C to stop early.")
-    if args.keep_music:
-        print(f"    BARGE-IN MODE: start spotifyd playback NOW; music is resumed via "
-              f"{args.spotify_control} after each wake.")
 
     sock = socket.create_connection(addr, timeout=10)
     preroll: list[bytes] = []
@@ -398,13 +373,6 @@ def main() -> int:
             results.append(res)
             jsonl.write(json.dumps(res) + "\n")
             jsonl.flush()
-
-            # The audio process pauses spotifyd on wake; resume so the next trial
-            # is again over live playback. Only needed when a wake actually paused it.
-            if args.keep_music and res.get("spotify_was_paused"):
-                if spotify_post(args.spotify_control, "/api/spotify/resume"):
-                    print(f"      🎵 resumed music, settling {args.music_settle_s:.0f}s…")
-                    time.sleep(args.music_settle_s)
     except (KeyboardInterrupt, ConnectionError) as e:
         print(f"\n  (stopped: {type(e).__name__})")
     finally:
@@ -429,9 +397,6 @@ def main() -> int:
               f"(perfect: {sum(1 for w in wers if w==0)}/{len(wers)})")
         print(f"  first-word lost: {fwd}/{len(transcribed)} = {fwd/len(transcribed):.0%}")
         print(f"  STT latency ms:  median={st.median(lats):.0f}")
-    paused = sum(1 for r in wakes if r.get("spotify_was_paused"))
-    if wakes:
-        print(f"  fired during spotify playback: {paused}/{len(wakes)}")
     print(f"\n  rows -> {jsonl_path}")
     return 0
 

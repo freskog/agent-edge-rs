@@ -1,11 +1,10 @@
 [Unit]
 Description=Audio Service (wakeword + VAD + streaming)
-After=spotifyd.service mpv.service spotify-control.service
 
 [Service]
 Type=simple
 # Core map: 0 = RT ALSA playback, 1 = mic capture + wake detection + TTS feed.
-# Keep the audio pipeline off cores 2-3 (spotifyd/agent-edge/mpv/led/control).
+# Keep the audio pipeline off cores 2-3 (spotifyd/agent-edge/led).
 CPUAffinity=0 1
 # Keep the audio server responsive under CPU load; cpal still promotes the ALSA
 # callback thread to RT. LimitRTPRIO allows the RT playback thread; CPUWeight

@@ -13,7 +13,6 @@
 #   --softvol PCT       set "XVF3800 SoftMaster" to PCT% before running
 #   --far-extgain DB    set AEC_FAR_EXTGAIN to DB before running
 #   --no-stt            capture-only (no Whisper); passed through to the harness
-#   --no-music          drop --keep-music (no barge-in resume)
 #
 # Anything after `--` is passed straight to fake_agent_edge.py.
 #
@@ -36,7 +35,6 @@ XVF="$XVF_DIR/xvf_host -u i2c"
 MIXER='XVF3800 SoftMaster'
 CARD='XVF3800'
 CONSUMER="${CONSUMER:-127.0.0.1:50051}"
-SPOTIFY="${SPOTIFY:-http://127.0.0.1:3001}"
 
 SNAP_PARAMS=(AEC_AECCONVERGED AEC_RT60 AEC_FAR_EXTGAIN PP_AGCONOFF PP_AGCGAIN \
   AUDIO_MGR_MIC_GAIN AUDIO_MGR_REF_GAIN AUDIO_MGR_SYS_DELAY PP_ECHOONOFF \
@@ -47,13 +45,12 @@ if [[ $# -lt 1 ]]; then
 fi
 LABEL="$1"; shift
 
-softvol=""; far=""; keep_music=1; extra=()
+softvol=""; far=""; extra=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --softvol)     softvol="$2"; shift 2 ;;
     --far-extgain) far="$2"; shift 2 ;;
     --no-stt)      extra+=(--no-stt); shift ;;
-    --no-music)    keep_music=0; shift ;;
     --)            shift; extra+=("$@"); break ;;
     *)             extra+=("$1"); shift ;;
   esac
@@ -80,7 +77,6 @@ snapshot before
 
 cmd=("$HERE/fake_agent_edge.py" --label "$LABEL" --consumer "$CONSUMER" \
      --stt-url "${STT_URL:-http://10.10.100.102:8008}" --outdir "$OUTDIR")
-[[ $keep_music -eq 1 ]] && cmd+=(--keep-music --spotify-control "$SPOTIFY")
 cmd+=("${extra[@]}")
 
 echo "+ ${cmd[*]}"

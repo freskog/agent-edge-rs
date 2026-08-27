@@ -1,7 +1,5 @@
 use crate::audio_source::{AudioCapture, AudioCaptureConfig};
-use crate::mpv_controller::MpvController;
 use crate::protocol::{ConsumerConnection, ConsumerMessage, ProtocolError};
-use crate::spotify_controller::SpotifyController;
 use crate::wakeword_model::Model as WakewordModel;
 use crate::wakeword_vad::{VadConfig, VadProcessor};
 use crossbeam::channel::{Receiver, Sender};
@@ -54,13 +52,6 @@ pub struct ConsumerServerConfig {
     pub wakeword_models: Vec<String>,
     pub detection_threshold: f32,
     pub vad_config: VadConfig,
-    /// `host:port` of the LED controller's HTTP API. The detection thread POSTs
-    /// a `ww_detected` event here the instant a wake word fires, before any
-    /// media-pause work, for the lowest-latency ring feedback.
-    pub led_endpoint: String,
-    /// `host:port` of the spotify-control service. The detection thread POSTs a
-    /// pause request here on wake word.
-    pub spotify_endpoint: String,
 }
 
 impl Default for ConsumerServerConfig {
@@ -71,8 +62,6 @@ impl Default for ConsumerServerConfig {
             wakeword_models: vec!["hey_mycroft".to_string()],
             detection_threshold: 0.5,
             vad_config: VadConfig::default(),
-            led_endpoint: "127.0.0.1:3000".to_string(),
-            spotify_endpoint: "127.0.0.1:3001".to_string(),
         }
     }
 }
@@ -85,14 +74,11 @@ pub struct ConsumerServer {
     audio_capture: Arc<Mutex<Option<AudioCapture>>>,
     wakeword_model: Arc<Mutex<Option<WakewordModel>>>,
     vad_processor: Arc<Mutex<Option<VadProcessor>>>,
-    spotify_controller: SpotifyController,
-    mpv_controller: MpvController,
     barge_in_tx: Option<Sender<()>>,
 }
 
 impl ConsumerServer {
     pub fn new(config: ConsumerServerConfig) -> Self {
-        let spotify_controller = SpotifyController::new(config.spotify_endpoint.clone());
         Self {
             config,
             should_stop: Arc::new(AtomicBool::new(false)),
@@ -100,8 +86,6 @@ impl ConsumerServer {
             audio_capture: Arc::new(Mutex::new(None)),
             wakeword_model: Arc::new(Mutex::new(None)),
             vad_processor: Arc::new(Mutex::new(None)),
-            spotify_controller,
-            mpv_controller: MpvController::new(),
             barge_in_tx: None,
         }
     }
@@ -123,8 +107,6 @@ impl ConsumerServer {
         let wakeword_model = Arc::clone(&self.wakeword_model);
         let vad_processor = Arc::clone(&self.vad_processor);
         let config = self.config.clone();
-        let spotify_controller = self.spotify_controller.clone();
-        let mpv_controller = self.mpv_controller.clone();
         let barge_in_tx = self.barge_in_tx.clone();
 
         // Start detection thread
@@ -137,8 +119,6 @@ impl ConsumerServer {
                 vad_processor,
                 config,
                 sender,
-                spotify_controller,
-                mpv_controller,
                 barge_in_tx,
             );
 
@@ -226,8 +206,6 @@ impl ConsumerServer {
         vad_processor: Arc<Mutex<Option<VadProcessor>>>,
         config: ConsumerServerConfig,
         sender: Sender<AudioDetectionPair>,
-        spotify_controller: SpotifyController,
-        mpv_controller: MpvController,
         barge_in_tx: Option<Sender<()>>,
     ) -> Result<(), ConsumerServerError> {
         // Initialize audio capture for streaming
@@ -380,10 +358,7 @@ impl ConsumerServer {
                                 config.detection_threshold,
                                 &last_wakeword_time,
                                 WAKEWORD_DEBOUNCE_MS,
-                                &spotify_controller,
-                                &mpv_controller,
                                 &barge_in_tx,
-                                &config.led_endpoint,
                             )?;
                         let event = match event_opt {
                             Some((event, at)) => {
@@ -475,22 +450,16 @@ impl ConsumerServer {
     /// Returns `(Some((WakewordEvent, timestamp)), wake_peak)` if a wake fired,
     /// else `(None, wake_peak)`. The peak confidence across models is always
     /// returned so callers can log sub-threshold near-misses.
-    #[allow(clippy::too_many_arguments)]
     fn process_wakeword_detection_standalone(
         wakeword_model: &Arc<Mutex<Option<WakewordModel>>>,
         detection_samples: &[i16],
         threshold: f32,
         last_wakeword_time: &Option<Instant>,
         debounce_ms: u64,
-        spotify_controller: &SpotifyController,
-        mpv_controller: &MpvController,
         barge_in_tx: &Option<Sender<()>>,
-        led_endpoint: &str,
     ) -> Result<(Option<(WakewordEvent, Instant)>, f32), ConsumerServerError> {
         let mut max_conf = 0.0f32;
         if let Some(ref mut model) = wakeword_model.lock().unwrap().as_mut() {
-            // Time the TFLite inference so we can tell, on-device, how much of
-            // the end-to-end latency is the model itself vs. the pause work.
             let predict_start = Instant::now();
             match model.predict(detection_samples, None, 1.0) {
                 Ok(predictions) => {
@@ -526,13 +495,6 @@ impl ConsumerServer {
                                 predict_ms
                             );
 
-                            // --- Immediate feedback, BEFORE any blocking work ---
-                            // Light the ring instantly via the LED controller's
-                            // HTTP API (fire-and-forget, never blocks). This is
-                            // the lowest-latency feedback path: it does not wait
-                            // for the agent's TCP + STT round-trip.
-                            crate::led_notify::notify_ww_detected(led_endpoint);
-
                             // Send barge-in signal to producer (automatic server-side barge-in)
                             // Use try_send - non-blocking, stale signals will be drained by producer
                             if let Some(ref barge_in) = barge_in_tx {
@@ -546,53 +508,14 @@ impl ConsumerServer {
                                 }
                             }
 
-                            // --- Pause Spotify + mpv concurrently ---
-                            // Each pause runs on its own thread so total latency
-                            // is max(spotify, mpv) instead of the sum. Both
-                            // controllers are cheap to clone (the Spotify one
-                            // caches its D-Bus connection internally).
-                            let pause_start = Instant::now();
-                            let spotify = spotify_controller.clone();
-                            let spotify_handle = thread::spawn(move || {
-                                let t = Instant::now();
-                                let paused = spotify.pause_for_wakeword();
-                                (paused, t.elapsed())
-                            });
-                            let mpv = mpv_controller.clone();
-                            let mpv_handle = thread::spawn(move || {
-                                let t = Instant::now();
-                                let paused = mpv.pause_for_wakeword();
-                                (paused, t.elapsed())
-                            });
-
-                            let (spotify_was_paused, spotify_dur) =
-                                spotify_handle.join().unwrap_or((false, Duration::ZERO));
-                            let (mpv_was_paused, mpv_dur) =
-                                mpv_handle.join().unwrap_or((false, Duration::ZERO));
-
-                            log::info!(
-                                "⏱️ [Detection] media pause done in {:.1}ms (spotify {:.1}ms was_paused={}, mpv {:.1}ms was_paused={})",
-                                pause_start.elapsed().as_secs_f64() * 1000.0,
-                                spotify_dur.as_secs_f64() * 1000.0,
-                                spotify_was_paused,
-                                mpv_dur.as_secs_f64() * 1000.0,
-                                mpv_was_paused
-                            );
-
-                            // --- Confirmation beep ---
-                            // Only beep when nothing was actually paused: if
-                            // media was playing, the pause itself is obvious
-                            // feedback, so a beep would just be redundant noise.
-                            if !spotify_was_paused && !mpv_was_paused {
-                                crate::beep::play_confirmation();
-                            }
-
+                            // Pause/LED/beep are handled downstream; wire flags stay
+                            // false for protocol compatibility.
                             let wakeword_event = WakewordEvent {
                                 model: model_name,
                                 confidence,
                                 timestamp: ConsumerMessage::current_timestamp(),
-                                spotify_was_paused,
-                                mpv_was_paused,
+                                spotify_was_paused: false,
+                                mpv_was_paused: false,
                             };
 
                             return Ok((Some((wakeword_event, now)), max_conf));
