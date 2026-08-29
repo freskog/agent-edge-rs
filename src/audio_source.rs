@@ -15,6 +15,84 @@ use std::time::Instant;
 
 pub const CHUNK_SIZE: usize = 1280; // Fixed chunk size (in samples)
 
+/// The XVF3800 I2S link is physically 48 kHz–fixed (the board drives BCLK/
+/// LRCLK; requesting 16 kHz from ALSA still yields 48 kHz data). The wakeword
+/// model, however, expects 16 kHz. We therefore capture at the hardware rate
+/// and resample down here, rather than relying on PipeWire to do it: the
+/// pro-audio capture node does not resample, so a 16 kHz capture stream ends
+/// up reading 48 kHz data at a 16 kHz rate (3×-slow audio, ~1e-8 model output).
+const CAPTURE_RATE: u32 = 48000;
+const MODEL_RATE: u32 = 16000;
+
+/// Single-rate decimator: applies a windowed-sinc low-pass FIR at the input
+/// rate, then keeps every `in_rate / out_rate`-th sample. Built for the exact
+/// 48 kHz → 16 kHz (factor 3) case of the XVF3800. The FIR cutoff sits at the
+/// output Nyquist (8 kHz) so decimation does not alias energy into the band
+/// the model listens in.
+struct Decimator {
+    coeffs: Vec<f32>,
+    /// The last `coeffs.len() - 1` input samples, oldest first.
+    hist: Vec<f32>,
+    /// Samples seen since construction; we emit once per `factor`.
+    count: u32,
+    factor: u32,
+}
+
+impl Decimator {
+    fn new(in_rate: u32, out_rate: u32) -> Self {
+        let factor = in_rate / out_rate;
+        let n_taps = 31;
+        let m = (n_taps - 1) / 2;
+        // Cutoff at the output Nyquist, in radians per input sample:
+        // 2π · (out_rate/2) / in_rate.
+        let wc = std::f32::consts::PI * (out_rate as f32) / (in_rate as f32);
+        let mut coeffs = Vec::with_capacity(n_taps);
+        let mut sum = 0.0f32;
+        for n in 0..n_taps {
+            let k = (n - m) as f32;
+            let sinc = if k == 0.0 {
+                wc
+            } else {
+                (wc * k).sin() / (std::f32::consts::PI * k)
+            };
+            // Hamming window.
+            let w = 0.54
+                - 0.46
+                    * (2.0 * std::f32::consts::PI * n as f32 / (n_taps - 1) as f32).cos();
+            let c = sinc * w;
+            sum += c;
+            coeffs.push(c);
+        }
+        // Normalize for unity DC gain.
+        for c in coeffs.iter_mut() {
+            *c /= sum;
+        }
+        Self {
+            coeffs,
+            hist: vec![0.0f32; n_taps - 1],
+            count: 0,
+            factor,
+        }
+    }
+
+    /// Feed one input sample (at `in_rate`). Returns the resampled output
+    /// sample (at `out_rate`) once per `factor` input samples.
+    fn push(&mut self, sample: f32) -> Option<f32> {
+        // FIR: y[n] = Σ coeffs[i] · x[n - (N-1-i)]. The newest sample x[n]
+        // pairs with the last coefficient.
+        let n = self.coeffs.len();
+        let mut acc = self.coeffs[n - 1] * sample;
+        for (i, &h) in self.hist.iter().rev().enumerate() {
+            acc += self.coeffs[n - 2 - i] * h;
+        }
+        self.hist.drain(..1);
+        self.hist.push(sample);
+
+        self.count += 1;
+        (self.count % self.factor == 0).then_some(acc)
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
     #[error("No audio devices found")]
@@ -51,7 +129,8 @@ impl Default for AudioCaptureConfig {
 }
 
 /// Sync audio capture that outputs mono 16kHz s16le chunks.
-/// Assumes hardware delivers I16 at 16kHz (XVF3800).
+/// Captures at the hardware rate (48 kHz on the XVF3800) and resamples down
+/// to 16 kHz before handing chunks to the model.
 pub struct AudioCapture {
     receiver: Receiver<Vec<u8>>,
     stop_sender: Sender<()>,
@@ -210,17 +289,18 @@ impl AudioCapture {
                 supported_config.sample_format()
             )));
         }
-        if hardware_sample_rate != 16000 {
+        if hardware_sample_rate != CAPTURE_RATE {
             return Err(AudioCaptureError::Config(format!(
-                "Expected 16kHz sample rate, got {}Hz",
-                hardware_sample_rate
+                "Expected {}Hz capture rate, got {}Hz",
+                CAPTURE_RATE, hardware_sample_rate
             )));
         }
 
         log::info!(
-            "🎤 Hardware: {}Hz, {} channels, I16 → Output: 16kHz mono s16le",
+            "🎤 Hardware: {}Hz, {} channels, I16 → resample to {}Hz mono s16le",
             hardware_sample_rate,
             channels,
+            MODEL_RATE,
         );
 
         let sender = sender.clone();
@@ -237,7 +317,7 @@ impl AudioCapture {
         Ok((stream, hardware_sample_rate))
     }
 
-    /// Prefer I16 at 16kHz; reject anything else.
+    /// Prefer I16 at the capture rate (48 kHz on the XVF3800); reject anything else.
     fn select_input_config(
         device: &Device,
         channel: u32,
@@ -263,7 +343,7 @@ impl AudioCapture {
 
             let min_rate = config_range.min_sample_rate().0;
             let max_rate = config_range.max_sample_rate().0;
-            let target_rate = 16000;
+            let target_rate = CAPTURE_RATE;
 
             let chosen_rate = target_rate.clamp(min_rate, max_rate);
             let rate_diff = chosen_rate.abs_diff(target_rate);
@@ -299,6 +379,12 @@ impl AudioCapture {
         let mut byte_buffer: Vec<u8> = Vec::with_capacity(chunk_bytes * 8);
         let mut chunk_buf: Vec<u8> = vec![0u8; chunk_bytes];
         let affinity_set = Arc::new(AtomicBool::new(false));
+        // Resample the hardware capture rate down to the model rate. The cpal
+        // callback runs on a single thread, so a RefCell needs no lock.
+        let decimator = std::cell::RefCell::new(Decimator::new(
+            config.sample_rate.0,
+            MODEL_RATE,
+        ));
 
         device
             .build_input_stream(
@@ -336,7 +422,13 @@ impl AudioCapture {
                             } else {
                                 s
                             };
-                            byte_buffer.extend_from_slice(&sample.to_le_bytes());
+                            if let Some(out) = decimator.borrow_mut().push(sample as f32) {
+                                let out_sample = out
+                                    .round()
+                                    .clamp(i16::MIN as f32, i16::MAX as f32)
+                                    as i16;
+                                byte_buffer.extend_from_slice(&out_sample.to_le_bytes());
+                            }
                         }
                     }
 
