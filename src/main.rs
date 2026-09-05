@@ -38,9 +38,6 @@ EXAMPLES:
 
   # Use specific audio devices
   audio_service --input-device \"ReSpeaker 4 Mic Array\" --output-device \"Built-in Audio\"
-
-  # Boost TTS volume by 30 percentage points
-  audio_service --mixer-name \"PCM\" --tts-volume-boost 30
 ")]
 struct Args {
     /// Consumer server bind address (for audio streaming)
@@ -72,14 +69,6 @@ struct Args {
     /// openWakeWord expects. Leave at 0 for the ReSpeaker, which is already hot.
     #[arg(long, default_value = "0.0")]
     capture_gain: f32,
-
-    /// ALSA mixer element name for volume control (e.g., "PCM" for the Jabra, "XVF3800 SoftMaster" for the ReSpeaker)
-    #[arg(long)]
-    mixer_name: Option<String>,
-
-    /// TTS volume boost in percentage points added to current volume (e.g., 20)
-    #[arg(long, default_value = "20")]
-    tts_volume_boost: u8,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,8 +102,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_sink_config: AudioSinkConfig {
             device_name: args.output_device.clone(),
         },
-        mixer_name: args.mixer_name.clone(),
-        tts_volume_boost: args.tts_volume_boost,
     };
 
     // Create barge-in channel for automatic server-side interruption

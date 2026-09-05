@@ -16,9 +16,15 @@ pub struct VadConfig {
 impl Default for VadConfig {
     fn default() -> Self {
         Self {
-            sample_rate: 16000,    // 16kHz sample rate
-            chunk_size: 512,       // 32ms chunks at 16kHz (required by Silero VAD)
-            speech_threshold: 0.5, // Default threshold for speech detection
+            sample_rate: 16000, // 16kHz sample rate
+            chunk_size: 512,   // 32ms chunks at 16kHz (required by Silero VAD)
+            // 0.3, not the Silero default 0.5: the user's voice straddles 0.5, so a
+            // 0.5 threshold makes the VAD flicker between speech/silence mid-phrase
+            // (observed dip-outs at 0.45-0.47) and the parser's maxSilenceDuration
+            // ends the turn early. 0.3 sits well above the ambient-noise floor
+            // (0.001-0.02) and below those dip-outs, so the VAD stays "speech"
+            // through the phrase instead of dropping out.
+            speech_threshold: 0.3,
         }
     }
 }

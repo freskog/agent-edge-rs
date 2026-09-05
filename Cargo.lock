@@ -40,14 +40,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alsa-volume"
-version = "0.1.0"
-dependencies = [
- "log",
- "thiserror 2.0.19",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -107,7 +99,6 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "audio"
 version = "0.1.0"
 dependencies = [
- "alsa-volume",
  "clap",
  "cpal",
  "crossbeam",
@@ -968,7 +959,6 @@ dependencies = [
 name = "led-controller"
 version = "0.1.0"
 dependencies = [
- "alsa-volume",
  "axum",
  "clap",
  "env_logger",

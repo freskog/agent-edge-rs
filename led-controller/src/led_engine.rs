@@ -12,10 +12,8 @@ const ANIMATED_TICK_MS: u64 = 33; // ~30 fps
 const STATIC_TICK_MS: u64 = 100;
 const VOLUME_OVERLAY_DURATION_MS: u64 = 2000;
 const ACK_DURATION_MS: u64 = 1000;
-const TIMER_ALERT_DURATION_MS: u64 = 4000;
+const TIMER_ALERT_DURATION_MS: u64 = 5000;
 const VOLUME_STEP: u8 = 1; // 1 LED per step
-
-const MIXER_NAME: &str = "XVF3800 SoftMaster";
 
 const COLOR_LISTENING: RgbColor = RgbColor::new(0, 80, 255);
 const COLOR_PROCESSING: RgbColor = RgbColor::new(0, 200, 220);
@@ -162,19 +160,16 @@ impl LedEngine {
             LedEvent::Volume { level } => {
                 self.previous_state = self.base_state();
                 self.volume_leds = (level.min(100) as f32 / 100.0 * NUM_LEDS as f32).round() as u8;
-                alsa_volume::set_volume(MIXER_NAME, level.min(100));
                 self.transition(LedState::Volume);
             }
             LedEvent::VolumeUp => {
                 self.previous_state = self.base_state();
                 self.volume_leds = (self.volume_leds + VOLUME_STEP).min(NUM_LEDS as u8);
-                alsa_volume::set_volume(MIXER_NAME, self.volume_percent());
                 self.transition(LedState::Volume);
             }
             LedEvent::VolumeDown => {
                 self.previous_state = self.base_state();
                 self.volume_leds = self.volume_leds.saturating_sub(VOLUME_STEP);
-                alsa_volume::set_volume(MIXER_NAME, self.volume_percent());
                 self.transition(LedState::Volume);
             }
             LedEvent::TimerAlert => {

@@ -4,7 +4,7 @@ Description=Audio Service (wakeword + VAD + streaming)
 [Service]
 Type=simple
 # Core map: 0 = RT ALSA playback, 1 = mic capture + wake detection + TTS feed.
-# Keep the audio pipeline off cores 2-3 (spotifyd/agent-edge/led).
+# Keep the audio pipeline off cores 2-3 (soloist/agent-edge/led).
 CPUAffinity=0 1
 # Keep the audio server responsive under CPU load; cpal still promotes the ALSA
 # callback thread to RT. LimitRTPRIO allows the RT playback thread; CPUWeight
@@ -16,7 +16,7 @@ CPUWeight=10000
 EnvironmentFile=%h/.env
 Environment=LD_LIBRARY_PATH=%h/libs/linux-aarch64
 WorkingDirectory=%h
-ExecStart=%h/audio --consumer-bind 0.0.0.0:50051 --producer-bind 0.0.0.0:50052 --mixer-name "XVF3800 SoftMaster" --tts-volume-boost 15 --input-channel 0
+ExecStart=%h/audio --consumer-bind 0.0.0.0:50051 --producer-bind 0.0.0.0:50052 --input-channel 0
 # Nudge the audio threads up in priority a couple seconds after start (renice
 # via passwordless sudo). Installed to ~/bin by `deploy.sh services`.
 ExecStartPost=%h/bin/audio-service-priority

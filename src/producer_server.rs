@@ -29,10 +29,6 @@ pub enum ProducerServerError {
 pub struct ProducerServerConfig {
     pub bind_address: String,
     pub audio_sink_config: AudioSinkConfig,
-    /// ALSA mixer element name. When set, volume is boosted during TTS playback.
-    pub mixer_name: Option<String>,
-    /// Percentage points to add to current volume during TTS (default 20).
-    pub tts_volume_boost: u8,
 }
 
 impl Default for ProducerServerConfig {
@@ -40,8 +36,6 @@ impl Default for ProducerServerConfig {
         Self {
             bind_address: "127.0.0.1:8081".to_string(),
             audio_sink_config: AudioSinkConfig::default(),
-            mixer_name: None,
-            tts_volume_boost: 20,
         }
     }
 }
@@ -166,8 +160,6 @@ impl ProducerServer {
         let producer_connected = Arc::clone(&self.producer_connected);
         let audio_sink = Arc::clone(&self.audio_sink);
         let sink_config = self.config.audio_sink_config.clone();
-        let mixer_name = self.config.mixer_name.clone();
-        let tts_volume_boost = self.config.tts_volume_boost;
         let barge_in_rx = self.barge_in_rx.clone();
 
         thread::spawn(move || {
@@ -179,8 +171,6 @@ impl ProducerServer {
                 audio_sink,
                 sink_config,
                 barge_in_rx,
-                mixer_name,
-                tts_volume_boost,
             );
 
             // Always mark producer as disconnected when thread exits
@@ -202,8 +192,6 @@ impl ProducerServer {
         audio_sink: Arc<Mutex<Option<AudioSink>>>,
         sink_config: AudioSinkConfig,
         barge_in_rx: Option<Receiver<()>>,
-        mixer_name: Option<String>,
-        tts_volume_boost: u8,
     ) -> Result<(), ProducerServerError> {
         let mut connection = ProducerConnection::new(stream);
 
@@ -237,7 +225,6 @@ impl ProducerServer {
         let mut current_stream_id: u64 = 0; // 0 = idle, >0 = playing
         let mut interrupted_stream_id: u64 = 0; // Last interrupted stream
         let mut pending_completion: Option<mpsc::Receiver<()>> = None;
-        let mut saved_volume: Option<u8> = None;
 
         while !should_stop.load(Ordering::SeqCst) {
             // Check for barge-in signal from consumer (wakeword detected during playback)
@@ -255,14 +242,6 @@ impl ProducerServer {
                             interrupted_stream_id = current_stream_id;
                             current_stream_id = 0;
                             pending_completion = None;
-
-                            // Restore volume before aborting playback
-                            if let Some(vol) = saved_volume.take() {
-                                if let Some(ref mixer) = mixer_name {
-                                    log::info!("🔊 Restoring volume to {}% after barge-in", vol);
-                                    alsa_volume::set_volume(mixer, vol);
-                                }
-                            }
 
                             // Abort playback
                             let sink_guard = audio_sink.lock().unwrap();
@@ -307,14 +286,6 @@ impl ProducerServer {
                             current_stream_id,
                             addr
                         );
-
-                        // Restore volume after TTS playback
-                        if let Some(vol) = saved_volume.take() {
-                            if let Some(ref mixer) = mixer_name {
-                                log::info!("🔊 Restoring volume to {}% after playback", vol);
-                                alsa_volume::set_volume(mixer, vol);
-                            }
-                        }
 
                         let complete_msg = ProducerMessage::PlaybackComplete {
                             timestamp: ProducerMessage::current_timestamp(),
@@ -386,24 +357,6 @@ impl ProducerServer {
                                     }
                                     if drained > 0 {
                                         log::info!("🧹 Drained {} stale barge-in signal(s) before starting new stream", drained);
-                                    }
-                                }
-
-                                // Boost volume for TTS playback
-                                if let Some(ref mixer) = mixer_name {
-                                    match alsa_volume::get_volume(mixer) {
-                                        Ok(current) => {
-                                            saved_volume = Some(current);
-                                            let boosted = (current as u16 + tts_volume_boost as u16).min(100) as u8;
-                                            log::info!(
-                                                "🔊 TTS volume boost: {}% -> {}% (+{})",
-                                                current, boosted, tts_volume_boost
-                                            );
-                                            alsa_volume::set_volume(mixer, boosted);
-                                        }
-                                        Err(e) => {
-                                            log::warn!("⚠️  Could not read volume for TTS boost: {}", e);
-                                        }
                                     }
                                 }
 

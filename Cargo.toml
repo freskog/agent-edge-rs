@@ -7,7 +7,7 @@ description = "Binary Audio Service with integrated wakeword detection and VAD p
 license = "MIT"
 
 [workspace]
-members = ["alsa-volume", "led-controller"]
+members = ["led-controller"]
 
 [dependencies]
 cpal = "0.16.0"
@@ -19,7 +19,6 @@ crossbeam = "0.8"
 ringbuf = "0.4"
 ctrlc = "3.4"
 libc = "0.2"
-alsa-volume = { path = "alsa-volume" }
 
 # Wakeword detection dependencies
 voice_activity_detector = "0.2.0"        # VAD processing (also pulls in ort/ONNX Runtime)

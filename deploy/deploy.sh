@@ -138,13 +138,13 @@ case "$cmd" in
         echo "==> Reloading systemd..."
         ssh "$PI_HOST" "systemctl --user daemon-reload"
         echo "==> Enabling all services..."
-        ssh "$PI_HOST" "systemctl --user enable spotifyd led-controller audio agent-edge"
+        ssh "$PI_HOST" "systemctl --user enable led-controller audio agent-edge"
         echo "==> Enabling linger (start services at boot without login)..."
         ssh "$PI_HOST" "sudo loginctl enable-linger freskog"
         echo "Done. Services will start on next reboot, or run: ./deploy.sh start all"
         ;;
     status)
-        ALL_SERVICES="spotifyd led-controller audio agent-edge"
+        ALL_SERVICES="led-controller audio agent-edge"
         target="${1:-all}"
         if [[ "$target" == "all" ]]; then
             services_list="$ALL_SERVICES"
@@ -162,11 +162,11 @@ case "$cmd" in
         if [[ -n "$target" ]]; then
             ssh "$PI_HOST" "journalctl --user -u $target.service -f --no-pager"
         else
-            ssh "$PI_HOST" "journalctl --user -u spotifyd -u led-controller -u audio -u agent-edge -f --no-pager"
+            ssh "$PI_HOST" "journalctl --user -u led-controller -u audio -u agent-edge -f --no-pager"
         fi
         ;;
     restart)
-        ALL_SERVICES="spotifyd led-controller audio agent-edge"
+        ALL_SERVICES="led-controller audio agent-edge"
         target="${1:-all}"
         if [[ "$target" == "all" ]]; then
             services_list="$ALL_SERVICES"
